@@ -14,11 +14,10 @@
 set -euo pipefail
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54 no_proxy=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
-
 # ============ Configuration ============
-MODEL="Qwen/Qwen3-8B"
+MODEL="/mnt/pipeline-data/beta_lab/weights/Qwen3-8B"
 DATASET="sharegpt"                # sharegpt, ultrachat, or path to custom data
 OUTPUT_DIR="./output/dspark_qwen3_8b_sharegpt_ascend"
 VLLM_PORT=8000
@@ -49,17 +48,18 @@ NUM_TRAIN_NPUS=4
 
 # Extra vLLM arguments for Ascend. Remove --enforce-eager if your stack supports
 # graph mode for this path.
-VLLM_EXTRA_ARGS=(--enforce-eager --data-parallel-size 4)
+#VLLM_EXTRA_ARGS=(--enforce-eager --data-parallel-size 4)
+VLLM_EXTRA_ARGS=(--data-parallel-size 4)
 # =======================================
 
 # Step 1: Prepare data
 echo "=== Step 1: Preparing data ==="
-python scripts/prepare_data.py \
-    --model "$MODEL" \
-    --data "$DATASET" \
-    --output "$OUTPUT_DIR" \
-    --max-samples "$MAX_SAMPLES" \
-    --seq-length "$SEQ_LENGTH"
+# python scripts/prepare_data.py \
+#     --model "$MODEL" \
+#     --data "$DATASET" \
+#     --output "$OUTPUT_DIR" \
+#     --max-samples "$MAX_SAMPLES" \
+#     --seq-length "$SEQ_LENGTH"
 
 # Step 2: Launch vLLM server in the background
 echo "=== Step 2: Launching vLLM server on Ascend NPU(s): $VLLM_NPUS ==="
@@ -74,41 +74,15 @@ cleanup() {
     kill "$VLLM_PID" 2>/dev/null || true
     wait "$VLLM_PID" 2>/dev/null || true
 }
-trap cleanup EXIT
+
+trap cleanup INT TERM
 
 echo "Waiting for vLLM server to be ready..."
-until curl --noproxy localhost,127.0.0.1 -sf "http://localhost:${VLLM_PORT}/v1/models" > /dev/null 2>&1; do
+until curl --noproxy '*' -sf "http://127.0.0.1:${VLLM_PORT}/v1/models" > /dev/null 2>&1; do
     echo "vLLM not ready yet..."
     sleep 5
 done
 echo "vLLM server ready."
+echo "vLLM is running. Press Ctrl+C to stop it."
 
-# Step 3: Train DSpark against the live vLLM server
-echo "=== Step 3: Training on Ascend NPU(s): $TRAIN_NPUS ==="
-env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
-    --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
-    scripts/train.py \
-    --verifier-name-or-path "$MODEL" \
-    --data-path "$OUTPUT_DIR" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
-    --save-path "$OUTPUT_DIR/checkpoints" \
-    --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
-    --epochs "$EPOCHS" \
-    --lr "$LR" \
-    --total-seq-len "$SEQ_LENGTH" \
-    --speculator-type "$SPECULATOR_TYPE" \
-    --block-size "$BLOCK_SIZE" \
-    --max-anchors "$MAX_ANCHORS" \
-    --num-layers "$NUM_LAYERS" \
-    --draft-attn-impl "$DRAFT_ATTN_IMPL" \
-    --target-layer-ids $TARGET_LAYER_IDS \
-    --markov-rank "$MARKOV_RANK" \
-    --markov-head-type "$MARKOV_HEAD_TYPE" \
-    --enable-confidence-head \
-    --confidence-head-with-markov \
-    --loss-fn "$LOSS_FN" \
-    --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
-    --on-missing generate \
-    --on-generate delete
-
-echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"
+wait "$VLLM_PID"
