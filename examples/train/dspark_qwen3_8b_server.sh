@@ -29,7 +29,7 @@ LR=6e-4
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
 BLOCK_SIZE=8
-MAX_ANCHORS=3072
+MAX_ANCHORS=512
 NUM_LAYERS=5
 DRAFT_VOCAB_SIZE=32000
 TARGET_LAYER_IDS="1 9 17 25 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
