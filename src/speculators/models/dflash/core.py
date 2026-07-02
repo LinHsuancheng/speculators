@@ -11,7 +11,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.dflash import DFlashSpeculatorConfig
-from speculators.models.dflash.attention import create_anchor_block_mask_mod
+from speculators.models.dflash.attention import (
+    create_anchor_block_mask_mod,
+    create_anchor_micro_block_causal_mask_mod,
+)
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
 from speculators.models.dflash.utils import (
@@ -72,6 +75,26 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ]
         )
         self.sliding_window = tl_config.sliding_window
+        self.micro_block_size = config.micro_block_size or None
+        self.anchor_len = config.anchor_len
+        if self.micro_block_size is not None:
+            if self.micro_block_size <= 0:
+                raise ValueError(
+                    f"micro_block_size must be positive, got {self.micro_block_size}"
+                )
+            if self.anchor_len < 0 or self.anchor_len >= config.block_size:
+                raise ValueError(
+                    "anchor_len must be in [0, block_size), got "
+                    f"anchor_len={self.anchor_len}, block_size={config.block_size}"
+                )
+            spec_len = config.block_size - self.anchor_len
+            if spec_len % self.micro_block_size != 0:
+                raise ValueError(
+                    "block_size - anchor_len must be divisible by micro_block_size, "
+                    f"got block_size={config.block_size}, "
+                    f"anchor_len={self.anchor_len}, "
+                    f"micro_block_size={self.micro_block_size}"
+                )
         self.sliding_window_indices = [
             i
             for i, layer_type in enumerate(tl_config.layer_types)
@@ -171,7 +194,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
             "draft_attn_impl", "simple_flex_attention"
         )
-        block_size = kwargs.get("block_size", 8)
+        block_size = kwargs.get("block_size", 16)
+        micro_block_size = kwargs.get("micro_block_size", 0) or None
         return {
             "transformer_layer_config": verifier_config,
             "draft_vocab_size": kwargs["draft_vocab_size"],
@@ -180,6 +204,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
+            "micro_block_size": micro_block_size,
+            "anchor_len": kwargs.get("anchor_len", 1),
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
@@ -228,14 +254,26 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         sliding_window: int | None = None,
         sliding_window_non_causal: bool = False,
     ):
-        mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
-            document_ids=document_ids.squeeze(0).to(device),
-            total_seq_len=total_seq_len,
-            anchor_positions=anchor_positions,
-            block_size=self.block_size,
-            sliding_window=sliding_window,
-            sliding_window_non_causal=sliding_window_non_causal,
-        )
+        document_ids = document_ids.squeeze(0).to(device)
+        if self.micro_block_size is None:
+            mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                block_size=self.block_size,
+                sliding_window=sliding_window,
+                sliding_window_non_causal=sliding_window_non_causal,
+            )
+        else:
+            mask_mod, q_len, kv_len = create_anchor_micro_block_causal_mask_mod(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                block_size=self.block_size,
+                micro_block_size=self.micro_block_size,
+                anchor_len=self.anchor_len,
+                sliding_window=sliding_window,
+            )
         return self._create_mask_fn(
             mask_mod,
             B=None,

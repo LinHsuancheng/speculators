@@ -42,7 +42,7 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
     )
 
     block_size: int = Field(
-        default=8,
+        default=16,
         description=(
             "Default size of the draft block predicted with a forward pass of the model"
         ),
@@ -76,6 +76,24 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         description="Use non-causal (bidirectional) masking within draft blocks for "
         "sliding window attention layers. Full attention layers are always "
         "bidirectional.",
+    )
+
+    micro_block_size: int | None = Field(
+        default=0,
+        description=(
+            "Enable pseudo-autoregressive micro-block attention within each DFlash "
+            "block when set. Speculative positions are split into micro blocks of "
+            "this size; later micro blocks can attend to earlier ones, while each "
+            "micro block remains bidirectional internally."
+        ),
+    )
+
+    anchor_len: int = Field(
+        default=1,
+        description=(
+            "Number of leading synthetic positions in each block treated as anchors "
+            "by micro-block attention."
+        ),
     )
 
     @field_serializer("transformer_layer_config")

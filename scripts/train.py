@@ -929,8 +929,8 @@ def parse_args():
     parser.add_argument(
         "--block-size",
         type=int,
-        default=8,
-        help="Block size for DFlash model (default: 8)",
+        default=16,
+        help="Block size for DFlash/DSpark model (default: 16)",
     )
     parser.add_argument(
         "--max-anchors",
@@ -943,6 +943,27 @@ def parse_args():
         type=float,
         default=4.0,
         help="Decay gamma for DFlash/DSpark loss weighting (default: 4.0)",
+    )
+    parser.add_argument(
+        "--micro-block-size",
+        type=int,
+        default=0,
+        help=(
+            "DFlash/DSpark pseudo-autoregressive micro-block size. "
+            "Speculative positions inside each block are split into chunks of this "
+            "size; chunks are causal across micro blocks and bidirectional within "
+            "each micro block. Defaults to 0 (disabled, original DFlash/DSpark "
+            "mask). Use 3 for a 5x3 layout with --block-size 16 and --anchor-len 1."
+        ),
+    )
+    parser.add_argument(
+        "--anchor-len",
+        type=int,
+        default=1,
+        help=(
+            "Number of leading synthetic positions treated as anchors when "
+            "--micro-block-size is enabled (default: 1)."
+        ),
     )
     # DSpark-specific arguments (sequential Markov head + confidence head).
     parser.add_argument(

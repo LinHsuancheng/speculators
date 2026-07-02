@@ -53,6 +53,19 @@ def test_dflash_decay_gamma_falls_back_when_omitted():
     assert val_kw["gamma"] == 4.0
 
 
+def test_dflash_default_micro_block_layout(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.block_size == 16
+    assert args.anchor_len == 1
+    assert args.micro_block_size == 0
+
+
+def test_dflash_micro_block_args(monkeypatch):
+    args = _parse(monkeypatch, ["--micro-block-size", "3", "--anchor-len", "1"])
+    assert args.micro_block_size == 3
+    assert args.anchor_len == 1
+
+
 def test_dflash_compound_loss(monkeypatch):
     args = _parse(monkeypatch, ["--loss-fn", '{"ce": 0.1, "tv": 0.9}'])
     train_kw, val_kw = DFlashDraftModel.get_trainer_kwargs(**vars(args))

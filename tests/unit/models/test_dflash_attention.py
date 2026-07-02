@@ -3,7 +3,10 @@
 import torch
 from torch.nn.attention.flex_attention import create_mask
 
-from speculators.models.dflash.attention import create_anchor_block_mask_mod
+from speculators.models.dflash.attention import (
+    create_anchor_block_mask_mod,
+    create_anchor_micro_block_causal_mask_mod,
+)
 
 
 def _lengths_to_document_ids(lengths, total_seq_len):
@@ -124,3 +127,54 @@ def test_create_mask_each_query_sees_its_own_block():
     )
 
     assert bool(dense[0, 0].any(dim=-1).all())
+
+
+def test_micro_block_mask_is_bidirectional_within_micro_blocks():
+    """Micro-block mask is causal across chunks and bidirectional within chunks."""
+    total_seq_len, block_size = 8, 5
+    anchor_len, micro_block_size = 1, 2
+    document_ids = _lengths_to_document_ids(torch.tensor([8]), total_seq_len)
+    anchor_positions = torch.tensor([4])
+
+    mask_mod, q_len, kv_len = create_anchor_micro_block_causal_mask_mod(
+        document_ids=document_ids,
+        total_seq_len=total_seq_len,
+        anchor_positions=anchor_positions,
+        block_size=block_size,
+        micro_block_size=micro_block_size,
+        anchor_len=anchor_len,
+    )
+    dense = create_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        device=document_ids.device,
+    )[0, 0].bool()
+
+    block_start = total_seq_len
+
+    # Anchor can see only the synthetic anchor position inside its own block.
+    assert bool(dense[0, block_start])
+    assert not bool(dense[0, block_start + 1])
+
+    # First speculative micro block sees the anchor and both tokens in micro 0.
+    assert torch.equal(
+        dense[1, block_start : block_start + block_size],
+        torch.tensor([True, True, True, False, False]),
+    )
+    assert torch.equal(
+        dense[2, block_start : block_start + block_size],
+        torch.tensor([True, True, True, False, False]),
+    )
+
+    # Second speculative micro block additionally sees all earlier spec tokens.
+    assert torch.equal(
+        dense[3, block_start : block_start + block_size],
+        torch.tensor([True, True, True, True, True]),
+    )
+    assert torch.equal(
+        dense[4, block_start : block_start + block_size],
+        torch.tensor([True, True, True, True, True]),
+    )
