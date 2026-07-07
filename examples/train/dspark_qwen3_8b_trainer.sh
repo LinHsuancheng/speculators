@@ -61,8 +61,13 @@ echo "=== Step 1: Preparing data ==="
 #     --seq-length "$SEQ_LENGTH"
 
 # Step 3: Train DSpark against the live vLLM server
+LOG_DIR="$OUTPUT_DIR/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
+PID_FILE="$LOG_DIR/train.pid"
+
 echo "=== Step 3: Training on Ascend NPU(s): $TRAIN_NPUS ==="
-env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
+nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
     --verifier-name-or-path "$MODEL" \
@@ -86,6 +91,10 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
     --on-missing generate \
-    --on-generate delete
+    --on-generate delete \
+    > "$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
 
-echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"
+echo "Log file: $LOG_FILE"
+echo "View log with: tail -f $LOG_FILE"
+echo "Stop with: kill \$(cat $PID_FILE)"
