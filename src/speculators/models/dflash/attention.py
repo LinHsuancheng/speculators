@@ -142,6 +142,7 @@ def create_anchor_micro_block_causal_mask_mod(
     micro_block_size: int,
     anchor_len: int = 1,
     sliding_window: int | None = None,
+    max_prev_micro_blocks: int | None = None,
 ):
     """
     Build a DFlash flex-attention mask with pseudo-autoregressive micro blocks.
@@ -178,6 +179,11 @@ def create_anchor_micro_block_causal_mask_mod(
             "block_size - anchor_len must be divisible by micro_block_size, "
             f"got block_size={block_size}, anchor_len={anchor_len}, "
             f"micro_block_size={micro_block_size}"
+        )
+    if max_prev_micro_blocks is not None and max_prev_micro_blocks < 0:
+        raise ValueError(
+            "max_prev_micro_blocks must be non-negative when set, got "
+            f"{max_prev_micro_blocks}"
         )
 
     n_anchors = anchor_positions.numel()
@@ -231,8 +237,16 @@ def create_anchor_micro_block_causal_mask_mod(
 
         q_micro = (q_offset - anchor_len) // micro_block_size
         kv_micro = (kv_offset - anchor_len) // micro_block_size
+        same_micro_visible = kv_micro == q_micro
+        prev_micro_visible = kv_micro < q_micro
+        if max_prev_micro_blocks is not None:
+            prev_micro_visible = prev_micro_visible & (
+                q_micro - kv_micro <= max_prev_micro_blocks
+            )
         spec_to_spec_visible = (
-            (~q_is_anchor) & (~kv_is_anchor) & (kv_micro <= q_micro)
+            (~q_is_anchor)
+            & (~kv_is_anchor)
+            & (same_micro_visible | prev_micro_visible)
         )
 
         return same_block & (

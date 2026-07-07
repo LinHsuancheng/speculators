@@ -58,12 +58,27 @@ def test_dflash_default_micro_block_layout(monkeypatch):
     assert args.block_size == 16
     assert args.anchor_len == 1
     assert args.micro_block_size == 0
+    assert args.micro_block_layer_growth is False
+    assert args.max_prev_micro_blocks is None
 
 
 def test_dflash_micro_block_args(monkeypatch):
-    args = _parse(monkeypatch, ["--micro-block-size", "3", "--anchor-len", "1"])
+    args = _parse(
+        monkeypatch,
+        [
+            "--micro-block-size",
+            "3",
+            "--anchor-len",
+            "1",
+            "--micro-block-layer-growth",
+            "--max-prev-micro-blocks",
+            "4",
+        ],
+    )
     assert args.micro_block_size == 3
     assert args.anchor_len == 1
+    assert args.micro_block_layer_growth is True
+    assert args.max_prev_micro_blocks == 4
 
 
 def test_dflash_compound_loss(monkeypatch):

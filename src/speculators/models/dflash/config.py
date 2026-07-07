@@ -96,6 +96,22 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    micro_block_layer_growth: bool = Field(
+        default=False,
+        description=(
+            "When micro-block attention is enabled, gradually expand the number of "
+            "previous micro blocks visible at deeper draft layers."
+        ),
+    )
+
+    max_prev_micro_blocks: int | None = Field(
+        default=None,
+        description=(
+            "Maximum number of previous micro blocks visible when layer-wise "
+            "micro-block growth is enabled. Defaults to all previous micro blocks."
+        ),
+    )
+
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
         """Serialize transformer config to dict."""

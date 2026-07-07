@@ -178,3 +178,41 @@ def test_micro_block_mask_is_bidirectional_within_micro_blocks():
         dense[4, block_start : block_start + block_size],
         torch.tensor([True, True, True, True, True]),
     )
+
+
+def test_micro_block_mask_limits_previous_micro_blocks():
+    """Layer-growth masks can restrict how many previous micro blocks are visible."""
+    total_seq_len, block_size = 8, 7
+    anchor_len, micro_block_size = 1, 2
+    document_ids = _lengths_to_document_ids(torch.tensor([8]), total_seq_len)
+    anchor_positions = torch.tensor([4])
+
+    mask_mod, q_len, kv_len = create_anchor_micro_block_causal_mask_mod(
+        document_ids=document_ids,
+        total_seq_len=total_seq_len,
+        anchor_positions=anchor_positions,
+        block_size=block_size,
+        micro_block_size=micro_block_size,
+        anchor_len=anchor_len,
+        max_prev_micro_blocks=1,
+    )
+    dense = create_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        device=document_ids.device,
+    )[0, 0].bool()
+
+    block_start = total_seq_len
+
+    # Query in m2 can see anchor, m1, and m2, but not m0 when the window is 1.
+    assert torch.equal(
+        dense[5, block_start : block_start + block_size],
+        torch.tensor([True, False, False, True, True, True, True]),
+    )
+    assert torch.equal(
+        dense[6, block_start : block_start + block_size],
+        torch.tensor([True, False, False, True, True, True, True]),
+    )

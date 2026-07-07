@@ -68,6 +68,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
+        self.num_draft_layers = num_draft_layers
         self.layers = nn.ModuleList(
             [
                 Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
@@ -77,6 +78,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.sliding_window = tl_config.sliding_window
         self.micro_block_size = config.micro_block_size or None
         self.anchor_len = config.anchor_len
+        self.micro_block_layer_growth = config.micro_block_layer_growth
+        self.max_prev_micro_blocks = config.max_prev_micro_blocks
         if self.micro_block_size is not None:
             if self.micro_block_size <= 0:
                 raise ValueError(
@@ -95,6 +98,25 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     f"anchor_len={self.anchor_len}, "
                     f"micro_block_size={self.micro_block_size}"
                 )
+            if (
+                self.max_prev_micro_blocks is not None
+                and self.max_prev_micro_blocks < 0
+            ):
+                raise ValueError(
+                    "max_prev_micro_blocks must be non-negative when set, got "
+                    f"{self.max_prev_micro_blocks}"
+                )
+            self.num_micro_blocks = spec_len // self.micro_block_size
+            if self.max_prev_micro_blocks is None:
+                self.max_prev_micro_blocks = self.num_micro_blocks - 1
+            else:
+                self.max_prev_micro_blocks = min(
+                    self.max_prev_micro_blocks, self.num_micro_blocks - 1
+                )
+        elif self.micro_block_layer_growth:
+            raise ValueError(
+                "micro_block_layer_growth=True requires micro_block_size > 0."
+            )
         self.sliding_window_indices = [
             i
             for i, layer_type in enumerate(tl_config.layer_types)
@@ -206,6 +228,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
             "micro_block_size": micro_block_size,
             "anchor_len": kwargs.get("anchor_len", 1),
+            "micro_block_layer_growth": kwargs.get(
+                "micro_block_layer_growth", False
+            ),
+            "max_prev_micro_blocks": kwargs.get("max_prev_micro_blocks"),
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
@@ -253,6 +279,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         device: torch.device,
         sliding_window: int | None = None,
         sliding_window_non_causal: bool = False,
+        max_prev_micro_blocks: int | None = None,
     ):
         document_ids = document_ids.squeeze(0).to(device)
         if self.micro_block_size is None:
@@ -273,6 +300,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 micro_block_size=self.micro_block_size,
                 anchor_len=self.anchor_len,
                 sliding_window=sliding_window,
+                max_prev_micro_blocks=max_prev_micro_blocks,
             )
         return self._create_mask_fn(
             mask_mod,
@@ -282,6 +310,31 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             KV_LEN=kv_len,
             device=device,
         )
+
+    def _max_prev_micro_blocks_for_layer(self, layer_idx: int) -> int | None:
+        if self.micro_block_size is None:
+            return None
+        if not self.micro_block_layer_growth:
+            return self.max_prev_micro_blocks
+        return min(layer_idx, self.max_prev_micro_blocks)
+
+    def _create_attention_masks_for_layers(self, **kwargs):
+        if self.micro_block_layer_growth and self.micro_block_size is not None:
+            return [
+                self._create_attention_mask(
+                    **kwargs,
+                    max_prev_micro_blocks=self._max_prev_micro_blocks_for_layer(
+                        layer_idx
+                    ),
+                )
+                for layer_idx in range(self.num_draft_layers)
+            ]
+
+        mask = self._create_attention_mask(
+            **kwargs,
+            max_prev_micro_blocks=self._max_prev_micro_blocks_for_layer(0),
+        )
+        return [mask] * self.num_draft_layers
 
     @torch.compiler.disable
     def _build_attention_mask(self, loss_mask, document_ids, device):
@@ -293,7 +346,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         full_attn_mask = None
         if self.uses_full_attn:
-            full_attn_mask = self._create_attention_mask(
+            full_attn_mask = self._create_attention_masks_for_layers(
                 document_ids=document_ids,
                 total_seq_len=total_seq_len,
                 anchor_positions=anchor_positions,
@@ -303,7 +356,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         sliding_window_attn_mask = None
         if self.uses_sliding_window_attn:
-            sliding_window_attn_mask = self._create_attention_mask(
+            sliding_window_attn_mask = self._create_attention_masks_for_layers(
                 document_ids=document_ids,
                 total_seq_len=total_seq_len,
                 anchor_positions=anchor_positions,
@@ -386,9 +439,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
                 target_hidden=fc_output,
-                attention_mask=sliding_window_attn_mask
-                if layer_idx in self.sliding_window_indices
-                else full_attn_mask,
+                attention_mask=(
+                    sliding_window_attn_mask[layer_idx]
+                    if layer_idx in self.sliding_window_indices
+                    else full_attn_mask[layer_idx]
+                ),
                 position_ids=position_ids,
                 use_cache=False,
                 position_embeddings=position_embeddings,

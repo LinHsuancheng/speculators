@@ -28,7 +28,10 @@ LR=6e-4
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
-BLOCK_SIZE=8
+BLOCK_SIZE=16
+MICRO_BLOCK_SIZE=3
+MICRO_BLOCK_LAYER_GROWTH=1
+MAX_PREV_MICRO_BLOCKS=4
 MAX_ANCHORS=512
 NUM_LAYERS=5
 DRAFT_VOCAB_SIZE=32000
@@ -65,6 +68,13 @@ LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
 PID_FILE="$LOG_DIR/train.pid"
+MICRO_BLOCK_GROWTH_ARGS=()
+if [[ "$MICRO_BLOCK_LAYER_GROWTH" == "1" ]]; then
+    MICRO_BLOCK_GROWTH_ARGS=(
+        --micro-block-layer-growth
+        --max-prev-micro-blocks "$MAX_PREV_MICRO_BLOCKS"
+    )
+fi
 
 echo "=== Step 3: Training on Ascend NPU(s): $TRAIN_NPUS ==="
 nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
@@ -80,6 +90,8 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --total-seq-len "$SEQ_LENGTH" \
     --speculator-type "$SPECULATOR_TYPE" \
     --block-size "$BLOCK_SIZE" \
+    --micro-block-size "$MICRO_BLOCK_SIZE" \
+    "${MICRO_BLOCK_GROWTH_ARGS[@]}" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers "$NUM_LAYERS" \
     --draft-attn-impl "$DRAFT_ATTN_IMPL" \

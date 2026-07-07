@@ -965,6 +965,24 @@ def parse_args():
             "--micro-block-size is enabled (default: 1)."
         ),
     )
+    parser.add_argument(
+        "--micro-block-layer-growth",
+        action="store_true",
+        default=False,
+        help=(
+            "When micro-block attention is enabled, gradually expand previous "
+            "micro-block visibility across deeper draft layers."
+        ),
+    )
+    parser.add_argument(
+        "--max-prev-micro-blocks",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of previous micro blocks visible with "
+            "--micro-block-layer-growth. Defaults to all previous micro blocks."
+        ),
+    )
     # DSpark-specific arguments (sequential Markov head + confidence head).
     parser.add_argument(
         "--markov-rank",
