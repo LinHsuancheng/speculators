@@ -25,6 +25,7 @@ MAX_SAMPLES=5000
 SEQ_LENGTH=8192
 EPOCHS=5
 LR=6e-4
+LOGGER="tensorboard"
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
@@ -77,6 +78,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
     --epochs "$EPOCHS" \
     --lr "$LR" \
+    --logger "$LOGGER" \
     --total-seq-len "$SEQ_LENGTH" \
     --speculator-type "$SPECULATOR_TYPE" \
     --block-size "$BLOCK_SIZE" \
@@ -96,5 +98,6 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
 echo $! > "$PID_FILE"
 
 echo "Log file: $LOG_FILE"
+echo "TensorBoard: tensorboard --logdir ./logs --host 0.0.0.0 --port 6006"
 echo "View log with: tail -f $LOG_FILE"
 echo "Stop with: kill \$(cat $PID_FILE)"
