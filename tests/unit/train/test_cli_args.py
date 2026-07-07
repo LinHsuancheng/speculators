@@ -60,6 +60,8 @@ def test_dflash_default_micro_block_layout(monkeypatch):
     assert args.micro_block_size == 0
     assert args.micro_block_layer_growth is False
     assert args.max_prev_micro_blocks is None
+    assert args.micro_token_layer_growth is False
+    assert args.max_prev_micro_tokens is None
 
 
 def test_dflash_micro_block_args(monkeypatch):
@@ -73,12 +75,17 @@ def test_dflash_micro_block_args(monkeypatch):
             "--micro-block-layer-growth",
             "--max-prev-micro-blocks",
             "4",
+            "--micro-token-layer-growth",
+            "--max-prev-micro-tokens",
+            "2",
         ],
     )
     assert args.micro_block_size == 3
     assert args.anchor_len == 1
     assert args.micro_block_layer_growth is True
     assert args.max_prev_micro_blocks == 4
+    assert args.micro_token_layer_growth is True
+    assert args.max_prev_micro_tokens == 2
 
 
 def test_dflash_compound_loss(monkeypatch):

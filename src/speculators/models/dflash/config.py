@@ -112,6 +112,23 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    micro_token_layer_growth: bool = Field(
+        default=False,
+        description=(
+            "When micro-block attention is enabled, gradually expand causal "
+            "token-level visibility inside each micro block at deeper draft layers."
+        ),
+    )
+
+    max_prev_micro_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Maximum number of previous tokens visible inside each micro block when "
+            "token-level layer growth is enabled. Defaults to all previous tokens "
+            "inside the micro block."
+        ),
+    )
+
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
         """Serialize transformer config to dict."""

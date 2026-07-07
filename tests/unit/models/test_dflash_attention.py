@@ -216,3 +216,37 @@ def test_micro_block_mask_limits_previous_micro_blocks():
         dense[6, block_start : block_start + block_size],
         torch.tensor([True, False, False, True, True, True, True]),
     )
+
+
+def test_micro_block_mask_limits_previous_tokens_within_micro_block():
+    """Token-growth masks can make same-micro attention causal and local."""
+    total_seq_len, block_size = 8, 4
+    anchor_len, micro_block_size = 1, 3
+    document_ids = _lengths_to_document_ids(torch.tensor([8]), total_seq_len)
+    anchor_positions = torch.tensor([4])
+
+    mask_mod, q_len, kv_len = create_anchor_micro_block_causal_mask_mod(
+        document_ids=document_ids,
+        total_seq_len=total_seq_len,
+        anchor_positions=anchor_positions,
+        block_size=block_size,
+        micro_block_size=micro_block_size,
+        anchor_len=anchor_len,
+        max_prev_micro_tokens=1,
+    )
+    dense = create_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        device=document_ids.device,
+    )[0, 0].bool()
+
+    block_start = total_seq_len
+
+    # Last token in the micro block sees anchor, itself, and only one prior token.
+    assert torch.equal(
+        dense[3, block_start : block_start + block_size],
+        torch.tensor([True, False, True, True]),
+    )

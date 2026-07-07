@@ -32,6 +32,8 @@ BLOCK_SIZE=16
 MICRO_BLOCK_SIZE=3
 MICRO_BLOCK_LAYER_GROWTH=1
 MAX_PREV_MICRO_BLOCKS=4
+MICRO_TOKEN_LAYER_GROWTH=1
+MAX_PREV_MICRO_TOKENS=2
 MAX_ANCHORS=512
 NUM_LAYERS=5
 DRAFT_VOCAB_SIZE=32000
@@ -75,6 +77,13 @@ if [[ "$MICRO_BLOCK_LAYER_GROWTH" == "1" ]]; then
         --max-prev-micro-blocks "$MAX_PREV_MICRO_BLOCKS"
     )
 fi
+MICRO_TOKEN_GROWTH_ARGS=()
+if [[ "$MICRO_TOKEN_LAYER_GROWTH" == "1" ]]; then
+    MICRO_TOKEN_GROWTH_ARGS=(
+        --micro-token-layer-growth
+        --max-prev-micro-tokens "$MAX_PREV_MICRO_TOKENS"
+    )
+fi
 
 echo "=== Step 3: Training on Ascend NPU(s): $TRAIN_NPUS ==="
 nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
@@ -92,6 +101,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --block-size "$BLOCK_SIZE" \
     --micro-block-size "$MICRO_BLOCK_SIZE" \
     "${MICRO_BLOCK_GROWTH_ARGS[@]}" \
+    "${MICRO_TOKEN_GROWTH_ARGS[@]}" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers "$NUM_LAYERS" \
     --draft-attn-impl "$DRAFT_ATTN_IMPL" \

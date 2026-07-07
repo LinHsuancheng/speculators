@@ -983,6 +983,26 @@ def parse_args():
             "--micro-block-layer-growth. Defaults to all previous micro blocks."
         ),
     )
+    parser.add_argument(
+        "--micro-token-layer-growth",
+        action="store_true",
+        default=False,
+        help=(
+            "When micro-block attention is enabled, gradually expand causal "
+            "token-level visibility inside each micro block across deeper draft "
+            "layers."
+        ),
+    )
+    parser.add_argument(
+        "--max-prev-micro-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of previous tokens visible inside each micro block with "
+            "--micro-token-layer-growth. Defaults to all previous tokens inside the "
+            "micro block."
+        ),
+    )
     # DSpark-specific arguments (sequential Markov head + confidence head).
     parser.add_argument(
         "--markov-rank",

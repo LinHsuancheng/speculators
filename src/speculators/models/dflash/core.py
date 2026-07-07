@@ -80,6 +80,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.anchor_len = config.anchor_len
         self.micro_block_layer_growth = config.micro_block_layer_growth
         self.max_prev_micro_blocks = config.max_prev_micro_blocks
+        self.micro_token_layer_growth = config.micro_token_layer_growth
+        self.max_prev_micro_tokens = config.max_prev_micro_tokens
         if self.micro_block_size is not None:
             if self.micro_block_size <= 0:
                 raise ValueError(
@@ -106,6 +108,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     "max_prev_micro_blocks must be non-negative when set, got "
                     f"{self.max_prev_micro_blocks}"
                 )
+            if (
+                self.max_prev_micro_tokens is not None
+                and self.max_prev_micro_tokens < 0
+            ):
+                raise ValueError(
+                    "max_prev_micro_tokens must be non-negative when set, got "
+                    f"{self.max_prev_micro_tokens}"
+                )
             self.num_micro_blocks = spec_len // self.micro_block_size
             if self.max_prev_micro_blocks is None:
                 self.max_prev_micro_blocks = self.num_micro_blocks - 1
@@ -113,9 +123,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 self.max_prev_micro_blocks = min(
                     self.max_prev_micro_blocks, self.num_micro_blocks - 1
                 )
+            if self.max_prev_micro_tokens is None:
+                self.max_prev_micro_tokens = self.micro_block_size - 1
+            else:
+                self.max_prev_micro_tokens = min(
+                    self.max_prev_micro_tokens, self.micro_block_size - 1
+                )
         elif self.micro_block_layer_growth:
             raise ValueError(
                 "micro_block_layer_growth=True requires micro_block_size > 0."
+            )
+        elif self.micro_token_layer_growth:
+            raise ValueError(
+                "micro_token_layer_growth=True requires micro_block_size > 0."
             )
         self.sliding_window_indices = [
             i
@@ -232,6 +252,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 "micro_block_layer_growth", False
             ),
             "max_prev_micro_blocks": kwargs.get("max_prev_micro_blocks"),
+            "micro_token_layer_growth": kwargs.get(
+                "micro_token_layer_growth", False
+            ),
+            "max_prev_micro_tokens": kwargs.get("max_prev_micro_tokens"),
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
@@ -280,6 +304,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         sliding_window: int | None = None,
         sliding_window_non_causal: bool = False,
         max_prev_micro_blocks: int | None = None,
+        max_prev_micro_tokens: int | None = None,
     ):
         document_ids = document_ids.squeeze(0).to(device)
         if self.micro_block_size is None:
@@ -301,6 +326,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 anchor_len=self.anchor_len,
                 sliding_window=sliding_window,
                 max_prev_micro_blocks=max_prev_micro_blocks,
+                max_prev_micro_tokens=max_prev_micro_tokens,
             )
         return self._create_mask_fn(
             mask_mod,
@@ -318,12 +344,22 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             return self.max_prev_micro_blocks
         return min(layer_idx, self.max_prev_micro_blocks)
 
+    def _max_prev_micro_tokens_for_layer(self, layer_idx: int) -> int | None:
+        if self.micro_block_size is None or not self.micro_token_layer_growth:
+            return None
+        return min(layer_idx, self.max_prev_micro_tokens)
+
     def _create_attention_masks_for_layers(self, **kwargs):
-        if self.micro_block_layer_growth and self.micro_block_size is not None:
+        if self.micro_block_size is not None and (
+            self.micro_block_layer_growth or self.micro_token_layer_growth
+        ):
             return [
                 self._create_attention_mask(
                     **kwargs,
                     max_prev_micro_blocks=self._max_prev_micro_blocks_for_layer(
+                        layer_idx
+                    ),
+                    max_prev_micro_tokens=self._max_prev_micro_tokens_for_layer(
                         layer_idx
                     ),
                 )
@@ -333,6 +369,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         mask = self._create_attention_mask(
             **kwargs,
             max_prev_micro_blocks=self._max_prev_micro_blocks_for_layer(0),
+            max_prev_micro_tokens=self._max_prev_micro_tokens_for_layer(0),
         )
         return [mask] * self.num_draft_layers
 
