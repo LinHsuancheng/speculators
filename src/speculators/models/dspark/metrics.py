@@ -4,11 +4,17 @@ loss = compound_loss(logits, targets) + conf_alpha * BCE(confidence, accept_rate
 
 The confidence target ``accept_rate = sum_v min(q_v, p_v) = 1 - d_TV`` is the
 analytical acceptance rate (the overlap ``tv_loss`` already computes).
+
+Optional CAT (Confidence-Adaptive Token) reweights each draft position by the
+prefix product of a stop-gradient confidence proxy, following PARD-2:
+
+* ``target``: target-model GT-token confidence
+* ``draft``: analytical draft/target acceptance overlap
 """
 
 from collections.abc import Callable
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch.nn.functional import binary_cross_entropy_with_logits, softmax
@@ -18,6 +24,8 @@ from speculators.models.metrics import (
     compound_loss,
     compute_accuracy_multi_step,
     dflash_loss_decay,
+    draft_cat_weights,
+    target_cat_weights,
 )
 
 __all__ = [
@@ -26,20 +34,43 @@ __all__ = [
 
 _EPS = 1e-8
 
+CatMode = Literal["none", "target", "draft"]
+
 
 def _masked_decayed_mean(
     elementwise: torch.Tensor,  # [1, T]
     loss_mask: torch.Tensor,  # [1, T]
     pos_idx: torch.Tensor,  # [1, T]
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None,
+    position_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Masked, optionally position-decayed mean of a precomputed per-position term."""
     loss_mask = loss_mask.to(elementwise.dtype)
     weighted = elementwise * loss_mask
     if decay_fn is not None:
         weighted = weighted * decay_fn(pos_idx.to(weighted.dtype))
+    if position_weights is not None:
+        weighted = weighted * position_weights.to(weighted.dtype)
     denominator = loss_mask.sum(dim=1) + _EPS
     return (weighted.sum(dim=1) / denominator).mean()
+
+
+def _resolve_cat_weights(
+    cat_mode: CatMode,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    loss_mask: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor | None:
+    if cat_mode == "none":
+        return None
+    if cat_mode == "target":
+        return target_cat_weights(targets, block_size, loss_mask=loss_mask)
+    if cat_mode == "draft":
+        return draft_cat_weights(logits, targets, block_size, loss_mask=loss_mask)
+    raise ValueError(
+        f"Unknown cat_mode '{cat_mode}'. Choose from: none, target, draft."
+    )
 
 
 def compute_metrics(
@@ -51,6 +82,7 @@ def compute_metrics(
     loss_config: LossConfig,
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
+    cat_mode: CatMode = "none",
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -58,9 +90,18 @@ def compute_metrics(
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
     decay_fn = partial(dflash_loss_decay, gamma=gamma)
+    cat_weights = _resolve_cat_weights(
+        cat_mode, logits, targets, loss_mask, block_size
+    )
 
     loss, term_losses = compound_loss(
-        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
+        logits,
+        targets,
+        loss_mask,
+        pos_idx,
+        loss_config=loss_config,
+        decay_fn=decay_fn,
+        position_weights=cat_weights,
     )
 
     # Analytical per-position acceptance rate = distributional overlap.
@@ -81,7 +122,9 @@ def compute_metrics(
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
-        conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, decay_fn)
+        conf_loss = _masked_decayed_mean(
+            bce, loss_mask, pos_idx, decay_fn, position_weights=cat_weights
+        )
         loss = loss + confidence_head_alpha * conf_loss
 
         with torch.no_grad():
@@ -113,6 +156,12 @@ def compute_metrics(
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones
+
+    if cat_weights is not None:
+        with torch.no_grad():
+            mask_f = loss_mask.to(cat_weights.dtype)
+            metrics["cat_weight_mean_sum"] = (cat_weights * mask_f).sum()
+            metrics["cat_weight_mean_total"] = mask_f.sum().clamp_min(1.0)
 
     # Mean acceptance rate of the (Markov-corrected) drafter.
     with torch.no_grad():

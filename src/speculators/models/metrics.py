@@ -256,6 +256,82 @@ def exp_loss_decay(pos_idx: torch.Tensor, gamma: float):
     return gamma**pos_idx
 
 
+def cat_prefix_weights(
+    per_pos_conf: torch.Tensor,  # [1, T]
+    block_size: int,
+    loss_mask: torch.Tensor | None = None,  # [1, T]
+) -> torch.Tensor:
+    """Build PARD-2-style CAT prefix weights from per-position confidences.
+
+    For each speculative block, draft position ``k`` (1-indexed within the block)
+    receives weight ``ŝ_k = ∏_{j<k} c_j`` with ``ŝ_1 = 1``. Anchor slot 0 is 0.
+    Masked positions contribute ``1`` to the product so padding does not shrink
+    later weights. The returned tensor is detached (stop-gradient).
+
+    Args:
+        per_pos_conf: Per-position confidence / acceptance proxy in ``[0, 1]``.
+        block_size: Speculative block size (including the anchor slot).
+        loss_mask: Optional mask; masked slots act as confidence ``1`` in the
+            prefix product.
+
+    Returns:
+        CAT weights with the same shape as ``per_pos_conf``.
+    """
+    conf = per_pos_conf.detach().float()
+    seq_len = conf.shape[-1]
+    if seq_len % block_size != 0:
+        raise ValueError(
+            f"Sequence length {seq_len} is not divisible by block_size {block_size}."
+        )
+    num_blocks = seq_len // block_size
+    conf_blocks = conf.view(num_blocks, block_size)
+    if loss_mask is not None:
+        mask = loss_mask.to(conf.dtype).view(num_blocks, block_size)
+        # Masked / invalid slots should not shrink the prefix product.
+        conf_blocks = conf_blocks * mask + (1.0 - mask)
+
+    draft_conf = conf_blocks[:, 1:].clamp_min(_EPS)
+    ones = torch.ones(num_blocks, 1, device=conf.device, dtype=conf.dtype)
+    # weight for draft slot i uses product of confidences at draft slots < i.
+    prev_prod = torch.cumprod(torch.cat([ones, draft_conf[:, :-1]], dim=-1), dim=-1)
+    weights = torch.zeros_like(conf_blocks)
+    weights[:, 1:] = prev_prod
+    return weights.view_as(per_pos_conf).to(per_pos_conf.dtype)
+
+
+def target_cat_weights(
+    targets: torch.Tensor,  # [1, T, V]
+    block_size: int,
+    loss_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """PARD-2 CAT weights from target-model confidence of the ground-truth token.
+
+    ``ĉ_k = softmax(targets)_k[argmax(targets)_k]``, then prefix-cumprod within
+    each block as in :func:`cat_prefix_weights`.
+    """
+    target_p = torch.nn.functional.softmax(targets.float(), dim=-1)
+    gt_ids = torch.argmax(targets, dim=-1, keepdim=True)
+    conf = target_p.gather(-1, gt_ids).squeeze(-1)  # [1, T]
+    return cat_prefix_weights(conf, block_size, loss_mask=loss_mask)
+
+
+def draft_cat_weights(
+    logits: torch.Tensor,  # [1, T, V]
+    targets: torch.Tensor,  # [1, T, V]
+    block_size: int,
+    loss_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Draft-side CAT weights from analytical acceptance overlap.
+
+    Uses ``a_k = Σ_v min(q_v, p_v)`` (same quantity as ``tv_loss`` / DSpark
+    ``accept_rate``) as the per-position confidence proxy, then prefix-cumprod.
+    """
+    draft_p = torch.nn.functional.softmax(logits.float(), dim=-1)
+    target_p = torch.nn.functional.softmax(targets.float(), dim=-1)
+    accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)  # [1, T]
+    return cat_prefix_weights(accept_rate, block_size, loss_mask=loss_mask)
+
+
 _LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
     "kl_div": kl_div_loss,
     "ce": ce_loss,
@@ -337,6 +413,7 @@ def compound_loss(
     pos_idx: torch.Tensor,
     loss_config: LossConfig,
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    position_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a weighted sum of loss terms.
 
@@ -353,7 +430,13 @@ def compound_loss(
     multi = len(loss_config) > 1
     for name, (fn, weight) in loss_config.items():
         term = loss_function(
-            logits, targets, loss_mask, pos_idx, loss_fn=fn, decay_fn=decay_fn
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_fn=fn,
+            decay_fn=decay_fn,
+            position_weights=position_weights,
         )
         if multi:
             term_losses[f"{name}_loss"] = term.detach()
@@ -368,6 +451,7 @@ def loss_function(
     pos_idx: torch.Tensor,  # shape: [1, seq_len]
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = kl_div_loss,
     decay_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    position_weights: torch.Tensor | None = None,
 ):
     """Compute masked, optionally position-decayed training loss.
 
@@ -378,6 +462,10 @@ def loss_function(
         pos_idx: Position indices within each speculative block.
         loss_fn: Per-position loss function (default: kl_div_loss).
         decay_fn: Optional position-dependent decay weighting function.
+        position_weights: Optional per-position importance weights (e.g. CAT).
+            Detached stop-gradient weights are expected; denominator stays
+            ``loss_mask.sum()`` so this reweights importance without changing
+            the effective sample count.
 
     Returns:
         Scalar mean loss across the batch.
@@ -390,6 +478,9 @@ def loss_function(
     if decay_fn is not None:
         decay_mult = decay_fn(pos_idx.to(elementwise_loss.dtype))
         elementwise_loss = elementwise_loss * decay_mult
+
+    if position_weights is not None:
+        elementwise_loss = elementwise_loss * position_weights.to(elementwise_loss.dtype)
 
     denominator = loss_mask.sum(dim=1) + _EPS
 

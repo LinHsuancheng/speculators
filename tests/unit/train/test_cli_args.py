@@ -159,3 +159,25 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+
+
+def test_dspark_cat_mode_default(monkeypatch):
+    args = _parse(monkeypatch, [])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert args.cat_mode == "none"
+    assert train_kw["cat_mode"] == "none"
+    assert val_kw["cat_mode"] == "none"
+
+
+def test_dspark_cat_mode_target(monkeypatch):
+    args = _parse(monkeypatch, ["--cat-mode", "target"])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["cat_mode"] == "target"
+    assert val_kw["cat_mode"] == "target"
+
+
+def test_dspark_cat_mode_draft(monkeypatch):
+    args = _parse(monkeypatch, ["--cat-mode", "draft"])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["cat_mode"] == "draft"
+    assert val_kw["cat_mode"] == "draft"

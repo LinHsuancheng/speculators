@@ -46,6 +46,8 @@ MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
+# CAT loss reweighting: none | target (PARD-2) | draft (accept-rate prefix)
+CAT_MODE="none"
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
 VLLM_NPUS="0,1,2,3"
@@ -114,6 +116,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --cat-mode "$CAT_MODE" \
     --on-missing generate \
     --on-generate delete \
     > "$LOG_FILE" 2>&1 &

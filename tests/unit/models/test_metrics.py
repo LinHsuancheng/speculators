@@ -9,13 +9,16 @@ from speculators.models.metrics import (
     ce_loss,
     compute_accuracy_single_step,
     dflash_loss_decay,
+    draft_cat_weights,
     exp_loss_decay,
     kl_div_loss,
     lk_hybrid_loss,
     loss_function,
     neg_log_acceptance_loss,
     resolve_loss_fn,
+    target_cat_weights,
     tv_loss,
+    cat_prefix_weights,
 )
 
 
@@ -284,3 +287,59 @@ class TestDecayFunctions:
             0.25
         )
         assert exp_loss_decay(torch.tensor(0.0), gamma=0.5).item() == pytest.approx(1.0)
+
+
+class TestCATWeights:
+    def test_prefix_product_shape_and_values(self):
+        """First draft slot is 1; later slots are prefix products; anchor is 0."""
+        # One block of size 4: anchor + 3 draft slots with conf [_, 0.8, 0.5, 0.2]
+        conf = torch.tensor([[0.0, 0.8, 0.5, 0.2]])
+        weights = cat_prefix_weights(conf, block_size=4)
+        assert weights.shape == (1, 4)
+        assert weights[0, 0].item() == pytest.approx(0.0)
+        assert weights[0, 1].item() == pytest.approx(1.0)
+        assert weights[0, 2].item() == pytest.approx(0.8)
+        assert weights[0, 3].item() == pytest.approx(0.8 * 0.5)
+
+    def test_masked_slots_do_not_shrink_prefix(self):
+        """Masked draft slots contribute 1.0 to the prefix product."""
+        conf = torch.tensor([[0.0, 0.5, 0.1, 0.9]])
+        loss_mask = torch.tensor([[0.0, 1.0, 0.0, 1.0]])
+        weights = cat_prefix_weights(conf, block_size=4, loss_mask=loss_mask)
+        # slot1 weight=1; slot2 masked so product uses 1; slot3 = 0.5 * 1
+        assert weights[0, 1].item() == pytest.approx(1.0)
+        assert weights[0, 3].item() == pytest.approx(0.5)
+
+    def test_target_and_draft_modes_detached(self):
+        """Both CAT builders return stop-gradient weights in [0, 1]."""
+        torch.manual_seed(0)
+        logits = torch.randn(1, 4, 8, requires_grad=True)
+        targets = torch.randn(1, 4, 8, requires_grad=True)
+        tw = target_cat_weights(targets, block_size=4)
+        dw = draft_cat_weights(logits, targets, block_size=4)
+        assert not tw.requires_grad
+        assert not dw.requires_grad
+        assert (tw >= 0).all() and (tw <= 1).all()
+        assert (dw >= 0).all() and (dw <= 1).all()
+        assert tw[0, 0].item() == 0.0
+        assert dw[0, 0].item() == 0.0
+        assert tw[0, 1].item() == pytest.approx(1.0)
+        assert dw[0, 1].item() == pytest.approx(1.0)
+
+    def test_position_weights_scale_loss(self):
+        """CAT-style position_weights must scale the aggregated loss."""
+        torch.manual_seed(1)
+        logits = torch.randn(1, 4, 6)
+        targets = torch.randn(1, 4, 6)
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+        pos_idx = torch.arange(4).unsqueeze(0)
+        base = loss_function(logits, targets, loss_mask, pos_idx, loss_fn=tv_loss)
+        half = loss_function(
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_fn=tv_loss,
+            position_weights=torch.full((1, 4), 0.5),
+        )
+        assert torch.isclose(half, base * 0.5, rtol=1e-4)

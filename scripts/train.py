@@ -1037,6 +1037,18 @@ def parse_args():
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
     )
     parser.add_argument(
+        "--cat-mode",
+        type=str,
+        default="none",
+        choices=["none", "target", "draft"],
+        help=(
+            "DSpark: Confidence-Adaptive Token (CAT) loss reweighting. "
+            "'target' uses PARD-2 target GT-token confidence prefix products; "
+            "'draft' uses analytical draft/target acceptance overlap prefix "
+            "products; 'none' disables CAT (default)."
+        ),
+    )
+    parser.add_argument(
         "--draft-attn-impl",
         type=str,
         default="simple_flex_attention",
