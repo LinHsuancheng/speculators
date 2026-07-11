@@ -11,8 +11,8 @@
 set -euo pipefail
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
-export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
+export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54 no_proxy=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
 
 # ============ Configuration ============
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
@@ -45,12 +45,8 @@ CONFIDENCE_HEAD_ALPHA="${CONFIDENCE_HEAD_ALPHA:-1.0}"
 ASCEND_NPUS="${ASCEND_NPUS:-7}"
 NUM_NPUS="${NUM_NPUS:-1}"
 
-# Extra vLLM arguments. Tune these if KV cache memory is too large or too small.
-VLLM_EXTRA_ARGS=(
-    --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
-    --max-model-len "$SEQ_LENGTH"
-    --max-num-seqs "${VLLM_MAX_NUM_SEQS:-8}"
-)
+# Extra vLLM arguments for Ascend. Matches the runnable TYS 8B server pattern.
+VLLM_EXTRA_ARGS=()
 # =======================================
 
 cleanup() {
@@ -90,8 +86,7 @@ python scripts/data_generation_offline.py \
     --output "$HIDDEN_STATES_DIR" \
     --max-samples "$MAX_SAMPLES" \
     --concurrency "$CONCURRENCY" \
-    --validate-outputs \
-    --fail-on-error
+    --validate-outputs
 
 echo "=== Step 4: Stopping vLLM server ==="
 cleanup
@@ -100,7 +95,7 @@ trap - EXIT
 echo "vLLM server stopped. Ascend NPU(s) freed for training."
 
 echo "=== Step 5: Training DSpark on Ascend NPU(s): $ASCEND_NPUS ==="
-env ASCEND_RT_VISIBLE_DEVICES="$ASCEND_NPUS" torchrun \
+env TASK_QUEUE_ENABLE=2 ASCEND_RT_VISIBLE_DEVICES="$ASCEND_NPUS" torchrun \
     --standalone --nproc_per_node "$NUM_NPUS" \
     scripts/train.py \
     --verifier-name-or-path "$MODEL" \

@@ -11,7 +11,7 @@ set -euo pipefail
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
-export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
+export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54 no_proxy=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
 
 # ============ Configuration ============
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
@@ -43,12 +43,8 @@ VLLM_NPUS="${VLLM_NPUS:-6}"
 TRAIN_NPUS="${TRAIN_NPUS:-7}"
 NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-1}"
 
-# Extra vLLM arguments. Tune these if KV cache memory is too large or too small.
-VLLM_EXTRA_ARGS=(
-    --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
-    --max-model-len "$SEQ_LENGTH"
-    --max-num-seqs "${VLLM_MAX_NUM_SEQS:-8}"
-)
+# Extra vLLM arguments for Ascend. Matches the runnable TYS 8B server pattern.
+VLLM_EXTRA_ARGS=()
 # =======================================
 
 if [[ "$VLLM_NPUS" == "$TRAIN_NPUS" ]]; then
@@ -74,7 +70,7 @@ python scripts/prepare_data.py \
     --seq-length "$SEQ_LENGTH"
 
 echo "=== Step 2: Launching vLLM server on Ascend NPU(s): $VLLM_NPUS ==="
-env ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
+env TASK_QUEUE_ENABLE=1 ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     -- --port "$VLLM_PORT" "${VLLM_EXTRA_ARGS[@]}" &
 VLLM_PID=$!
@@ -87,7 +83,7 @@ done
 echo "vLLM server ready."
 
 echo "=== Step 3: Training DSpark on Ascend NPU(s): $TRAIN_NPUS ==="
-env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
+env TASK_QUEUE_ENABLE=2 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
     --verifier-name-or-path "$MODEL" \
