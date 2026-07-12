@@ -41,9 +41,9 @@ MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-vanilla}"   # vanilla | gated | rnn
 LOSS_FN="${LOSS_FN:-{\"ce\": 0.1, \"tv\": 0.9}}"
 CONFIDENCE_HEAD_ALPHA="${CONFIDENCE_HEAD_ALPHA:-1.0}"
 
-# Offline reuses the same Ascend device sequentially. Device 7 is the default.
-ASCEND_NPUS="${ASCEND_NPUS:-7}"
-NUM_NPUS="${NUM_NPUS:-1}"
+# Offline reuses the same Ascend device sequentially. Device 7 is the default. In docker, 14 and 15 will be mapped to 0 and 1.
+ASCEND_NPUS="${ASCEND_NPUS:-0 1}"
+NUM_NPUS="${NUM_NPUS:-2}"
 
 # Extra vLLM arguments for Ascend. Matches the runnable TYS 8B server pattern.
 VLLM_EXTRA_ARGS=()
