@@ -24,7 +24,7 @@ MAX_SAMPLES="${MAX_SAMPLES:-5000}"
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-3e-4}"
-CONCURRENCY="${CONCURRENCY:-4}"
+CONCURRENCY="${CONCURRENCY:-16}"
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
@@ -42,11 +42,11 @@ LOSS_FN="${LOSS_FN:-{\"ce\": 0.1, \"tv\": 0.9}}"
 CONFIDENCE_HEAD_ALPHA="${CONFIDENCE_HEAD_ALPHA:-1.0}"
 
 # Offline reuses the same Ascend device sequentially. Device 7 is the default. In docker, 14 and 15 will be mapped to 0 and 1.
-ASCEND_NPUS="${ASCEND_NPUS:-0 1}"
+ASCEND_NPUS="${ASCEND_NPUS:-0,1}"
 NUM_NPUS="${NUM_NPUS:-2}"
 
 # Extra vLLM arguments for Ascend. Matches the runnable TYS 8B server pattern.
-VLLM_EXTRA_ARGS=()
+VLLM_EXTRA_ARGS=(--data-parallel-size 2)
 # =======================================
 
 cleanup() {
