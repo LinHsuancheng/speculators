@@ -1,57 +1,66 @@
 #!/bin/bash
-# Online DSpark Training Script
+# Online DSpark Training Script for Qwen3-0.6B on Ascend NPU
 #
-# Runs the full online DSpark training pipeline: data preparation, vLLM server
-# launch, and training (with hidden states generated on-the-fly from the live
-# server). DSpark extends DFlash with a Markov head (intra-block token
-# dependency) and a confidence head (per-position acceptance prediction); the
-# pipeline is the DFlash one plus a few DSpark-specific flags.
+# Runs vLLM and training at the same time. This requires separate Ascend devices
+# for vLLM and training. If only device 7 is available, use the offline script.
 #
-# Usage: Copy this script, modify the configuration variables below, then run:
-#   bash examples/train/dspark_qwen3_0_6b_sharegpt_online.sh
-#
-# For a detailed walkthrough, see
-# https://docs.vllm.ai/projects/speculators/en/latest/user_guide/tutorials/train_dflash_online/
-
-### Example E2E run for DSpark Qwen3-0.6B on 5k samples from ShareGPT ###
-
-# Note: With just 5k samples, performance will be low, but it is enough to verify
-# the pipeline works and DSpark is learning (the Markov head should lift
-# later-position accuracy over plain DFlash).
+# Usage:
+#   VLLM_NPUS=6 TRAIN_NPUS=7 bash examples/train/dspark_qwen3_0_6b_sharegpt_online_ascend.sh
 
 set -euo pipefail
+export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54 no_proxy=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
 
 # ============ Configuration ============
-MODEL="Qwen/Qwen3-0.6B"
-DATASET="sharegpt"                # sharegpt, ultrachat, or path to custom data
-OUTPUT_DIR="./output/dspark_qwen3_0_6b_sharegpt"
-VLLM_PORT=8000
-MAX_SAMPLES=5000
-SEQ_LENGTH=4096
-EPOCHS=5
-LR=3e-4
+MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
+DATASET="${DATASET:-sharegpt}"      # sharegpt, ultrachat, or path to custom data
+OUTPUT_DIR="${OUTPUT_DIR:-./output/dspark_qwen3_0_6b_sharegpt_ascend}"
+VLLM_PORT="${VLLM_PORT:-8000}"
+MAX_SAMPLES="${MAX_SAMPLES:-5000}"
+SEQ_LENGTH="${SEQ_LENGTH:-4096}"
+EPOCHS="${EPOCHS:-5}"
+LR="${LR:-3e-4}"
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
-BLOCK_SIZE=8
-MAX_ANCHORS=3072
-NUM_LAYERS=3
-DRAFT_VOCAB_SIZE=32000
-TARGET_LAYER_IDS="2 14 25"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
+BLOCK_SIZE="${BLOCK_SIZE:-8}"
+MAX_ANCHORS="${MAX_ANCHORS:-512}"
+NUM_LAYERS="${NUM_LAYERS:-3}"
+DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
+TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-2 14 25}"
+DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-sdpa}"
 
 # Markov + confidence head settings
-MARKOV_RANK=256
-MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
-LOSS_FN='{"ce": 0.1, "tv": 0.9}'
-CONFIDENCE_HEAD_ALPHA=1.0
+MARKOV_RANK="${MARKOV_RANK:-256}"
+MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-vanilla}"   # vanilla | gated | rnn
+LOSS_FN="${LOSS_FN:-{\"ce\": 0.1, \"tv\": 0.9}}"
+CONFIDENCE_HEAD_ALPHA="${CONFIDENCE_HEAD_ALPHA:-1.0}"
 
-# GPU assignments (online training needs separate GPUs for vLLM and training)
-VLLM_GPUS="0"
-TRAIN_GPUS="1"
-NUM_TRAIN_GPUS=1
+# Online mode needs separate device sets. Defaults assume training on device 7.
+VLLM_NPUS="${VLLM_NPUS:-6}"
+TRAIN_NPUS="${TRAIN_NPUS:-7}"
+NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-1}"
+
+# Extra vLLM arguments for Ascend. Matches the runnable TYS 8B server pattern.
+VLLM_EXTRA_ARGS=()
 # =======================================
 
-# Step 1: Prepare data
+if [[ "$VLLM_NPUS" == "$TRAIN_NPUS" ]]; then
+    echo "Online mode requires distinct VLLM_NPUS and TRAIN_NPUS. Use offline mode when only one device is available." >&2
+    exit 1
+fi
+
+cleanup() {
+    if [[ -n "${VLLM_PID:-}" ]]; then
+        echo "Stopping vLLM server..."
+        kill "$VLLM_PID" 2>/dev/null || true
+        wait "$VLLM_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
 echo "=== Step 1: Preparing data ==="
 python scripts/prepare_data.py \
     --model "$MODEL" \
@@ -60,31 +69,22 @@ python scripts/prepare_data.py \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH"
 
-# Step 2: Launch vLLM server in the background
-echo "=== Step 2: Launching vLLM server ==="
-CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
+echo "=== Step 2: Launching vLLM server on Ascend NPU(s): $VLLM_NPUS ==="
+env TASK_QUEUE_ENABLE=1 ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
-    -- --port "$VLLM_PORT" &
+    -- --port "$VLLM_PORT" "${VLLM_EXTRA_ARGS[@]}" &
 VLLM_PID=$!
 
-# Ensure vLLM is cleaned up on exit
-cleanup() {
-    echo "Stopping vLLM server..."
-    kill "$VLLM_PID" 2>/dev/null || true
-    wait "$VLLM_PID" 2>/dev/null || true
-}
-trap cleanup EXIT
-
 echo "Waiting for vLLM server to be ready..."
-until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
-    sleep 2
+until curl --noproxy localhost,127.0.0.1 -sf "http://localhost:${VLLM_PORT}/v1/models" > /dev/null 2>&1; do
+    echo "vLLM not ready yet..."
+    sleep 5
 done
 echo "vLLM server ready."
 
-# Step 3: Train DSpark against the live vLLM server
-echo "=== Step 3: Training ==="
-CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
-    --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
+echo "=== Step 3: Training DSpark on Ascend NPU(s): $TRAIN_NPUS ==="
+env TASK_QUEUE_ENABLE=2 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
+    --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
     --verifier-name-or-path "$MODEL" \
     --data-path "$OUTPUT_DIR" \
@@ -98,6 +98,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --block-size "$BLOCK_SIZE" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers "$NUM_LAYERS" \
+    --draft-attn-impl "$DRAFT_ATTN_IMPL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
