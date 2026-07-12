@@ -1,27 +1,30 @@
 #!/bin/bash
-# Online DSpark Training Script for Qwen3-0.6B on Ascend NPU
+# Offline DSpark Training Script for Qwen3-0.6B on Ascend NPU
 #
-# Runs vLLM and training at the same time. This requires separate Ascend devices
-# for vLLM and training. If only device 7 is available, use the offline script.
+# Runs the offline DSpark pipeline on one Ascend device: data preparation,
+# vLLM hidden-state generation, vLLM shutdown, then training on the same device.
+# This is the recommended mode when only one device, such as device 7, is available.
 #
 # Usage:
-#   VLLM_NPUS=6 TRAIN_NPUS=7 bash examples/train/dspark_qwen3_0_6b_sharegpt_online_ascend.sh
+#   bash examples/train/dspark_qwen3_0_6b_sharegpt_offline_ascend.sh
 
 set -euo pipefail
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54 no_proxy=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
 
 # ============ Configuration ============
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 DATASET="${DATASET:-sharegpt}"      # sharegpt, ultrachat, or path to custom data
-OUTPUT_DIR="${OUTPUT_DIR:-./output/dspark_qwen3_0_6b_sharegpt_ascend}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/dspark_qwen3_0_6b_sharegpt_ascend_offline}"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-$OUTPUT_DIR/hidden_states}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 MAX_SAMPLES="${MAX_SAMPLES:-5000}"
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
 EPOCHS="${EPOCHS:-5}"
-LR="${LR:-3e-4}"
+LR="${LR:-6e-4}"
+CONCURRENCY="${CONCURRENCY:-16}"
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
@@ -38,19 +41,13 @@ MARKOV_HEAD_TYPE="${MARKOV_HEAD_TYPE:-vanilla}"   # vanilla | gated | rnn
 LOSS_FN="${LOSS_FN:-{\"ce\": 0.1, \"tv\": 0.9}}"
 CONFIDENCE_HEAD_ALPHA="${CONFIDENCE_HEAD_ALPHA:-1.0}"
 
-# Online mode needs separate device sets. Defaults assume training on device 7.
-VLLM_NPUS="${VLLM_NPUS:-6}"
-TRAIN_NPUS="${TRAIN_NPUS:-7}"
-NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-1}"
+# Offline reuses the same Ascend device sequentially. Device 7 is the default. In docker, 14 and 15 will be mapped to 0 and 1.
+ASCEND_NPUS="${ASCEND_NPUS:-0,1}"
+NUM_NPUS="${NUM_NPUS:-2}"
 
 # Extra vLLM arguments for Ascend. Matches the runnable TYS 8B server pattern.
-VLLM_EXTRA_ARGS=()
+VLLM_EXTRA_ARGS=(--data-parallel-size 2)
 # =======================================
-
-if [[ "$VLLM_NPUS" == "$TRAIN_NPUS" ]]; then
-    echo "Online mode requires distinct VLLM_NPUS and TRAIN_NPUS. Use offline mode when only one device is available." >&2
-    exit 1
-fi
 
 cleanup() {
     if [[ -n "${VLLM_PID:-}" ]]; then
@@ -69,8 +66,8 @@ python scripts/prepare_data.py \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH"
 
-echo "=== Step 2: Launching vLLM server on Ascend NPU(s): $VLLM_NPUS ==="
-env TASK_QUEUE_ENABLE=1 ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
+echo "=== Step 2: Launching vLLM server on Ascend NPU(s): $ASCEND_NPUS ==="
+env ASCEND_RT_VISIBLE_DEVICES="$ASCEND_NPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     -- --port "$VLLM_PORT" "${VLLM_EXTRA_ARGS[@]}" &
 VLLM_PID=$!
@@ -82,13 +79,28 @@ until curl --noproxy localhost,127.0.0.1 -sf "http://localhost:${VLLM_PORT}/v1/m
 done
 echo "vLLM server ready."
 
-echo "=== Step 3: Training DSpark on Ascend NPU(s): $TRAIN_NPUS ==="
-env TASK_QUEUE_ENABLE=2 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
-    --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
+echo "=== Step 3: Generating hidden states ==="
+python scripts/data_generation_offline.py \
+    --preprocessed-data "$OUTPUT_DIR" \
+    --endpoint "http://localhost:${VLLM_PORT}/v1" \
+    --output "$HIDDEN_STATES_DIR" \
+    --max-samples "$MAX_SAMPLES" \
+    --concurrency "$CONCURRENCY" \
+    --validate-outputs
+
+echo "=== Step 4: Stopping vLLM server ==="
+cleanup
+unset VLLM_PID
+trap - EXIT
+echo "vLLM server stopped. Ascend NPU(s) freed for training."
+
+echo "=== Step 5: Training DSpark on Ascend NPU(s): $ASCEND_NPUS ==="
+env TASK_QUEUE_ENABLE=2 ASCEND_RT_VISIBLE_DEVICES="$ASCEND_NPUS" torchrun \
+    --standalone --nproc_per_node "$NUM_NPUS" \
     scripts/train.py \
     --verifier-name-or-path "$MODEL" \
     --data-path "$OUTPUT_DIR" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
+    --hidden-states-path "$HIDDEN_STATES_DIR" \
     --save-path "$OUTPUT_DIR/checkpoints" \
     --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
     --epochs "$EPOCHS" \
@@ -106,7 +118,6 @@ env TASK_QUEUE_ENABLE=2 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
-    --on-missing generate \
-    --on-generate delete
+    --on-missing raise
 
 echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"
