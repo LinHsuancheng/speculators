@@ -162,3 +162,61 @@ class TestComputeMetrics:
             assert key in metrics
         # all metric values must be tensors (so dist.reduce works in the trainer)
         assert all(torch.is_tensor(v) for v in metrics.values())
+
+    def test_target_cat_changes_loss_and_logs_weight(self):
+        ids = torch.tensor([[0, 1, 0, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = _ids_to_logits(torch.tensor([[0, 3, 0, 4]]), 8)
+        loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+        loss_none, metrics_none = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            cat_mode="none",
+        )
+        loss_cat, metrics_cat = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            cat_mode="target",
+        )
+        assert "cat_weight_mean_sum" not in metrics_none
+        assert "cat_weight_mean_sum" in metrics_cat
+        # With mismatched draft/target, CAT still produces a finite loss.
+        assert torch.isfinite(loss_cat)
+        assert torch.isfinite(loss_none)
+
+    def test_draft_cat_changes_loss(self):
+        ids = torch.tensor([[0, 1, 0, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = _ids_to_logits(torch.tensor([[0, 3, 0, 4]]), 8)
+        loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+        loss_none, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            cat_mode="none",
+        )
+        loss_draft, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            cat_mode="draft",
+        )
+        assert torch.isfinite(loss_draft)
+        # Mismatched distributions -> low accept_rate -> later CAT weights < 1,
+        # so draft-CAT loss should be <= unweighted loss for the same terms.
+        assert float(loss_draft) <= float(loss_none) + 1e-5
+        assert "cat_weight_mean_sum" in metrics

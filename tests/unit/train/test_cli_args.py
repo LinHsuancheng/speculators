@@ -53,6 +53,41 @@ def test_dflash_decay_gamma_falls_back_when_omitted():
     assert val_kw["gamma"] == 4.0
 
 
+def test_dflash_default_micro_block_layout(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.block_size == 16
+    assert args.anchor_len == 1
+    assert args.micro_block_size == 0
+    assert args.micro_block_layer_growth is False
+    assert args.max_prev_micro_blocks is None
+    assert args.micro_token_layer_growth is False
+    assert args.max_prev_micro_tokens is None
+
+
+def test_dflash_micro_block_args(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--micro-block-size",
+            "3",
+            "--anchor-len",
+            "1",
+            "--micro-block-layer-growth",
+            "--max-prev-micro-blocks",
+            "4",
+            "--micro-token-layer-growth",
+            "--max-prev-micro-tokens",
+            "2",
+        ],
+    )
+    assert args.micro_block_size == 3
+    assert args.anchor_len == 1
+    assert args.micro_block_layer_growth is True
+    assert args.max_prev_micro_blocks == 4
+    assert args.micro_token_layer_growth is True
+    assert args.max_prev_micro_tokens == 2
+
+
 def test_dflash_compound_loss(monkeypatch):
     args = _parse(monkeypatch, ["--loss-fn", '{"ce": 0.1, "tv": 0.9}'])
     train_kw, val_kw = DFlashDraftModel.get_trainer_kwargs(**vars(args))
@@ -124,3 +159,25 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+
+
+def test_dspark_cat_mode_default(monkeypatch):
+    args = _parse(monkeypatch, [])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert args.cat_mode == "none"
+    assert train_kw["cat_mode"] == "none"
+    assert val_kw["cat_mode"] == "none"
+
+
+def test_dspark_cat_mode_target(monkeypatch):
+    args = _parse(monkeypatch, ["--cat-mode", "target"])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["cat_mode"] == "target"
+    assert val_kw["cat_mode"] == "target"
+
+
+def test_dspark_cat_mode_draft(monkeypatch):
+    args = _parse(monkeypatch, ["--cat-mode", "draft"])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["cat_mode"] == "draft"
+    assert val_kw["cat_mode"] == "draft"

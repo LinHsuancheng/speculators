@@ -929,8 +929,8 @@ def parse_args():
     parser.add_argument(
         "--block-size",
         type=int,
-        default=8,
-        help="Block size for DFlash model (default: 8)",
+        default=16,
+        help="Block size for DFlash/DSpark model (default: 16)",
     )
     parser.add_argument(
         "--max-anchors",
@@ -943,6 +943,65 @@ def parse_args():
         type=float,
         default=4.0,
         help="Decay gamma for DFlash/DSpark loss weighting (default: 4.0)",
+    )
+    parser.add_argument(
+        "--micro-block-size",
+        type=int,
+        default=0,
+        help=(
+            "DFlash/DSpark pseudo-autoregressive micro-block size. "
+            "Speculative positions inside each block are split into chunks of this "
+            "size; chunks are causal across micro blocks and bidirectional within "
+            "each micro block. Defaults to 0 (disabled, original DFlash/DSpark "
+            "mask). Use 3 for a 5x3 layout with --block-size 16 and --anchor-len 1."
+        ),
+    )
+    parser.add_argument(
+        "--anchor-len",
+        type=int,
+        default=1,
+        help=(
+            "Number of leading synthetic positions treated as anchors when "
+            "--micro-block-size is enabled (default: 1)."
+        ),
+    )
+    parser.add_argument(
+        "--micro-block-layer-growth",
+        action="store_true",
+        default=False,
+        help=(
+            "When micro-block attention is enabled, gradually expand previous "
+            "micro-block visibility across deeper draft layers."
+        ),
+    )
+    parser.add_argument(
+        "--max-prev-micro-blocks",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of previous micro blocks visible with "
+            "--micro-block-layer-growth. Defaults to all previous micro blocks."
+        ),
+    )
+    parser.add_argument(
+        "--micro-token-layer-growth",
+        action="store_true",
+        default=False,
+        help=(
+            "When micro-block attention is enabled, gradually expand causal "
+            "token-level visibility inside each micro block across deeper draft "
+            "layers."
+        ),
+    )
+    parser.add_argument(
+        "--max-prev-micro-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of previous tokens visible inside each micro block with "
+            "--micro-token-layer-growth. Defaults to all previous tokens inside the "
+            "micro block."
+        ),
     )
     # DSpark-specific arguments (sequential Markov head + confidence head).
     parser.add_argument(
@@ -976,6 +1035,18 @@ def parse_args():
         type=float,
         default=1.0,
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cat-mode",
+        type=str,
+        default="none",
+        choices=["none", "target", "draft"],
+        help=(
+            "DSpark: Confidence-Adaptive Token (CAT) loss reweighting. "
+            "'target' uses PARD-2 target GT-token confidence prefix products; "
+            "'draft' uses analytical draft/target acceptance overlap prefix "
+            "products; 'none' disables CAT (default)."
+        ),
     )
     parser.add_argument(
         "--draft-attn-impl",

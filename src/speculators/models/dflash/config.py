@@ -42,7 +42,7 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
     )
 
     block_size: int = Field(
-        default=8,
+        default=16,
         description=(
             "Default size of the draft block predicted with a forward pass of the model"
         ),
@@ -76,6 +76,57 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         description="Use non-causal (bidirectional) masking within draft blocks for "
         "sliding window attention layers. Full attention layers are always "
         "bidirectional.",
+    )
+
+    micro_block_size: int | None = Field(
+        default=0,
+        description=(
+            "Enable pseudo-autoregressive micro-block attention within each DFlash "
+            "block when set. Speculative positions are split into micro blocks of "
+            "this size; later micro blocks can attend to earlier ones, while each "
+            "micro block remains bidirectional internally."
+        ),
+    )
+
+    anchor_len: int = Field(
+        default=1,
+        description=(
+            "Number of leading synthetic positions in each block treated as anchors "
+            "by micro-block attention."
+        ),
+    )
+
+    micro_block_layer_growth: bool = Field(
+        default=False,
+        description=(
+            "When micro-block attention is enabled, gradually expand the number of "
+            "previous micro blocks visible at deeper draft layers."
+        ),
+    )
+
+    max_prev_micro_blocks: int | None = Field(
+        default=None,
+        description=(
+            "Maximum number of previous micro blocks visible when layer-wise "
+            "micro-block growth is enabled. Defaults to all previous micro blocks."
+        ),
+    )
+
+    micro_token_layer_growth: bool = Field(
+        default=False,
+        description=(
+            "When micro-block attention is enabled, gradually expand causal "
+            "token-level visibility inside each micro block at deeper draft layers."
+        ),
+    )
+
+    max_prev_micro_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Maximum number of previous tokens visible inside each micro block when "
+            "token-level layer growth is enabled. Defaults to all previous tokens "
+            "inside the micro block."
+        ),
     )
 
     @field_serializer("transformer_layer_config")

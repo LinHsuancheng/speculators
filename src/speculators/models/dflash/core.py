@@ -12,7 +12,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
 from speculators.models.dflash import DFlashSpeculatorConfig
-from speculators.models.dflash.attention import create_anchor_block_mask_mod
+from speculators.models.dflash.attention import (
+    create_anchor_block_mask_mod,
+    create_anchor_micro_block_causal_mask_mod,
+)
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
 from speculators.models.dflash.utils import (
@@ -68,6 +71,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
+        self.num_draft_layers = num_draft_layers
         self.layers = nn.ModuleList(
             [
                 Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
@@ -75,6 +79,67 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ]
         )
         self.sliding_window = tl_config.sliding_window
+        self.micro_block_size = config.micro_block_size or None
+        self.anchor_len = config.anchor_len
+        self.micro_block_layer_growth = config.micro_block_layer_growth
+        self.max_prev_micro_blocks = config.max_prev_micro_blocks
+        self.micro_token_layer_growth = config.micro_token_layer_growth
+        self.max_prev_micro_tokens = config.max_prev_micro_tokens
+        if self.micro_block_size is not None:
+            if self.micro_block_size <= 0:
+                raise ValueError(
+                    f"micro_block_size must be positive, got {self.micro_block_size}"
+                )
+            if self.anchor_len < 0 or self.anchor_len >= config.block_size:
+                raise ValueError(
+                    "anchor_len must be in [0, block_size), got "
+                    f"anchor_len={self.anchor_len}, block_size={config.block_size}"
+                )
+            spec_len = config.block_size - self.anchor_len
+            if spec_len % self.micro_block_size != 0:
+                raise ValueError(
+                    "block_size - anchor_len must be divisible by micro_block_size, "
+                    f"got block_size={config.block_size}, "
+                    f"anchor_len={self.anchor_len}, "
+                    f"micro_block_size={self.micro_block_size}"
+                )
+            if (
+                self.max_prev_micro_blocks is not None
+                and self.max_prev_micro_blocks < 0
+            ):
+                raise ValueError(
+                    "max_prev_micro_blocks must be non-negative when set, got "
+                    f"{self.max_prev_micro_blocks}"
+                )
+            if (
+                self.max_prev_micro_tokens is not None
+                and self.max_prev_micro_tokens < 0
+            ):
+                raise ValueError(
+                    "max_prev_micro_tokens must be non-negative when set, got "
+                    f"{self.max_prev_micro_tokens}"
+                )
+            self.num_micro_blocks = spec_len // self.micro_block_size
+            if self.max_prev_micro_blocks is None:
+                self.max_prev_micro_blocks = self.num_micro_blocks - 1
+            else:
+                self.max_prev_micro_blocks = min(
+                    self.max_prev_micro_blocks, self.num_micro_blocks - 1
+                )
+            if self.max_prev_micro_tokens is None:
+                self.max_prev_micro_tokens = self.micro_block_size - 1
+            else:
+                self.max_prev_micro_tokens = min(
+                    self.max_prev_micro_tokens, self.micro_block_size - 1
+                )
+        elif self.micro_block_layer_growth:
+            raise ValueError(
+                "micro_block_layer_growth=True requires micro_block_size > 0."
+            )
+        elif self.micro_token_layer_growth:
+            raise ValueError(
+                "micro_token_layer_growth=True requires micro_block_size > 0."
+            )
         self.sliding_window_indices = [
             i
             for i, layer_type in enumerate(tl_config.layer_types)
@@ -174,7 +239,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
             "draft_attn_impl", "simple_flex_attention"
         )
-        block_size = kwargs.get("block_size", 8)
+        block_size = kwargs.get("block_size", 16)
+        micro_block_size = kwargs.get("micro_block_size", 0) or None
         return {
             "transformer_layer_config": verifier_config,
             "draft_vocab_size": kwargs["draft_vocab_size"],
@@ -183,6 +249,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
+            "micro_block_size": micro_block_size,
+            "anchor_len": kwargs.get("anchor_len", 1),
+            "micro_block_layer_growth": kwargs.get(
+                "micro_block_layer_growth", False
+            ),
+            "max_prev_micro_blocks": kwargs.get("max_prev_micro_blocks"),
+            "micro_token_layer_growth": kwargs.get(
+                "micro_token_layer_growth", False
+            ),
+            "max_prev_micro_tokens": kwargs.get("max_prev_micro_tokens"),
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
@@ -230,15 +306,31 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         device: torch.device,
         sliding_window: int | None = None,
         sliding_window_non_causal: bool = False,
+        max_prev_micro_blocks: int | None = None,
+        max_prev_micro_tokens: int | None = None,
     ):
-        mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
-            document_ids=document_ids.squeeze(0).to(device),
-            total_seq_len=total_seq_len,
-            anchor_positions=anchor_positions,
-            block_size=self.block_size,
-            sliding_window=sliding_window,
-            sliding_window_non_causal=sliding_window_non_causal,
-        )
+        document_ids = document_ids.squeeze(0).to(device)
+        if self.micro_block_size is None:
+            mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                block_size=self.block_size,
+                sliding_window=sliding_window,
+                sliding_window_non_causal=sliding_window_non_causal,
+            )
+        else:
+            mask_mod, q_len, kv_len = create_anchor_micro_block_causal_mask_mod(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                block_size=self.block_size,
+                micro_block_size=self.micro_block_size,
+                anchor_len=self.anchor_len,
+                sliding_window=sliding_window,
+                max_prev_micro_blocks=max_prev_micro_blocks,
+                max_prev_micro_tokens=max_prev_micro_tokens,
+            )
         return self._create_mask_fn(
             mask_mod,
             B=None,
@@ -247,6 +339,42 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             KV_LEN=kv_len,
             device=device,
         )
+
+    def _max_prev_micro_blocks_for_layer(self, layer_idx: int) -> int | None:
+        if self.micro_block_size is None:
+            return None
+        if not self.micro_block_layer_growth:
+            return self.max_prev_micro_blocks
+        return min(layer_idx, self.max_prev_micro_blocks)
+
+    def _max_prev_micro_tokens_for_layer(self, layer_idx: int) -> int | None:
+        if self.micro_block_size is None or not self.micro_token_layer_growth:
+            return None
+        return min(layer_idx, self.max_prev_micro_tokens)
+
+    def _create_attention_masks_for_layers(self, **kwargs):
+        if self.micro_block_size is not None and (
+            self.micro_block_layer_growth or self.micro_token_layer_growth
+        ):
+            return [
+                self._create_attention_mask(
+                    **kwargs,
+                    max_prev_micro_blocks=self._max_prev_micro_blocks_for_layer(
+                        layer_idx
+                    ),
+                    max_prev_micro_tokens=self._max_prev_micro_tokens_for_layer(
+                        layer_idx
+                    ),
+                )
+                for layer_idx in range(self.num_draft_layers)
+            ]
+
+        mask = self._create_attention_mask(
+            **kwargs,
+            max_prev_micro_blocks=self._max_prev_micro_blocks_for_layer(0),
+            max_prev_micro_tokens=self._max_prev_micro_tokens_for_layer(0),
+        )
+        return [mask] * self.num_draft_layers
 
     @torch.compiler.disable
     def _build_attention_mask(self, loss_mask, document_ids, device):
@@ -258,7 +386,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         full_attn_mask = None
         if self.uses_full_attn:
-            full_attn_mask = self._create_attention_mask(
+            full_attn_mask = self._create_attention_masks_for_layers(
                 document_ids=document_ids,
                 total_seq_len=total_seq_len,
                 anchor_positions=anchor_positions,
@@ -268,7 +396,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         sliding_window_attn_mask = None
         if self.uses_sliding_window_attn:
-            sliding_window_attn_mask = self._create_attention_mask(
+            sliding_window_attn_mask = self._create_attention_masks_for_layers(
                 document_ids=document_ids,
                 total_seq_len=total_seq_len,
                 anchor_positions=anchor_positions,
@@ -351,9 +479,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
                 target_hidden=fc_output,
-                attention_mask=sliding_window_attn_mask
-                if layer_idx in self.sliding_window_indices
-                else full_attn_mask,
+                attention_mask=(
+                    sliding_window_attn_mask[layer_idx]
+                    if layer_idx in self.sliding_window_indices
+                    else full_attn_mask[layer_idx]
+                ),
                 position_ids=position_ids,
                 use_cache=False,
                 position_embeddings=position_embeddings,
