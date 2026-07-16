@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,23 @@ def _print_json(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def _wait_for_hidden_state_file(path: Path, timeout: float) -> None:
+    from speculators.data_generation.vllm_client import wait_for_lock  # noqa: PLC0415
+
+    lock_path = Path(str(path) + ".lock")
+    deadline = time.monotonic() + timeout
+    if lock_path.exists():
+        wait_for_lock(str(lock_path), timeout=timeout)
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise FileNotFoundError(f"Timed out waiting for hidden state file: {path}")
+        if lock_path.exists():
+            remaining = max(deadline - time.monotonic(), 0.1)
+            wait_for_lock(str(lock_path), timeout=remaining)
+            continue
+        time.sleep(0.05)
+
+
 def _inspect_one(
     *,
     dataset,
@@ -128,6 +146,7 @@ def _inspect_one(
     )
     if hs_path is None:
         raise ValueError("Response missing kv_transfer_params.hidden_states_path")
+    _wait_for_hidden_state_file(Path(hs_path), args.file_timeout)
     loaded = load_file(hs_path)
     actual_ids = loaded["token_ids"].tolist()
     hidden = loaded["hidden_states"]
@@ -219,6 +238,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--token-preview", type=int, default=16)
     parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT)
+    parser.add_argument(
+        "--file-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the hidden-state safetensors file to appear.",
+    )
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument(
         "--keep-generated",
