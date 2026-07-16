@@ -545,19 +545,23 @@ def main(args: argparse.Namespace):  # noqa: C901
         def _load_last_layer_hs(path: str) -> torch.Tensor:
             """Load a vLLM hidden-states file and return last-layer [seq_len, H].
 
-            The raw dump layout is resolved defensively: a 2D ``[seq_len, L*H]``
-            concatenation keeps the trailing ``H`` columns (last layer), a 3D
-            ``[L, seq_len, H]`` takes ``[-1]``, and ``[seq_len, L, H]`` takes
-            ``[:, -1]``. If the file cannot be read, an error is raised so the
-            failure is loud rather than silently corrupting ``p_t``.
+            The vLLM-Ascend hidden_states format is [seq_len, num_layers, H].
+            Extract the last layer: hs[:, -1, :].
             """
             loaded = _maybe_load_hs_file(Path(path))
             if loaded is None or "hidden_states" not in loaded:
                 raise ValueError(f"Failed to load hidden states from {path}")
             hs = loaded["hidden_states"]
-            if hs.ndim == 3:  # noqa: PLR2004
-                # [L, seq_len, H] vs [seq_len, L, H]: last layer along the L axis.
-                return hs[-1] if hs.shape[0] < hs.shape[1] else hs[:, -1]
+
+            # Handle empty tensor (vLLM failure or extreme APC)
+            if hs.shape[0] == 0:
+                raise ValueError(f"Empty hidden states from {path}")
+
+            # Extract last layer from 3D [seq_len, num_layers, hidden]
+            if hs.ndim == 3:
+                return hs[:, -1, :]  # [seq_len, hidden]
+
+            # Fallback for 2D [seq_len, hidden] or [seq_len, layers*hidden]
             if hs.shape[-1] != hidden_size:
                 return hs[:, -hidden_size:]
             return hs
