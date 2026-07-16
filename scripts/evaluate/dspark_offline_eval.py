@@ -354,6 +354,52 @@ def _rank_prefix(args: argparse.Namespace) -> str:
     return f"rank={args.worker_rank}/{args.worker_count}"
 
 
+def _progress_path_for(args: argparse.Namespace, dataset: str) -> Path | None:
+    if args.progress_path is not None:
+        return args.progress_path
+    if args.progress_root is None or args.worker_rank is None:
+        return None
+    return args.progress_root / dataset / f"rank{args.worker_rank}.json"
+
+
+def _progress_paths_for_dataset(
+    progress_root: Path,
+    dataset: str,
+    worker_count: int,
+) -> list[Path]:
+    return [progress_root / dataset / f"rank{rank}.json" for rank in range(worker_count)]
+
+
+def _write_progress(
+    progress_path: Path | None,
+    *,
+    dataset: str,
+    done: int,
+    total: int,
+    stats: EvalStats,
+    elapsed_s: float,
+) -> None:
+    if progress_path is None:
+        return
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "dataset": dataset,
+        "done": done,
+        "total": total,
+        "elapsed_s": elapsed_s,
+        "total_output_tokens": stats.total_output_tokens,
+        "num_proposals": stats.num_proposals,
+        "num_proposed_draft_tokens": stats.num_proposed_draft_tokens,
+        "num_accepted_draft_tokens": stats.num_accepted_draft_tokens,
+        "acceptance_length": stats.acceptance_length,
+        "accepted_draft_length": stats.accepted_draft_length,
+    }
+    tmp_path = progress_path.with_suffix(progress_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    tmp_path.replace(progress_path)
+
+
 def _evaluate_dataset(
     *,
     path: Path,
@@ -380,7 +426,20 @@ def _evaluate_dataset(
     stats = EvalStats()
     artifacts: list[dict[str, Any]] = []
     start = time.perf_counter()
-    use_tqdm = tqdm is not None and not args.no_progress
+    progress_path = _progress_path_for(args, path.stem)
+    _write_progress(
+        progress_path,
+        dataset=path.stem,
+        done=0,
+        total=len(records),
+        stats=stats,
+        elapsed_s=0.0,
+    )
+    use_tqdm = (
+        tqdm is not None
+        and not args.no_progress
+        and args.worker_rank is None
+    )
     iterator = enumerate(records, start=1)
     if use_tqdm:
         iterator = tqdm(
@@ -458,7 +517,23 @@ def _evaluate_dataset(
                     out_tps,
                     stats.acceptance_length,
                 )
+        _write_progress(
+            progress_path,
+            dataset=path.stem,
+            done=row_idx,
+            total=len(records),
+            stats=stats,
+            elapsed_s=elapsed,
+        )
     stats.elapsed_s = time.perf_counter() - start
+    _write_progress(
+        progress_path,
+        dataset=path.stem,
+        done=len(records),
+        total=len(records),
+        stats=stats,
+        elapsed_s=stats.elapsed_s,
+    )
 
     row = {
         "dataset": path.stem,
@@ -531,7 +606,12 @@ def _resolve_num_workers(args: argparse.Namespace) -> int:
     return max(1, len(devices))
 
 
-def _child_cmd(args: argparse.Namespace, rank: int, worker_count: int, output_dir: Path):
+def _child_cmd(
+    args: argparse.Namespace,
+    rank: int,
+    worker_count: int,
+    output_dir: Path,
+):
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -563,6 +643,8 @@ def _child_cmd(args: argparse.Namespace, rank: int, worker_count: int, output_di
     ]
     if args.datasets:
         cmd.extend(["--datasets", args.datasets])
+    if args.progress_root is not None:
+        cmd.extend(["--progress-root", str(args.progress_root)])
     if args.max_samples is not None:
         cmd.extend(["--max-samples", str(args.max_samples)])
     if args.trust_remote_code:
@@ -574,7 +656,39 @@ def _child_cmd(args: argparse.Namespace, rank: int, worker_count: int, output_di
     return cmd
 
 
-def _merge_worker_outputs(output_dir: Path, worker_dirs: list[Path]) -> None:
+def _merge_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("Cannot merge empty worker rows")
+    dataset = str(rows[0]["dataset"])
+    elapsed = max(float(row["elapsed_s"]) for row in rows)
+    num_requests = sum(int(row["num_requests"]) for row in rows)
+    total_output_tokens = sum(int(row["total_output_tokens"]) for row in rows)
+    num_proposals = sum(int(row["num_proposals"]) for row in rows)
+    num_proposed = sum(int(row["num_proposed_draft_tokens"]) for row in rows)
+    num_accepted = sum(int(row["num_accepted_draft_tokens"]) for row in rows)
+    return {
+        "dataset": dataset,
+        "num_requests": num_requests,
+        "elapsed_s": elapsed,
+        "requests_per_second": num_requests / elapsed if elapsed else 0,
+        "output_tokens_per_second": total_output_tokens / elapsed if elapsed else 0,
+        "total_output_tokens": total_output_tokens,
+        "num_proposals": num_proposals,
+        "num_proposed_draft_tokens": num_proposed,
+        "num_accepted_draft_tokens": num_accepted,
+        "acceptance_length": (
+            1.0 + num_accepted / num_proposals if num_proposals else 1.0
+        ),
+        "accepted_draft_length": num_accepted / num_proposals if num_proposals else 0.0,
+    }
+
+
+def _merge_worker_outputs(
+    output_dir: Path,
+    worker_dirs: list[Path],
+    *,
+    write_outputs: bool = True,
+) -> list[dict[str, Any]]:
     rows_by_dataset: dict[str, list[dict[str, Any]]] = {}
     for worker_dir in worker_dirs:
         summary_path = worker_dir / "summary.json"
@@ -586,34 +700,10 @@ def _merge_worker_outputs(output_dir: Path, worker_dirs: list[Path]) -> None:
 
     merged_rows: list[dict[str, Any]] = []
     for dataset, rows in sorted(rows_by_dataset.items()):
-        elapsed = max(float(row["elapsed_s"]) for row in rows)
-        num_requests = sum(int(row["num_requests"]) for row in rows)
-        total_output_tokens = sum(int(row["total_output_tokens"]) for row in rows)
-        num_proposals = sum(int(row["num_proposals"]) for row in rows)
-        num_proposed = sum(int(row["num_proposed_draft_tokens"]) for row in rows)
-        num_accepted = sum(int(row["num_accepted_draft_tokens"]) for row in rows)
-        merged_rows.append(
-            {
-                "dataset": dataset,
-                "num_requests": num_requests,
-                "elapsed_s": elapsed,
-                "requests_per_second": num_requests / elapsed if elapsed else 0,
-                "output_tokens_per_second": (
-                    total_output_tokens / elapsed if elapsed else 0
-                ),
-                "total_output_tokens": total_output_tokens,
-                "num_proposals": num_proposals,
-                "num_proposed_draft_tokens": num_proposed,
-                "num_accepted_draft_tokens": num_accepted,
-                "acceptance_length": (
-                    1.0 + num_accepted / num_proposals if num_proposals else 1.0
-                ),
-                "accepted_draft_length": (
-                    num_accepted / num_proposals if num_proposals else 0.0
-                ),
-            }
-        )
+        merged_rows.append(_merge_rows(rows))
 
+    if not write_outputs:
+        return merged_rows
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS)
@@ -624,6 +714,8 @@ def _merge_worker_outputs(output_dir: Path, worker_dirs: list[Path]) -> None:
 
     artifacts_dir = output_dir / "artifacts"
     artifacts_dir.mkdir(exist_ok=True)
+    for artifact_path in artifacts_dir.glob("*.jsonl"):
+        artifact_path.unlink()
     for worker_dir in worker_dirs:
         worker_artifacts = worker_dir / "artifacts"
         if not worker_artifacts.exists():
@@ -634,6 +726,169 @@ def _merge_worker_outputs(output_dir: Path, worker_dirs: list[Path]) -> None:
             ).open("a", encoding="utf-8") as dst:
                 for line in src:
                     dst.write(line)
+    return merged_rows
+
+
+def _read_progress(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _aggregate_progress(progress_paths: list[Path]) -> dict[str, Any]:
+    done = 0
+    total = 0
+    elapsed_s = 0.0
+    total_output_tokens = 0
+    num_proposals = 0
+    num_accepted = 0
+    for progress_path in progress_paths:
+        progress = _read_progress(progress_path)
+        if progress is None:
+            continue
+        done += int(progress.get("done", 0))
+        total += int(progress.get("total", 0))
+        elapsed_s = max(elapsed_s, float(progress.get("elapsed_s", 0.0)))
+        total_output_tokens += int(progress.get("total_output_tokens", 0))
+        num_proposals += int(progress.get("num_proposals", 0))
+        num_accepted += int(progress.get("num_accepted_draft_tokens", 0))
+    out_tps = total_output_tokens / elapsed_s if elapsed_s else 0.0
+    acc_len = 1.0 + num_accepted / num_proposals if num_proposals else 1.0
+    return {
+        "done": done,
+        "total": total,
+        "elapsed_s": elapsed_s,
+        "total_output_tokens": total_output_tokens,
+        "output_tokens_per_second": out_tps,
+        "acceptance_length": acc_len,
+    }
+
+
+def _set_dataset_progress_postfix(progress_bar, progress: dict[str, Any]) -> None:
+    progress_bar.set_postfix(
+        out_tok=progress["total_output_tokens"],
+        out_tps=f"{progress['output_tokens_per_second']:.2f}",
+        acc_len=f"{progress['acceptance_length']:.3f}",
+    )
+
+
+def _all_dataset_progress_done(progress_paths: list[Path]) -> bool:
+    for progress_path in progress_paths:
+        progress = _read_progress(progress_path)
+        if progress is None:
+            return False
+        if int(progress.get("done", 0)) < int(progress.get("total", 0)):
+            return False
+    return True
+
+
+def _wait_for_dataset_workers(
+    *,
+    dataset: str,
+    procs: list[subprocess.Popen],
+    progress_paths: list[Path],
+    total_samples: int,
+    args: argparse.Namespace,
+) -> None:
+    use_tqdm = tqdm is not None and not args.no_progress
+    progress_bar = None
+    if use_tqdm:
+        progress_bar = tqdm(
+            total=total_samples,
+            desc=dataset,
+            unit="sample",
+            dynamic_ncols=True,
+        )
+
+    failed: list[tuple[int, int]] = []
+    last_done = 0
+    last_log_done = 0
+    try:
+        while True:
+            progress = _aggregate_progress(progress_paths)
+            done = min(int(progress["done"]), total_samples)
+            if progress_bar is not None:
+                if done > last_done:
+                    progress_bar.update(done - last_done)
+                    last_done = done
+                _set_dataset_progress_postfix(progress_bar, progress)
+            elif (
+                done != last_log_done
+                and (
+                    done == total_samples
+                    or done == 1
+                    or done - last_log_done >= args.log_every
+                )
+            ):
+                logger.info(
+                    "[%s] %d/%d samples | out_tok=%d | out_tps=%.2f | acc_len=%.3f",
+                    dataset,
+                    done,
+                    total_samples,
+                    progress["total_output_tokens"],
+                    progress["output_tokens_per_second"],
+                    progress["acceptance_length"],
+                )
+                last_log_done = done
+
+            failed = [
+                (rank, ret)
+                for rank, proc in enumerate(procs)
+                if (ret := proc.poll()) not in (None, 0)
+            ]
+            if failed:
+                break
+            if _all_dataset_progress_done(progress_paths):
+                break
+            time.sleep(0.5)
+
+        progress = _aggregate_progress(progress_paths)
+        done = min(int(progress["done"]), total_samples)
+        if progress_bar is not None:
+            if done > last_done:
+                progress_bar.update(done - last_done)
+            _set_dataset_progress_postfix(progress_bar, progress)
+        if failed:
+            raise RuntimeError(f"[{dataset}] worker failures: {failed}")
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+
+def _wait_at_dataset_barrier(args: argparse.Namespace, dataset: str) -> None:
+    if args.progress_root is None or args.worker_rank is None:
+        return
+    progress_paths = _progress_paths_for_dataset(
+        args.progress_root,
+        dataset,
+        args.worker_count,
+    )
+    while not _all_dataset_progress_done(progress_paths):
+        time.sleep(0.5)
+
+
+def _terminate_workers(procs: list[subprocess.Popen]) -> None:
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in procs:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def _wait_for_all_workers(procs: list[subprocess.Popen]) -> None:
+    failed = []
+    for rank, proc in enumerate(procs):
+        ret = proc.wait()
+        if ret != 0:
+            failed.append((rank, ret))
+    if failed:
+        raise RuntimeError(f"Worker failures: {failed}")
 
 
 def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
@@ -645,7 +900,10 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
         )
 
     worker_root = args.output_dir / "workers"
+    progress_root = args.output_dir / "progress"
+    args.progress_root = progress_root
     worker_root.mkdir(parents=True, exist_ok=True)
+    progress_root.mkdir(parents=True, exist_ok=True)
     logger.info(
         "Launching %d worker(s) | output_dir=%s | device=%s | max_samples=%s | "
         "max_new_tokens=%s | log_every=%s | verbose_samples=%s | "
@@ -660,6 +918,19 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
         os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
         os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     )
+
+    dataset_names = args.datasets.split(",") if args.datasets else None
+    dataset_paths = _discover_datasets(args.datasets_root, dataset_names)
+    logger.info(
+        "Running datasets sequentially: %s",
+        ", ".join(path.stem for path in dataset_paths),
+    )
+
+    for dataset_path in dataset_paths:
+        dataset_progress_dir = progress_root / dataset_path.stem
+        dataset_progress_dir.mkdir(parents=True, exist_ok=True)
+        for progress_path in dataset_progress_dir.glob("rank*.json"):
+            progress_path.unlink()
 
     procs = []
     worker_dirs = []
@@ -680,13 +951,33 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
         logger.info("Worker %d command: %s", rank, " ".join(cmd))
         procs.append(subprocess.Popen(cmd, env=env))  # noqa: S603
 
-    failed = []
-    for rank, proc in enumerate(procs):
-        ret = proc.wait()
-        if ret != 0:
-            failed.append((rank, ret))
-    if failed:
-        raise RuntimeError(f"Worker failures: {failed}")
+    try:
+        for dataset_path in dataset_paths:
+            records = _load_jsonl(dataset_path)
+            if args.max_samples is not None:
+                records = records[: args.max_samples]
+            total_samples = len(records)
+            logger.info(
+                "[%s] waiting for %d worker(s), %d total samples",
+                dataset_path.stem,
+                worker_count,
+                total_samples,
+            )
+            _wait_for_dataset_workers(
+                dataset=dataset_path.stem,
+                procs=procs,
+                progress_paths=_progress_paths_for_dataset(
+                    progress_root,
+                    dataset_path.stem,
+                    worker_count,
+                ),
+                total_samples=total_samples,
+                args=args,
+            )
+        _wait_for_all_workers(procs)
+    except Exception:
+        _terminate_workers(procs)
+        raise
 
     _merge_worker_outputs(args.output_dir, worker_dirs)
     logger.info("Merged worker results into %s", args.output_dir)
@@ -798,6 +1089,7 @@ def run(args: argparse.Namespace) -> None:
             row["output_tokens_per_second"],
             row["acceptance_length"],
         )
+        _wait_at_dataset_barrier(args, path.stem)
 
     _write_outputs(args.output_dir, rows, artifacts_by_dataset)
     logger.info("Wrote results to %s", args.output_dir)
@@ -856,6 +1148,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--worker-rank", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--progress-path", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--progress-root", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser.parse_args()
 
