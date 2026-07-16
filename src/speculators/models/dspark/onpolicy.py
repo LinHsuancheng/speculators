@@ -169,6 +169,16 @@ class VLLMVerifierScorer:
                 timeout=self.request_timeout,
             )
             hs = self.load_hidden_states(path).to(device)  # [seq_len, H or L*H]
+
+            # Check for empty hidden states (vLLM request failure or extreme APC case)
+            if hs.shape[0] == 0:
+                warnings.warn(
+                    f"Sample {b}: vLLM returned empty hidden states (0 tokens) "
+                    f"for sequence with {len(seq)} tokens. Skipping."
+                )
+                valid_mask[b] = False
+                continue
+
             # Keep only the last-layer block if a multi-layer row was returned.
             if hs.shape[-1] != self.hidden_size:
                 hs = hs[:, -self.hidden_size :]
