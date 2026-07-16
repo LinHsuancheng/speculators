@@ -56,19 +56,6 @@ def _wait_for_hidden_state_file(path: Path, timeout: float) -> None:
         time.sleep(0.05)
 
 
-def _delete_generated_hidden_state(path_value: str | None, timeout: float) -> bool:
-    if path_value is None:
-        return False
-    path = Path(path_value)
-    try:
-        _wait_for_hidden_state_file(path, timeout)
-    except FileNotFoundError:
-        pass
-    path.unlink(missing_ok=True)
-    Path(str(path) + ".lock").unlink(missing_ok=True)
-    return True
-
-
 def _get_prompt_token_ids(response: Any) -> list[int] | None:
     choices = getattr(response, "choices", None)
     if choices:
@@ -86,56 +73,6 @@ def _get_kv_hidden_path(response: Any) -> str | None:
     if isinstance(params, dict):
         return params.get("hidden_states_path")
     return None
-
-
-def _get_prompt_logprobs(response: Any) -> Any:
-    choices = getattr(response, "choices", None)
-    if choices:
-        prompt_logprobs = getattr(choices[0], "prompt_logprobs", None)
-        if prompt_logprobs is not None:
-            return prompt_logprobs
-    prompt_logprobs = getattr(response, "prompt_logprobs", None)
-    if prompt_logprobs is not None:
-        return prompt_logprobs
-    if hasattr(response, "model_dump"):
-        dumped = response.model_dump()
-        if dumped.get("choices"):
-            return dumped["choices"][0].get("prompt_logprobs")
-        return dumped.get("prompt_logprobs")
-    return None
-
-
-def _summarize_prompt_logprobs(prompt_logprobs: Any, score_positions: range) -> dict:
-    if prompt_logprobs is None:
-        return {"present": False}
-    try:
-        total_len = len(prompt_logprobs)
-    except TypeError:
-        return {
-            "present": True,
-            "type": type(prompt_logprobs).__name__,
-            "repr": repr(prompt_logprobs)[:300],
-        }
-
-    non_null = 0
-    scored_non_null = 0
-    first_non_null = None
-    for idx, item in enumerate(prompt_logprobs):
-        if item is None:
-            continue
-        non_null += 1
-        if idx in score_positions:
-            scored_non_null += 1
-        if first_non_null is None:
-            first_non_null = repr(item)[:300]
-    return {
-        "present": True,
-        "len": total_len,
-        "non_null": non_null,
-        "scored_positions": [score_positions.start, score_positions.stop],
-        "scored_non_null": scored_non_null,
-        "first_non_null": first_non_null,
-    }
 
 
 def _request_hidden_states(
@@ -231,13 +168,15 @@ def _build_scoring_prompt(
     input_ids: list[int],
     prefix_tokens: int,
     score_tokens: int,
-) -> tuple[list[int], range]:
+) -> tuple[list[int], list[int]]:
     if len(input_ids) < 2:
         raise ValueError("Need at least two tokens for prompt scoring")
     score_tokens = min(score_tokens, len(input_ids) - 1)
     prefix_tokens = min(max(prefix_tokens, 1), len(input_ids) - score_tokens)
-    score_ids = input_ids[: prefix_tokens + score_tokens]
-    return score_ids, range(prefix_tokens, len(score_ids))
+    return (
+        input_ids[:prefix_tokens],
+        input_ids[prefix_tokens : prefix_tokens + score_tokens],
+    )
 
 
 def _score_prompt_logprobs(
@@ -247,63 +186,35 @@ def _score_prompt_logprobs(
     input_ids: list[int],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    score_ids, score_positions = _build_scoring_prompt(
+    from speculators.data_generation.vllm_client import (  # noqa: PLC0415
+        score_sampled_tokens,
+    )
+
+    prefix_ids, sampled_ids = _build_scoring_prompt(
         input_ids,
         prefix_tokens=args.score_prefix_tokens,
         score_tokens=args.score_tokens,
     )
-    extra_body = {
-        "return_token_ids": True,
-        "prompt_logprobs": args.prompt_logprobs,
-    }
-
-    max_tokens_used = args.score_max_tokens
-    try:
-        response = client.completions.create(
-            model=model,
-            prompt=score_ids,
-            max_tokens=max_tokens_used,
-            extra_body=extra_body,
-            timeout=args.request_timeout,
-        )
-    except Exception as exc:
-        if not args.retry_score_max_tokens_one or max_tokens_used != 0:
-            raise
-        max_tokens_used = 1
-        response = client.completions.create(
-            model=model,
-            prompt=score_ids,
-            max_tokens=max_tokens_used,
-            extra_body=extra_body,
-            timeout=args.request_timeout,
-        )
-        retry_note = f"max_tokens=0 failed with {type(exc).__name__}: {exc}"
-    else:
-        retry_note = None
-
-    response_prompt_ids = _get_prompt_token_ids(response)
-    prompt_logprobs = _get_prompt_logprobs(response)
-    summary = _summarize_prompt_logprobs(prompt_logprobs, score_positions)
-    ignored_hs_path = _get_kv_hidden_path(response)
-    ignored_hs_deleted = False
-    if not args.keep_generated:
-        ignored_hs_deleted = _delete_generated_hidden_state(
-            ignored_hs_path, args.file_timeout
-        )
+    scored = score_sampled_tokens(
+        client=client,
+        model=model,
+        prefix_token_ids=prefix_ids,
+        sampled_token_ids=sampled_ids,
+        prompt_logprobs=args.prompt_logprobs,
+        timeout=args.request_timeout,
+        cleanup_hidden_states=not args.keep_generated,
+        hidden_states_file_timeout=args.file_timeout,
+    )
 
     return {
-        "ok": bool(summary.get("present")),
-        "score_prompt_len": len(score_ids),
-        "score_positions": [score_positions.start, score_positions.stop],
-        "max_tokens_used": max_tokens_used,
-        "retry_note": retry_note,
-        "prompt_token_ids_len": None
-        if response_prompt_ids is None
-        else len(response_prompt_ids),
-        "prompt_token_ids_match": response_prompt_ids == score_ids,
-        "prompt_logprobs": summary,
-        "ignored_hidden_states_path": ignored_hs_path,
-        "ignored_hidden_states_deleted": ignored_hs_deleted,
+        "ok": True,
+        "score_prompt_len": len(scored["prompt_token_ids"]),
+        "prefix_len": len(prefix_ids),
+        "sampled_len": len(sampled_ids),
+        "score_positions": scored["score_positions"],
+        "target_token_logprobs": scored["token_logprobs"],
+        "ignored_hidden_states_path": scored["hidden_states_path"],
+        "ignored_hidden_states_deleted": scored["hidden_states_deleted"],
     }
 
 
@@ -326,19 +237,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-prefix-tokens", type=int, default=128)
     parser.add_argument("--score-tokens", type=int, default=8)
     parser.add_argument("--prompt-logprobs", type=int, default=1)
-    parser.add_argument(
-        "--score-max-tokens",
-        type=int,
-        default=0,
-        help="Use 0 for pure prompt scoring; retry with 1 by default if unsupported.",
-    )
-    parser.add_argument(
-        "--no-retry-score-max-tokens-one",
-        dest="retry_score_max_tokens_one",
-        action="store_false",
-        help="Do not retry scoring with max_tokens=1 if max_tokens=0 fails.",
-    )
-    parser.set_defaults(retry_score_max_tokens_one=True)
     parser.add_argument(
         "--score-only-usable-hidden",
         action="store_true",
