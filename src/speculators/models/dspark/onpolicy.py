@@ -171,6 +171,14 @@ class VLLMVerifierScorer:
                 hs = hs[:, -self.hidden_size :]
             # Row predicting draft slot t (1-indexed) sits at prefix_len-1+(t-1).
             first = prefix_len - 1
+            actual_len = hs.shape[0]
+            if actual_len < first + k:
+                raise RuntimeError(
+                    f"Hidden states from vLLM are too short ({actual_len}) "
+                    f"to extract {k} positions starting at {first}. "
+                    f"Prefix caching likely caused incomplete hidden state extraction. "
+                    f"Sequence had {len(seq)} tokens, needed positions [{first}:{first+k}]."
+                )
             out[b] = hs[first : first + k]
         return out
 
