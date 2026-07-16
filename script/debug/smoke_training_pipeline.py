@@ -182,6 +182,7 @@ def _load_draft_model(args: argparse.Namespace):
     import torch  # noqa: PLC0415
 
     from speculators.model import SpeculatorModel  # noqa: PLC0415
+    from speculators.models.attention import create_float_mask  # noqa: PLC0415
 
     device = _auto_device() if args.draft_device == "auto" else args.draft_device
     dtype = getattr(torch, args.draft_dtype)
@@ -192,6 +193,8 @@ def _load_draft_model(args: argparse.Namespace):
         )
         if hasattr(model, "_attn_impl"):
             model._attn_impl = args.draft_attn_impl  # noqa: SLF001
+        if hasattr(model, "_create_mask_fn"):
+            model._create_mask_fn = create_float_mask  # noqa: SLF001
         for module in model.modules():
             config = getattr(module, "config", None)
             if config is not None and hasattr(config, "_attn_implementation"):
