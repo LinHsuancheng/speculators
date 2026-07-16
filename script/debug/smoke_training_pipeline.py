@@ -56,6 +56,19 @@ def _wait_for_hidden_state_file(path: Path, timeout: float) -> None:
         time.sleep(0.05)
 
 
+def _delete_generated_hidden_state(path_value: str | None, timeout: float) -> bool:
+    if path_value is None:
+        return False
+    path = Path(path_value)
+    try:
+        _wait_for_hidden_state_file(path, timeout)
+    except FileNotFoundError:
+        pass
+    path.unlink(missing_ok=True)
+    Path(str(path) + ".lock").unlink(missing_ok=True)
+    return True
+
+
 def _get_prompt_token_ids(response: Any) -> list[int] | None:
     choices = getattr(response, "choices", None)
     if choices:
@@ -272,6 +285,11 @@ def _score_prompt_logprobs(
     prompt_logprobs = _get_prompt_logprobs(response)
     summary = _summarize_prompt_logprobs(prompt_logprobs, score_positions)
     ignored_hs_path = _get_kv_hidden_path(response)
+    ignored_hs_deleted = False
+    if not args.keep_generated:
+        ignored_hs_deleted = _delete_generated_hidden_state(
+            ignored_hs_path, args.file_timeout
+        )
 
     return {
         "ok": bool(summary.get("present")),
@@ -285,6 +303,7 @@ def _score_prompt_logprobs(
         "prompt_token_ids_match": response_prompt_ids == score_ids,
         "prompt_logprobs": summary,
         "ignored_hidden_states_path": ignored_hs_path,
+        "ignored_hidden_states_deleted": ignored_hs_deleted,
     }
 
 
