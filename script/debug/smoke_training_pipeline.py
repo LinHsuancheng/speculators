@@ -186,6 +186,16 @@ def _load_draft_model(args: argparse.Namespace):
     device = _auto_device() if args.draft_device == "auto" else args.draft_device
     dtype = getattr(torch, args.draft_dtype)
     model = SpeculatorModel.from_pretrained(args.draft_checkpoint)
+    if args.draft_attn_impl:
+        model.config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
+            args.draft_attn_impl
+        )
+        if hasattr(model, "_attn_impl"):
+            model._attn_impl = args.draft_attn_impl  # noqa: SLF001
+        for module in model.modules():
+            config = getattr(module, "config", None)
+            if config is not None and hasattr(config, "_attn_implementation"):
+                config._attn_implementation = args.draft_attn_impl  # noqa: SLF001
     model.to(dtype=dtype)
     model.to(device)
     model.eval()
@@ -411,6 +421,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--draft-device", default="auto")
     parser.add_argument("--draft-dtype", default="bfloat16")
+    parser.add_argument(
+        "--draft-attn-impl",
+        default="sdpa",
+        help="Attention implementation used when running the draft model.",
+    )
     parser.add_argument(
         "--draft-temperature",
         type=float,

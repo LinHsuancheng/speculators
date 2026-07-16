@@ -13,6 +13,7 @@ PROMPT_LOGPROBS="${PROMPT_LOGPROBS:-1}"
 DRAFT_CHECKPOINT="${DRAFT_CHECKPOINT:-}"
 DRAFT_DEVICE="${DRAFT_DEVICE:-auto}"
 DRAFT_DTYPE="${DRAFT_DTYPE:-bfloat16}"
+DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-sdpa}"
 DRAFT_TEMPERATURE="${DRAFT_TEMPERATURE:-0.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +32,7 @@ if [[ -n "${DRAFT_CHECKPOINT}" ]]; then
     --draft-checkpoint "${DRAFT_CHECKPOINT}"
     --draft-device "${DRAFT_DEVICE}"
     --draft-dtype "${DRAFT_DTYPE}"
+    --draft-attn-impl "${DRAFT_ATTN_IMPL}"
     --draft-temperature "${DRAFT_TEMPERATURE}"
   )
 fi
