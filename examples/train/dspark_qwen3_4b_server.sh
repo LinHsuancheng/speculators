@@ -19,7 +19,7 @@ export ASCEND_LAUNCH_BLOCKING=0
 # ============ Configuration ============
 MODEL="/models/Qwen3-4B"
 DATASET="sharegpt"
-OUTPUT_DIR="./output/dspark_qwen3_4b_real_baseline"
+OUTPUT_DIR="./outputs/dspark_qwen3_4b_real_baseline"
 ARROW_DIR="/data/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072.100k"
 VLLM_PORT=8000
 MAX_SAMPLES=5000
