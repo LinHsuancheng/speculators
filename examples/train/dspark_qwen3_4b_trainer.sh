@@ -126,8 +126,8 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --sampling-temperature "$SAMPLING_TEMPERATURE" \
     --logger tensorboard \
     --on-missing generate \
-    --on-generate delete \
-    > "$LOG_FILE" 2>&1 &
+    --on-generate delete > "$LOG_FILE" 2>&1 &
+
 echo $! > "$PID_FILE"
 
 echo "Log file: $LOG_FILE"
