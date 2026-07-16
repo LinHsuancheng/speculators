@@ -1,204 +1,120 @@
 """Comprehensive vLLM hidden states debugging - all tests in one file."""
 import openai
-import numpy as np
+import torch
 from pathlib import Path
 import sys
-import os
 
-# Add src to path
 sys.path.insert(0, '/workspace/speculators/src')
 sys.path.insert(0, '/workspace/speculators')
 
-print("=" * 70)
-print("TEST 1: Extract hidden states path from response")
-print("=" * 70)
+from safetensors.torch import load_file
 
+MODEL = "/models/Qwen3-4B"
 client = openai.Client(base_url="http://localhost:8000/v1", api_key="dummy")
-model = "Qwen/Qwen2.5-3B"
 
-test_tokens = [151644, 8948, 198, 151644, 8948]  # 5 tokens
-print(f"Input: {len(test_tokens)} tokens = {test_tokens}")
 
-response = client.completions.create(
-    model=model,
-    prompt=test_tokens,
-    max_tokens=1,
+def get_hs(tokens):
+    """Request and return (path, hidden_states tensor, token_ids)."""
+    resp = client.completions.create(
+        model=MODEL,
+        prompt=tokens,
+        max_tokens=1,
+        extra_body={"return_token_ids": True},
+    )
+    path = resp.kv_transfer_params.get('hidden_states_path')
+    data = load_file(path)
+    return path, data
+
+
+print("=" * 70)
+print("TEST 1: Short sequence (5 tokens)")
+print("=" * 70)
+tokens = [151644, 8948, 198, 151644, 8948]
+print(f"Input: {len(tokens)} tokens")
+path, data = get_hs(tokens)
+print(f"Path: {path}")
+print(f"Keys: {list(data.keys())}")
+for k, v in data.items():
+    print(f"  {k}: shape={tuple(v.shape)}, dtype={v.dtype}")
+hs = data['hidden_states']
+print(f"hidden_states length: {hs.shape[0]}, expected: {len(tokens)}")
+if hs.shape[0] == len(tokens):
+    print("✓ Full length returned")
+else:
+    print(f"⚠ APC truncated: got {hs.shape[0]}, cached {len(tokens) - hs.shape[0]}")
+
+
+print("\n" + "=" * 70)
+print("TEST 2: extract_output function")
+print("=" * 70)
+from speculators.data_generation.vllm_client import extract_output
+resp = client.completions.create(
+    model=MODEL, prompt=tokens, max_tokens=1,
     extra_body={"return_token_ids": True},
 )
-
-# Extract path
-hs_path = None
-if hasattr(response, 'kv_transfer_params') and response.kv_transfer_params:
-    hs_path = response.kv_transfer_params.get('hidden_states_path')
-    print(f"✓ Found in kv_transfer_params: {hs_path}")
-else:
-    print(f"✗ No kv_transfer_params")
-    sys.exit(1)
-
-
-print("\n" + "=" * 70)
-print("TEST 2: Load hidden states file and check shape")
-print("=" * 70)
-
-if not Path(hs_path).exists():
-    print(f"✗ File not found: {hs_path}")
-    sys.exit(1)
-
-print(f"✓ File exists: {hs_path}")
-
-# Try safetensors first
 try:
-    from safetensors import safe_open
-    with safe_open(hs_path, framework="numpy") as f:
-        keys = list(f.keys())
-        print(f"✓ Loaded with safetensors")
-        print(f"  Keys: {keys}")
-
-        for key in keys:
-            tensor = f.get_tensor(key)
-            print(f"  {key}: shape={tensor.shape}, dtype={tensor.dtype}")
-
-            expected_len = len(test_tokens)
-            actual_len = tensor.shape[0]
-
-            if actual_len == expected_len:
-                print(f"  ✓ Length matches input ({expected_len} tokens)")
-            elif actual_len < expected_len:
-                print(f"  ⚠ SHORTER: got {actual_len}, expected {expected_len}")
-                print(f"    → APC returned only last {actual_len} tokens")
-                print(f"    → Cached first {expected_len - actual_len} tokens")
-            else:
-                print(f"  ✗ LONGER: got {actual_len}, expected {expected_len}")
-
-except Exception as e:
-    print(f"✗ Failed to load: {e}")
-    sys.exit(1)
-
-
-print("\n" + "=" * 70)
-print("TEST 3: Check vllm_client.py extract_output function")
-print("=" * 70)
-
-from speculators.data_generation.vllm_client import extract_output
-
-try:
-    extracted_path = extract_output(response, test_tokens)
-    print(f"✓ extract_output returned: {extracted_path}")
-
-    if extracted_path == hs_path:
-        print(f"  ✓ Path matches kv_transfer_params")
-    else:
-        print(f"  ✗ Path mismatch!")
-        print(f"    extract_output: {extracted_path}")
-        print(f"    kv_transfer_params: {hs_path}")
-
+    p = extract_output(resp, tokens)
+    print(f"✓ extract_output: {p}")
 except Exception as e:
     print(f"✗ extract_output failed: {e}")
-    import traceback
-    traceback.print_exc()
 
 
 print("\n" + "=" * 70)
-print("TEST 4: Test with longer sequence (check APC behavior)")
+print("TEST 3: Long sequence (500 tokens) - trigger APC")
 print("=" * 70)
-
-# Use a longer sequence to trigger APC
-long_tokens = list(range(151644, 151644 + 500))  # 500 tokens
+long_tokens = list(range(1000, 1500))
 print(f"Input: {len(long_tokens)} tokens")
-
-response2 = client.completions.create(
-    model=model,
-    prompt=long_tokens,
-    max_tokens=1,
-    extra_body={"return_token_ids": True},
-)
-
-hs_path2 = response2.kv_transfer_params.get('hidden_states_path')
-print(f"Response path: {hs_path2}")
-
-try:
-    from safetensors import safe_open
-    with safe_open(hs_path2, framework="numpy") as f:
-        for key in f.keys():
-            tensor = f.get_tensor(key)
-            actual_len = tensor.shape[0]
-            expected_len = len(long_tokens)
-
-            print(f"  {key}: shape={tensor.shape}")
-            print(f"  Expected: {expected_len} tokens")
-            print(f"  Got: {actual_len} tokens")
-
-            if actual_len < expected_len:
-                cache_hit = expected_len - actual_len
-                print(f"  ⚠ APC cached {cache_hit} tokens, returned {actual_len}")
-                print(f"  → Returned positions: [{cache_hit}:{expected_len})")
-            elif actual_len == expected_len:
-                print(f"  ✓ Full sequence returned (no APC)")
-
-except Exception as e:
-    print(f"✗ Load failed: {e}")
+path, data = get_hs(long_tokens)
+hs = data['hidden_states']
+print(f"hidden_states length: {hs.shape[0]}, expected: {len(long_tokens)}")
+if hs.shape[0] < len(long_tokens):
+    cache = len(long_tokens) - hs.shape[0]
+    print(f"⚠ APC cached {cache} tokens, returned positions [{cache}:{len(long_tokens)})")
+else:
+    print("✓ Full length")
 
 
 print("\n" + "=" * 70)
-print("TEST 5: Simulate on-policy scenario")
+print("TEST 4: SAME long sequence AGAIN - APC should hit hard")
 print("=" * 70)
+path, data = get_hs(long_tokens)
+hs = data['hidden_states']
+print(f"hidden_states length: {hs.shape[0]}, expected: {len(long_tokens)}")
+if hs.shape[0] < len(long_tokens):
+    cache = len(long_tokens) - hs.shape[0]
+    print(f"⚠ APC cached {cache}, returned {hs.shape[0]}")
+    if hs.shape[0] == 0:
+        print("  ✗✗ COMPLETELY EMPTY - this is the bug!")
+else:
+    print("✓ Full length")
 
-# Simulate: gold prefix (300 tokens) + sampled continuation (7 tokens)
+
+print("\n" + "=" * 70)
+print("TEST 5: On-policy scenario (300 prefix + 7 continuation)")
+print("=" * 70)
 prefix_len = 300
-continuation_len = 7
-full_seq = list(range(151644, 151644 + prefix_len + continuation_len))
-
-print(f"Sequence: {prefix_len} prefix + {continuation_len} continuation = {len(full_seq)} total")
-print(f"Need positions: [{prefix_len-1}:{prefix_len-1+continuation_len})")
-
-response3 = client.completions.create(
-    model=model,
-    prompt=full_seq,
-    max_tokens=1,
-    extra_body={"return_token_ids": True},
-)
-
-hs_path3 = response3.kv_transfer_params.get('hidden_states_path')
-
-try:
-    from safetensors import safe_open
-    with safe_open(hs_path3, framework="numpy") as f:
-        for key in f.keys():
-            tensor = f.get_tensor(key)
-            actual_len = tensor.shape[0]
-
-            print(f"  Returned: {actual_len} tokens")
-
-            if actual_len < len(full_seq):
-                cache_hit = len(full_seq) - actual_len
-                returned_start = cache_hit
-                returned_end = len(full_seq)
-
-                needed_start = prefix_len - 1
-                needed_end = prefix_len - 1 + continuation_len
-
-                print(f"  APC cached: first {cache_hit} tokens")
-                print(f"  Returned range: [{returned_start}:{returned_end})")
-                print(f"  Needed range: [{needed_start}:{needed_end})")
-
-                if needed_start >= returned_start and needed_end <= returned_end:
-                    offset = needed_start - returned_start
-                    print(f"  ✓ Can extract from offset {offset}")
-                    print(f"    Extract: hs[{offset}:{offset + continuation_len}]")
-                else:
-                    print(f"  ✗ Needed range NOT in returned range")
-            else:
-                print(f"  ✓ Full sequence, extract normally")
-
-except Exception as e:
-    print(f"✗ Load failed: {e}")
+cont_len = 7
+full_seq = list(range(2000, 2000 + prefix_len + cont_len))
+print(f"Sequence: {prefix_len} prefix + {cont_len} cont = {len(full_seq)}")
+print(f"Need positions: [{prefix_len-1}:{prefix_len-1+cont_len})")
+path, data = get_hs(full_seq)
+hs = data['hidden_states']
+actual = hs.shape[0]
+print(f"Returned: {actual} tokens")
+if actual < len(full_seq):
+    cache = len(full_seq) - actual
+    r_start, r_end = cache, len(full_seq)
+    n_start, n_end = prefix_len - 1, prefix_len - 1 + cont_len
+    print(f"APC cached first {cache}, returned [{r_start}:{r_end})")
+    print(f"Needed [{n_start}:{n_end})")
+    if n_start >= r_start and n_end <= r_end:
+        print(f"✓ Extract from offset {n_start - r_start}")
+    else:
+        print(f"✗ Needed range NOT available (cached too much)")
 
 
 print("\n" + "=" * 70)
 print("SUMMARY")
 print("=" * 70)
-print("Key findings:")
-print("1. Hidden states path is in response.kv_transfer_params")
-print("2. APC causes vLLM to return only non-cached suffix")
-print("3. We need to compute offset when extracting from truncated tensor")
-print("4. Check if vllm_client.py extracts from the correct location")
+print("Check: does APC return empty/truncated for repeated sequences?")
+print("If TEST 4 returns 0, that confirms the on-policy failure cause.")
