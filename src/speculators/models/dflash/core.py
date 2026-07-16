@@ -407,6 +407,57 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
+    def _build_attention_mask_for_anchors(
+        self,
+        loss_mask,
+        document_ids,
+        device,
+        anchor_positions: torch.Tensor | None = None,
+        anchor_valid: torch.Tensor | None = None,
+    ):
+        if anchor_positions is None:
+            return self._build_attention_mask(loss_mask, document_ids, device)
+
+        total_seq_len = loss_mask.shape[1]
+        anchor_positions = anchor_positions.to(device=device, dtype=torch.long).view(-1)
+        if anchor_valid is None:
+            anchor_valid = torch.ones_like(anchor_positions, dtype=torch.bool)
+        else:
+            anchor_valid = anchor_valid.to(device=device, dtype=torch.bool).view(-1)
+        if anchor_positions.numel() != self.config.max_anchors:
+            raise ValueError(
+                "anchor_positions must match config.max_anchors, got "
+                f"{anchor_positions.numel()} vs {self.config.max_anchors}"
+            )
+        if anchor_valid.shape != anchor_positions.shape:
+            raise ValueError(
+                f"anchor_valid shape {anchor_valid.shape} does not match "
+                f"anchor_positions shape {anchor_positions.shape}"
+            )
+
+        full_attn_mask = None
+        if self.uses_full_attn:
+            full_attn_mask = self._create_attention_masks_for_layers(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                device=device,
+                sliding_window=None,
+            )
+
+        sliding_window_attn_mask = None
+        if self.uses_sliding_window_attn:
+            sliding_window_attn_mask = self._create_attention_masks_for_layers(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                device=device,
+                sliding_window=self.sliding_window,
+                sliding_window_non_causal=self.sliding_window_non_causal,
+            )
+
+        return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
@@ -415,6 +466,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        anchor_positions: torch.Tensor | None = None,  # [max_anchors]
+        anchor_valid: torch.Tensor | None = None,  # [max_anchors]
         **kwargs,
     ):
         """Run the anchored-block draft transformer up to the draft logits.
@@ -433,7 +486,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ).unsqueeze(0)
 
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, document_ids, device)
+            self._build_attention_mask_for_anchors(
+                loss_mask,
+                document_ids,
+                device,
+                anchor_positions=anchor_positions,
+                anchor_valid=anchor_valid,
+            )
         )
 
         mask_tokens_size = num_anchors * self.block_size

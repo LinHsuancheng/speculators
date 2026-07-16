@@ -33,6 +33,10 @@ from speculators.train.distributed import (
     maybe_setup_distributed,
 )
 from speculators.train.logger import setup_metric_logger, setup_root_logger
+from speculators.train.sampled_acceptance import (
+    SampledAcceptanceAugmentor,
+    SampledAcceptanceConfig,
+)
 from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.train.utils import resolve_mask_token_id, save_train_command
 from speculators.train.vocab_mapping import (
@@ -530,6 +534,28 @@ def main(args: argparse.Namespace):  # noqa: C901
 
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
+    batch_augmentor = None
+    if args.enable_sampled_acceptance_loss:
+        if args.speculator_type != "dspark":
+            raise ValueError(
+                "--enable-sampled-acceptance-loss is only supported for DSpark"
+            )
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            raise ValueError(
+                "--enable-sampled-acceptance-loss currently supports single-process "
+                "training only. Distributed broadcast of sampled logprobs is not "
+                "implemented yet."
+            )
+        batch_augmentor = SampledAcceptanceAugmentor(
+            SampledAcceptanceConfig(
+                vllm_endpoint=args.vllm_endpoint,
+                model=args.verifier_name_or_path,
+                request_timeout=args.request_timeout,
+            )
+        )
 
     trainer_config = TrainerConfig(
         num_epochs=args.epochs,
@@ -553,6 +579,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
+        batch_augmentor=batch_augmentor,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -1043,6 +1070,15 @@ def parse_args():
         help=(
             "DSpark: weight of the on-policy sampled exact acceptance-length "
             "loss when sampled draft/target logprobs are supplied (default: 1.0)."
+        ),
+    )
+    parser.add_argument(
+        "--enable-sampled-acceptance-loss",
+        action="store_true",
+        default=False,
+        help=(
+            "DSpark: generate on-policy sampled draft logprobs and target "
+            "prompt-logprobs during training. Currently single-process only."
         ),
     )
     parser.add_argument(

@@ -112,22 +112,36 @@ class DSparkDraftModel(DFlashDraftModel):
         sampled_draft_logprobs: torch.Tensor | None = None,
         sampled_target_logprobs: torch.Tensor | None = None,
         sampled_acceptance_loss_alpha: float = 1.0,
+        anchor_positions: torch.Tensor | None = None,
+        anchor_valid: torch.Tensor | None = None,
         **kwargs,
     ):
-        hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
-            self._backbone_forward(
-                hidden_states,
-                input_ids,
-                loss_mask,
-                verifier_last_hidden_states,
-                document_ids,
-                position_ids,
-                **kwargs,
+        old_max_anchors = self.config.max_anchors
+        if anchor_positions is not None:
+            self.config.max_anchors = int(anchor_positions.numel())
+        try:
+            hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
+                self._backbone_forward(
+                    hidden_states,
+                    input_ids,
+                    loss_mask,
+                    verifier_last_hidden_states,
+                    document_ids,
+                    position_ids,
+                    anchor_positions=anchor_positions,
+                    anchor_valid=anchor_valid,
+                    **kwargs,
+                )
             )
-        )
+        finally:
+            self.config.max_anchors = old_max_anchors
 
         # DSpark: add the Markov logit bias and predict per-position confidence.
-        num_blocks = self.config.max_anchors
+        num_blocks = (
+            int(anchor_positions.numel())
+            if anchor_positions is not None
+            else self.config.max_anchors
+        )
         block = self.block_size
         mask_tokens_size = num_blocks * block
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.

@@ -2,8 +2,9 @@ import json
 import logging
 import sys
 import warnings
+from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -81,6 +82,9 @@ class TrainerConfig(NamedTuple):
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
+    batch_augmentor: (
+        Callable[[SpeculatorModel, dict[str, Any]], dict[str, Any]] | None
+    ) = None
 
 
 class Trainer:
@@ -357,6 +361,8 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+            if self.config.batch_augmentor is not None:
+                gpu_batch = self.config.batch_augmentor(self.model, gpu_batch)
 
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **self.config.train_call_kwargs

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Online DSpark Training Script for Qwen3-4B on Ascend NPU
-# Baseline configuration for 4v4 setup (4 vLLM + 4 training)
+# Sampled-loss smoke training configuration (4 vLLM + 1 training)
 set -euo pipefail
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -43,8 +43,7 @@ SAMPLED_ACCEPTANCE_LOSS_ALPHA=1.0
 
 # Ascend NPU assignments
 VLLM_NPUS="8,9,10,11"
-TRAIN_NPUS="12,13,14,15"
-NUM_TRAIN_NPUS=4
+TRAIN_NPU="12"
 
 # vLLM configuration - fix memory + enable parallelism
 VLLM_EXTRA_ARGS=(
@@ -92,11 +91,9 @@ PID_FILE="$LOG_DIR/train.pid"
 
 # tensorboard --logdir ./logs --host 0.0.0.0 --port 6007 & 
 
-echo "=== Step 3: Training on NPUs: $TRAIN_NPUS ==="
+echo "=== Step 3: Training on NPU: $TRAIN_NPU ==="
 echo "Log file: $LOG_FILE"
-env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
-    --nnodes 1 --node_rank 0 --nproc_per_node "$NUM_TRAIN_NPUS" \
-    scripts/train.py \
+env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPU" python scripts/train.py \
     --verifier-name-or-path "$MODEL" \
     --data-path "$ARROW_DIR" \
     --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
@@ -119,6 +116,7 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
     --sampled-acceptance-loss-alpha "$SAMPLED_ACCEPTANCE_LOSS_ALPHA" \
+    --enable-sampled-acceptance-loss \
     --logger tensorboard \
     --on-missing generate \
     --on-generate delete > "$LOG_FILE" 2>&1 &

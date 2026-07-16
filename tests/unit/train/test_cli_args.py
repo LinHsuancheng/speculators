@@ -168,6 +168,11 @@ def test_dspark_sampled_acceptance_loss_alpha(monkeypatch):
     assert val_kw["sampled_acceptance_loss_alpha"] == 0.25
 
 
+def test_enable_sampled_acceptance_loss_flag(monkeypatch):
+    args = _parse(monkeypatch, ["--enable-sampled-acceptance-loss"])
+    assert args.enable_sampled_acceptance_loss is True
+
+
 def test_dspark_cat_mode_default(monkeypatch):
     args = _parse(monkeypatch, [])
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
