@@ -159,33 +159,47 @@ def _draft_logits(
     """Return DSpark logits for one anchored block at the sequence tail."""
     block = draft.block_size
     device = input_ids.device
+    anchor_pos = input_ids.shape[1] - 1
+    # DFlash/DSpark training uses anchored blocks inside a fixed sequence and
+    # `select_anchors` deliberately excludes the final `block_size` positions.
+    # For generation, append dummy tokens after the current prefix so the last
+    # real token can be selected as the single valid anchor.
+    dummy_ids = torch.full(
+        (1, block),
+        draft.mask_token_id,
+        dtype=input_ids.dtype,
+        device=device,
+    )
+    draft_input_ids = torch.cat([input_ids, dummy_ids], dim=1)
+
     hidden_states, verifier_last_hidden_states = _target_hidden_states(
         target,
-        input_ids,
+        draft_input_ids,
         draft.target_layer_ids,
     )
-    loss_mask = torch.zeros_like(input_ids, dtype=torch.float32)
-    loss_mask[:, -block:] = 1.0
-    document_ids = torch.zeros_like(input_ids)
-    position_ids = torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
+    loss_mask = torch.zeros_like(draft_input_ids, dtype=torch.float32)
+    loss_mask[:, anchor_pos] = 1.0
+    document_ids = torch.zeros_like(draft_input_ids)
+    position_ids = torch.arange(draft_input_ids.shape[1], device=device).unsqueeze(0)
     hidden, logits, _, _, _ = draft._backbone_forward(
         hidden_states,
-        input_ids,
+        draft_input_ids,
         loss_mask,
         verifier_last_hidden_states,
         document_ids,
         position_ids,
     )
 
-    block_tokens = input_ids[:, -block:].view(1, block)
+    logits = logits.view(draft.config.max_anchors, block, -1)[:1]
+    hidden = hidden.view(draft.config.max_anchors, block, -1)[:1]
+    block_tokens = draft_input_ids[:, anchor_pos : anchor_pos + block].view(1, block)
     prev_token_ids = torch.cat([block_tokens[:, :1], block_tokens[:, :-1]], dim=1)
-    hidden_blocks = hidden.view(1, block, -1)
     if draft.markov_head is not None:
         markov_bias = draft.markov_head.block_bias(
             prev_token_ids=prev_token_ids,
-            hidden_states=hidden_blocks,
+            hidden_states=hidden,
         )
-        logits = (logits.view(1, block, -1) + markov_bias).view(1, block, -1)
+        logits = logits + markov_bias
     return logits
 
 
