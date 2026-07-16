@@ -17,10 +17,14 @@ TARGET_LAYER_IDS="2 18 33"
 VLLM_NPUS="0,1,2,3"
 
 # vLLM configuration - fix memory + enable parallelism
+# --enable-prefix-caching: the on-policy exact-acceptance loss scores
+# gold_prefix + sampled_Y per anchor; the gold prefix is fixed across steps, so
+# prefix caching reuses its KV and each step only pays for the sampled tokens.
 VLLM_EXTRA_ARGS=(
     --data-parallel-size 4
     --max-model-len 4096
     --max-num-seqs 768
+    --enable-prefix-caching
 )
 
 # ============ Launch vLLM Server ============

@@ -332,12 +332,31 @@ def draft_cat_weights(
     return cat_prefix_weights(accept_rate, block_size, loss_mask=loss_mask)
 
 
+def _accept_length_sentinel(
+    logits: torch.Tensor,  # noqa: ARG001
+    targets: torch.Tensor,  # noqa: ARG001
+) -> torch.Tensor:
+    """Placeholder so ``accept_length`` is a valid ``--loss-fn`` weight key.
+
+    The exact-acceptance-length objective is not a ``(logits, targets)`` per-position
+    term: it needs on-policy sampled tokens and their draft/verifier log-probs. It is
+    handled directly in :func:`speculators.models.dspark.metrics.compute_metrics`
+    (on-policy branch), which pops ``accept_length`` out of the loss config before
+    calling :func:`compound_loss`. Calling this directly is a wiring error.
+    """
+    raise NotImplementedError(
+        "'accept_length' is handled in DSpark's on-policy compute_metrics, not via "
+        "compound_loss. It is only valid with --speculator-loss exact_accept_len."
+    )
+
+
 _LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
     "kl_div": kl_div_loss,
     "ce": ce_loss,
     "tv": tv_loss,
     "nla": neg_log_acceptance_loss,
     "lk_hybrid": lk_hybrid_loss,
+    "accept_length": _accept_length_sentinel,
 }
 
 

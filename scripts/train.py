@@ -531,6 +531,49 @@ def main(args: argparse.Namespace):  # noqa: C901
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
 
+    # On-policy exact-acceptance-length objective (DSpark): inject the frozen
+    # verifier scorer that scores sampled draft blocks via the vLLM endpoint. Only
+    # active when the loss spec contains the ``accept_length`` term.
+    if train_call_kwargs.get("onpolicy_sampling"):
+        import openai  # noqa: PLC0415
+
+        from speculators.models.dspark.onpolicy import (  # noqa: PLC0415
+            VLLMVerifierScorer,
+        )
+        from speculators.train.data import _maybe_load_hs_file  # noqa: PLC0415
+
+        def _load_last_layer_hs(path: str) -> torch.Tensor:
+            """Load a vLLM hidden-states file and return last-layer [seq_len, H].
+
+            The raw dump layout is resolved defensively: a 2D ``[seq_len, L*H]``
+            concatenation keeps the trailing ``H`` columns (last layer), a 3D
+            ``[L, seq_len, H]`` takes ``[-1]``, and ``[seq_len, L, H]`` takes
+            ``[:, -1]``. If the file cannot be read, an error is raised so the
+            failure is loud rather than silently corrupting ``p_t``.
+            """
+            loaded = _maybe_load_hs_file(Path(path))
+            if loaded is None or "hidden_states" not in loaded:
+                raise ValueError(f"Failed to load hidden states from {path}")
+            hs = loaded["hidden_states"]
+            if hs.ndim == 3:  # noqa: PLR2004
+                # [L, seq_len, H] vs [seq_len, L, H]: last layer along the L axis.
+                return hs[-1] if hs.shape[0] < hs.shape[1] else hs[:, -1]
+            if hs.shape[-1] != hidden_size:
+                return hs[:, -hidden_size:]
+            return hs
+
+        scorer_client = openai.OpenAI(
+            base_url=args.vllm_endpoint, api_key="EMPTY", max_retries=0
+        )
+        scorer_model = scorer_client.models.list().data[0].id
+        draft_model.verifier_scorer = VLLMVerifierScorer(
+            client=scorer_client,
+            model=scorer_model,
+            load_hidden_states=_load_last_layer_hs,
+            hidden_size=hidden_size,
+            request_timeout=args.request_timeout,
+        )
+
     trainer_config = TrainerConfig(
         num_epochs=args.epochs,
         save_path=args.save_path,
@@ -1046,6 +1089,18 @@ def parse_args():
             "'target' uses PARD-2 target GT-token confidence prefix products; "
             "'draft' uses analytical draft/target acceptance overlap prefix "
             "products; 'none' disables CAT (default)."
+        ),
+    )
+    parser.add_argument(
+        "--sampling-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "DSpark on-policy: draft sampling temperature T for the "
+            "exact-acceptance-length objective (active when --loss-fn contains "
+            "'accept_length'). Both q_t and p_t use this T, matching the serving "
+            "acceptance rule min(1, p/q). Floored to 1e-2; to target greedy "
+            "serving, train with a small positive T (default: 1.0)."
         ),
     )
     parser.add_argument(

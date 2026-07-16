@@ -30,19 +30,31 @@ DRAFT_ATTN_IMPL="sdpa"
 # Markov + confidence head settings
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"
-LOSS_FN='{"ce": 0.1, "tv": 0.9}'
+# On-policy exact expected-acceptance-length objective: CE (regularizer) + the
+# acceptance-length term replace the old TV term; the confidence BCE is kept via
+# CONFIDENCE_HEAD_ALPHA. The presence of "accept_length" turns on on-policy
+# sampling (draft rollout + vLLM verifier rescoring). Teacher-forced baseline was
+# LOSS_FN='{"ce": 0.1, "tv": 0.9}'.
+LOSS_FN='{"ce": 0.1, "accept_length": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
+# Draft sampling temperature for the on-policy rollout (also applied to the
+# verifier acceptance ratio). Train a greedy serving regime with a small T.
+SAMPLING_TEMPERATURE=1.0
+SAMPLING_TEMPERATURE=1.0
 
 # Ascend NPU assignments
 VLLM_NPUS="0,1,2,3"
 TRAIN_NPUS="4,5,6,7"
 NUM_TRAIN_NPUS=4
 
-# vLLM configuration - fix memory + enable parallelism
+# vLLM configuration - fix memory + enable parallelism.
+# --enable-prefix-caching lets the fixed gold prefix of each on-policy scoring
+# request hit cache, so only the sampled continuation is recomputed (node 4).
 VLLM_EXTRA_ARGS=(
     --data-parallel-size 4
     --max-model-len 4096
     --max-num-seqs 768
+    --enable-prefix-caching
 )
 
 cleanup() {
@@ -104,6 +116,7 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --sampling-temperature "$SAMPLING_TEMPERATURE" \
     --on-missing generate \
     --on-generate delete
 

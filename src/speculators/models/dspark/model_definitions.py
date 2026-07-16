@@ -44,6 +44,48 @@ class MarkovHead(nn.Module):
         """Look up W1 embeddings for the given previous-token ids."""
         return self.markov_w1(token_ids.long())
 
+    def step_bias(
+        self,
+        *,
+        prev_token_ids: torch.Tensor,  # [N]
+        hidden_states: torch.Tensor,  # [N, hidden]
+        prev_emb: torch.Tensor | None = None,  # [N, r]
+    ) -> torch.Tensor:
+        """Single-position logit bias for one autoregressive rollout step.
+
+        Same math as :meth:`block_bias` but for a single draft slot (no block
+        axis). Used by the on-policy rollout, where the previous token at step
+        ``k`` is the token *sampled* at step ``k-1`` (not the gold token), so the
+        bias must be recomputed per step. ``rnn`` is unsupported here because its
+        recurrent state is defined over a full teacher-forced block; use
+        ``vanilla`` or ``gated`` for on-policy sampling.
+
+        Args:
+            prev_token_ids: Previous-token ids in *verifier* vocabulary, ``[N]``.
+            hidden_states: Backbone hidden state at this slot, ``[N, hidden]``.
+            prev_emb: Optional precomputed ``W1`` embedding, ``[N, r]``.
+
+        Returns:
+            Per-position logit bias over the draft vocabulary, ``[N, draft_vocab]``.
+        """
+        if self.head_type == "rnn":
+            raise NotImplementedError(
+                "MarkovHead.step_bias does not support head_type='rnn' (its "
+                "recurrent state is defined over a teacher-forced block). Use "
+                "'vanilla' or 'gated' for on-policy rollout."
+            )
+        if prev_emb is None:
+            prev_emb = self.prev_embeddings(prev_token_ids)
+        prev_emb = prev_emb.to(self.markov_w2.weight.dtype)
+
+        if self.head_type == "vanilla":
+            return self.markov_w2(prev_emb)
+
+        # gated
+        hidden_states = hidden_states.to(prev_emb.dtype)
+        gate = torch.sigmoid(self.gate_proj(torch.cat([hidden_states, prev_emb], dim=-1)))
+        return self.markov_w2(gate * prev_emb)
+
     def block_bias(
         self,
         *,

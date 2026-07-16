@@ -29,12 +29,126 @@ from speculators.models.metrics import (
 )
 
 __all__ = [
+    "acceptance_length_credit",
     "compute_metrics",
+    "exact_acceptance_length_loss",
 ]
 
 _EPS = 1e-8
 
 CatMode = Literal["none", "target", "draft"]
+
+
+def acceptance_length_credit(
+    q_logp: torch.Tensor,  # [num_blocks, K] log q_t(Y_t), sampled tokens
+    p_logp: torch.Tensor,  # [num_blocks, K] log p_t(Y_t), same tokens, frozen
+    mask: torch.Tensor | None = None,  # [num_blocks, K] 1 for valid draft slots
+) -> torch.Tensor:
+    """Exact per-position credit ``C_t`` for the expected-acceptance-length loss.
+
+    Implements ``C_t = 1[q_t(Y_t) < p_t(Y_t)] * sum_{k>=t} S_k`` with
+    ``S_k = prod_{i<=k} alpha_i`` and ``alpha_i = min(1, p_i / q_i)`` (trials.md
+    §7-§9). Everything here is a function of *sampled* tokens under the frozen
+    verifier, so the returned tensor is detached (stop-gradient): it is meant to
+    be used as a per-position weight on ``log q_t(Y_t)``.
+
+    Survival / continuation are computed per block (each block is one
+    independent speculative rollout of ``K = block_size - 1`` draft positions;
+    slot 0, the anchor, is excluded upstream). Masked (padded/invalid) slots are
+    treated as ``alpha = 1`` so they neither shrink nor extend the survival of
+    real slots; their own credit is zeroed at the end.
+
+    Args:
+        q_logp: Draft log-probability of the sampled token at each draft slot.
+        p_logp: Frozen verifier log-probability of the *same* token at the
+            *same* sampled prefix. Detached internally regardless.
+        mask: Optional validity mask over draft slots. Masked slots contribute
+            ``alpha = 1`` to the prefix product and receive credit ``0``.
+
+    Returns:
+        Detached credit ``C_t`` with shape ``[num_blocks, K]``.
+    """
+    if q_logp.shape != p_logp.shape:
+        raise ValueError(
+            f"Shape mismatch: q_logp={tuple(q_logp.shape)}, "
+            f"p_logp={tuple(p_logp.shape)}"
+        )
+
+    q_detached = q_logp.detach()
+    p_detached = p_logp.detach()
+
+    # log(alpha_t) = min(0, log p_t - log q_t)
+    log_alpha = torch.minimum(torch.zeros_like(q_detached), p_detached - q_detached)
+
+    if mask is not None:
+        # Masked slots act as alpha = 1 (log_alpha = 0) so they do not shrink the
+        # prefix product of the real slots that follow within the block.
+        log_alpha = log_alpha * mask.to(log_alpha.dtype)
+
+    # S_k = prod_{i<=k} alpha_i   (per block, over draft slots)
+    log_survival = torch.cumsum(log_alpha, dim=-1)
+    survival = torch.exp(log_survival)
+
+    # continuation_t = sum_{k>=t} S_k   (reverse cumsum along the block)
+    continuation = torch.flip(
+        torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
+        dims=[-1],
+    )
+
+    # I_t = 1[q_t(Y_t) < p_t(Y_t)]  (the under-covered / accept-with-prob-1 slots)
+    undercovered = (q_detached < p_detached).to(q_logp.dtype)
+
+    credit = undercovered * continuation
+    if mask is not None:
+        credit = credit * mask.to(credit.dtype)
+
+    return credit.detach()
+
+
+def exact_acceptance_length_loss(
+    q_logp: torch.Tensor,  # [num_blocks, K] log q_t(Y_t), grad flows here
+    p_logp: torch.Tensor,  # [num_blocks, K] log p_t(Y_t), frozen
+    mask: torch.Tensor | None = None,  # [num_blocks, K]
+) -> torch.Tensor:
+    """On-policy Monte-Carlo loss for negative expected acceptance length.
+
+    ``L_hat = -(1/K) * sum_t sg(C_t) * log q_t(Y_t)`` (trials.md §9, §13). Its
+    gradient is an unbiased estimator of ``-grad R_K`` (negative expected
+    acceptance length) under standard speculative sampling, provided ``Y`` is
+    sampled on-policy from ``q_psi`` and ``p`` comes from the frozen verifier at
+    the *sampled* prefix.
+
+    Only ``q_logp`` carries gradient; the credit ``C_t`` is stop-gradient.
+    Normalisation is by a fixed ``K`` (the number of draft slots per block), not
+    by the random ``sum_t C_t`` — see trials.md §18.4.
+
+    Args:
+        q_logp: Draft log-probability of each sampled token (requires grad).
+        p_logp: Frozen verifier log-probability of the same sampled tokens.
+        mask: Optional validity mask over draft slots; masked slots are excluded
+            from both the credit and the loss, and blocks are averaged over
+            their valid-slot count.
+
+    Returns:
+        Scalar loss (mean over blocks).
+    """
+    credit = acceptance_length_credit(q_logp, p_logp, mask=mask)  # [num_blocks, K]
+
+    weighted = credit * q_logp  # grad only through q_logp
+    if mask is not None:
+        weighted = weighted * mask.to(weighted.dtype)
+
+    block_size_k = q_logp.shape[-1]
+    # Divide by a fixed K (block draft length), never by the random credit sum.
+    loss_per_block = -weighted.sum(dim=-1) / block_size_k  # [num_blocks]
+
+    if mask is not None:
+        # Average only over blocks that have at least one valid draft slot.
+        block_valid = (mask.sum(dim=-1) > 0).to(loss_per_block.dtype)
+        denom = block_valid.sum().clamp_min(1.0)
+        return (loss_per_block * block_valid).sum() / denom
+
+    return loss_per_block.mean()
 
 
 def _masked_decayed_mean(
@@ -83,26 +197,83 @@ def compute_metrics(
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
     cat_mode: CatMode = "none",
+    q_logp: torch.Tensor | None = None,  # [num_blocks, K] on-policy log q_t(Y_t)
+    p_logp: torch.Tensor | None = None,  # [num_blocks, K] frozen log p_t(Y_t)
+    sampled_draft_ids: torch.Tensor | None = None,  # [num_blocks, K] draft vocab
+    sampled_mask: torch.Tensor | None = None,  # [num_blocks, K] valid draft slots
 ) -> tuple[torch.Tensor, dict]:
-    """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
+    """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs).
+
+    Two modes:
+
+    * **Teacher-forced** (default, ``q_logp is None``): the compound loss over
+      gold positions with DFlash exponential position decay, unchanged.
+    * **On-policy** (``q_logp`` provided): the exact expected-acceptance-length
+      objective. The per-position credit ``C_t`` (trials.md §7-§9) *replaces* the
+      DFlash decay as the position weight shared by the CE term and the confidence
+      BCE, and the ``accept_length`` term ``-(1/K) sum_t C_t log q_t(Y_t)`` is
+      added with the weight given for ``"accept_length"`` in ``loss_config``.
+    """
+    onpolicy = q_logp is not None
+    if onpolicy and (p_logp is None or sampled_mask is None):
+        raise ValueError(
+            "On-policy compute_metrics requires q_logp, p_logp and sampled_mask."
+        )
 
     device = logits.device
     seq_len = logits.shape[1]
+    num_blocks = seq_len // block_size
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
-    decay_fn = partial(dflash_loss_decay, gamma=gamma)
-    cat_weights = _resolve_cat_weights(
-        cat_mode, logits, targets, loss_mask, block_size
-    )
+
+    # Position weighting: decay (teacher-forced) vs. credit C_t (on-policy).
+    if onpolicy:
+        credit = acceptance_length_credit(q_logp, p_logp, mask=sampled_mask)
+        # Scatter C_t [num_blocks, K] onto the gold grid [1, T]; anchor slot 0 -> 0.
+        credit_grid = torch.zeros(
+            num_blocks, block_size, device=device, dtype=logits.dtype
+        )
+        credit_grid[:, 1:] = credit.to(logits.dtype)
+        position_weights = credit_grid.view(1, seq_len)
+        decay_fn = None
+        cat_weights = None
+    else:
+        decay_fn = partial(dflash_loss_decay, gamma=gamma)
+        cat_weights = _resolve_cat_weights(
+            cat_mode, logits, targets, loss_mask, block_size
+        )
+        position_weights = cat_weights
+
+    # The ``accept_length`` term is not a (logits, targets) loss, so pull it out of
+    # the config before compound_loss and add it explicitly below.
+    accept_length_weight: float | None = None
+    compound_config = loss_config
+    if "accept_length" in loss_config:
+        if not onpolicy:
+            raise ValueError(
+                "'accept_length' loss requires on-policy sampling; call the model "
+                "with onpolicy_sampling=True (q_logp/p_logp)."
+            )
+        accept_length_weight = loss_config["accept_length"][1]
+        compound_config = {
+            k: v for k, v in loss_config.items() if k != "accept_length"
+        }
 
     loss, term_losses = compound_loss(
         logits,
         targets,
         loss_mask,
         pos_idx,
-        loss_config=loss_config,
+        loss_config=compound_config,
         decay_fn=decay_fn,
-        position_weights=cat_weights,
+        position_weights=position_weights,
     )
+
+    if accept_length_weight is not None:
+        accept_loss = exact_acceptance_length_loss(
+            q_logp, p_logp, mask=sampled_mask
+        )
+        loss = loss + accept_length_weight * accept_loss
+        term_losses["accept_length_loss"] = accept_loss.detach()
 
     # Analytical per-position acceptance rate = distributional overlap.
     with torch.no_grad():
@@ -122,8 +293,10 @@ def compute_metrics(
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
+        # Confidence BCE uses the same position weighting as the other terms:
+        # C_t on-policy (decay_fn is None there), cat_weights + decay teacher-forced.
         conf_loss = _masked_decayed_mean(
-            bce, loss_mask, pos_idx, decay_fn, position_weights=cat_weights
+            bce, loss_mask, pos_idx, decay_fn, position_weights=position_weights
         )
         loss = loss + confidence_head_alpha * conf_loss
 
