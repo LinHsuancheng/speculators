@@ -17,9 +17,11 @@ MAX_SAMPLES="${MAX_SAMPLES:-200}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
+NUM_WORKERS="${NUM_WORKERS:-auto}"
 DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-auto}"
 DATASETS="${DATASETS:-}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
+SKIP_ARTIFACTS="${SKIP_ARTIFACTS:-0}"
 PYTHON="${PYTHON:-python3}"
 
 if [[ -z "$VERIFIER_MODEL" ]]; then
@@ -49,6 +51,7 @@ cmd=(
     --max-new-tokens "$MAX_NEW_TOKENS"
     --device "$DEVICE"
     --dtype "$DTYPE"
+    --num-workers "$NUM_WORKERS"
     --draft-attn-impl "$DRAFT_ATTN_IMPL"
     --trust-remote-code
 )
@@ -59,6 +62,10 @@ fi
 
 if [[ "$NO_PROGRESS" == "1" ]]; then
     cmd+=(--no-progress)
+fi
+
+if [[ "$SKIP_ARTIFACTS" == "1" ]]; then
+    cmd+=(--skip-artifacts)
 fi
 
 "${cmd[@]}"

@@ -12,6 +12,9 @@ import argparse
 import csv
 import json
 import logging
+import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -356,6 +359,17 @@ def _evaluate_dataset(
     records = _load_jsonl(path)
     if args.max_samples is not None:
         records = records[: args.max_samples]
+    total_records = len(records)
+    if args.worker_rank is not None:
+        records = records[args.worker_rank :: args.worker_count]
+        logger.info(
+            "[%s] worker %d/%d processing %d/%d samples",
+            path.stem,
+            args.worker_rank,
+            args.worker_count,
+            len(records),
+            total_records,
+        )
 
     stats = EvalStats()
     artifacts: list[dict[str, Any]] = []
@@ -384,7 +398,8 @@ def _evaluate_dataset(
         stats.num_proposals += sample_stats.num_proposals
         stats.num_proposed_draft_tokens += sample_stats.num_proposed_draft_tokens
         stats.num_accepted_draft_tokens += sample_stats.num_accepted_draft_tokens
-        artifacts.append({"prompt": prompt, "output_token_ids": token_ids})
+        if not args.skip_artifacts:
+            artifacts.append({"prompt": prompt, "output_token_ids": token_ids})
         elapsed = time.perf_counter() - start
         if elapsed > 0:
             out_tps = stats.total_output_tokens / elapsed
@@ -445,6 +460,168 @@ def _write_outputs(
                 f.write(json.dumps(artifact) + "\n")
 
 
+def _visible_devices_for(device: str) -> tuple[str | None, list[str]]:
+    if str(device).startswith("npu"):
+        env_name = "ASCEND_RT_VISIBLE_DEVICES"
+    elif str(device).startswith("cuda"):
+        env_name = "CUDA_VISIBLE_DEVICES"
+    else:
+        return None, []
+
+    raw = os.environ.get(env_name, "")
+    devices = [item.strip() for item in raw.split(",") if item.strip()]
+    return env_name, devices
+
+
+def _resolve_num_workers(args: argparse.Namespace) -> int:
+    if args.worker_rank is not None:
+        return args.worker_count
+    if args.num_workers != "auto":
+        return max(1, int(args.num_workers))
+    _, devices = _visible_devices_for(args.device)
+    return max(1, len(devices))
+
+
+def _child_cmd(args: argparse.Namespace, rank: int, worker_count: int, output_dir: Path):
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--verifier-model",
+        args.verifier_model,
+        "--draft-model",
+        args.draft_model,
+        "--datasets-root",
+        str(args.datasets_root),
+        "--output-dir",
+        str(output_dir),
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--device",
+        args.device,
+        "--dtype",
+        args.dtype,
+        "--draft-attn-impl",
+        args.draft_attn_impl,
+        "--num-workers",
+        str(worker_count),
+        "--worker-rank",
+        str(rank),
+        "--worker-count",
+        str(worker_count),
+        "--no-progress",
+        "--log-every",
+        str(args.log_every),
+    ]
+    if args.datasets:
+        cmd.extend(["--datasets", args.datasets])
+    if args.max_samples is not None:
+        cmd.extend(["--max-samples", str(args.max_samples)])
+    if args.trust_remote_code:
+        cmd.append("--trust-remote-code")
+    if args.skip_artifacts:
+        cmd.append("--skip-artifacts")
+    return cmd
+
+
+def _merge_worker_outputs(output_dir: Path, worker_dirs: list[Path]) -> None:
+    rows_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for worker_dir in worker_dirs:
+        summary_path = worker_dir / "summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(f"Missing worker summary: {summary_path}")
+        with summary_path.open(encoding="utf-8") as f:
+            for row in json.load(f):
+                rows_by_dataset.setdefault(row["dataset"], []).append(row)
+
+    merged_rows: list[dict[str, Any]] = []
+    for dataset, rows in sorted(rows_by_dataset.items()):
+        elapsed = max(float(row["elapsed_s"]) for row in rows)
+        num_requests = sum(int(row["num_requests"]) for row in rows)
+        total_output_tokens = sum(int(row["total_output_tokens"]) for row in rows)
+        num_proposals = sum(int(row["num_proposals"]) for row in rows)
+        num_proposed = sum(int(row["num_proposed_draft_tokens"]) for row in rows)
+        num_accepted = sum(int(row["num_accepted_draft_tokens"]) for row in rows)
+        merged_rows.append(
+            {
+                "dataset": dataset,
+                "num_requests": num_requests,
+                "elapsed_s": elapsed,
+                "requests_per_second": num_requests / elapsed if elapsed else 0,
+                "output_tokens_per_second": (
+                    total_output_tokens / elapsed if elapsed else 0
+                ),
+                "total_output_tokens": total_output_tokens,
+                "num_proposals": num_proposals,
+                "num_proposed_draft_tokens": num_proposed,
+                "num_accepted_draft_tokens": num_accepted,
+                "acceptance_length": (
+                    1.0 + num_accepted / num_proposals if num_proposals else 1.0
+                ),
+                "accepted_draft_length": (
+                    num_accepted / num_proposals if num_proposals else 0.0
+                ),
+            }
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(merged_rows)
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump(merged_rows, f, indent=2)
+
+    artifacts_dir = output_dir / "artifacts"
+    artifacts_dir.mkdir(exist_ok=True)
+    for worker_dir in worker_dirs:
+        worker_artifacts = worker_dir / "artifacts"
+        if not worker_artifacts.exists():
+            continue
+        for artifact_path in worker_artifacts.glob("*.jsonl"):
+            with artifact_path.open(encoding="utf-8") as src, (
+                artifacts_dir / artifact_path.name
+            ).open("a", encoding="utf-8") as dst:
+                for line in src:
+                    dst.write(line)
+
+
+def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
+    env_name, devices = _visible_devices_for(args.device)
+    if devices and len(devices) < worker_count:
+        raise ValueError(
+            f"Requested {worker_count} workers but {env_name} has only "
+            f"{len(devices)} visible devices: {devices}"
+        )
+
+    worker_root = args.output_dir / "workers"
+    worker_root.mkdir(parents=True, exist_ok=True)
+    logger.info("Launching %d worker(s)", worker_count)
+
+    procs = []
+    worker_dirs = []
+    for rank in range(worker_count):
+        worker_dir = worker_root / f"rank{rank}"
+        worker_dirs.append(worker_dir)
+        env = os.environ.copy()
+        if env_name is not None:
+            visible = devices[rank] if devices else str(rank)
+            env[env_name] = visible
+            logger.info("Worker %d uses %s=%s", rank, env_name, visible)
+        cmd = _child_cmd(args, rank, worker_count, worker_dir)
+        procs.append(subprocess.Popen(cmd, env=env))  # noqa: S603
+
+    failed = []
+    for rank, proc in enumerate(procs):
+        ret = proc.wait()
+        if ret != 0:
+            failed.append((rank, ret))
+    if failed:
+        raise RuntimeError(f"Worker failures: {failed}")
+
+    _merge_worker_outputs(args.output_dir, worker_dirs)
+    logger.info("Merged worker results into %s", args.output_dir)
+
+
 def _resolve_draft_attn_impl(args: argparse.Namespace) -> str | None:
     if args.draft_attn_impl != "auto":
         return args.draft_attn_impl
@@ -455,6 +632,11 @@ def _resolve_draft_attn_impl(args: argparse.Namespace) -> str | None:
 
 def run(args: argparse.Namespace) -> None:
     global torch
+
+    worker_count = _resolve_num_workers(args)
+    if args.worker_rank is None and worker_count > 1:
+        _run_multi_worker(args, worker_count)
+        return
 
     import torch as torch_module  # noqa: PLC0415
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
@@ -539,6 +721,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument(
+        "--num-workers",
+        default="auto",
+        help=(
+            "Number of parallel worker processes. 'auto' uses the number of "
+            "visible ASCEND/CUDA devices; 1 disables multi-worker mode."
+        ),
+    )
+    parser.add_argument(
         "--draft-attn-impl",
         choices=["auto", "simple_flex_attention", "sdpa", "eager"],
         default="auto",
@@ -558,6 +748,13 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="When tqdm is unavailable or disabled, log progress every N samples.",
     )
+    parser.add_argument(
+        "--skip-artifacts",
+        action="store_true",
+        help="Do not write per-sample output_token_ids artifacts.",
+    )
+    parser.add_argument("--worker-rank", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser.parse_args()
 
