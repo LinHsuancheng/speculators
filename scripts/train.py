@@ -1037,6 +1037,15 @@ def parse_args():
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
     )
     parser.add_argument(
+        "--sampled-acceptance-loss-alpha",
+        type=float,
+        default=1.0,
+        help=(
+            "DSpark: weight of the on-policy sampled exact acceptance-length "
+            "loss when sampled draft/target logprobs are supplied (default: 1.0)."
+        ),
+    )
+    parser.add_argument(
         "--cat-mode",
         type=str,
         default="none",

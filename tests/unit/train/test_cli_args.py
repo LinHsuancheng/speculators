@@ -161,6 +161,13 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     assert val_kw["confidence_head_alpha"] == 0.5
 
 
+def test_dspark_sampled_acceptance_loss_alpha(monkeypatch):
+    args = _parse(monkeypatch, ["--sampled-acceptance-loss-alpha", "0.25"])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["sampled_acceptance_loss_alpha"] == 0.25
+    assert val_kw["sampled_acceptance_loss_alpha"] == 0.25
+
+
 def test_dspark_cat_mode_default(monkeypatch):
     args = _parse(monkeypatch, [])
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))

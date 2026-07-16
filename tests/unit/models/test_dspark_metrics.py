@@ -2,8 +2,12 @@
 
 import torch
 
-from speculators.models.dspark.metrics import compute_metrics
-from speculators.models.metrics import resolve_loss_config
+from speculators.models.dspark.metrics import (
+    compute_metrics,
+    exact_acceptance_length_loss,
+    sampled_acceptance_credit,
+)
+from speculators.models.metrics import ce_loss, loss_function, resolve_loss_config
 
 _DEFAULT_LOSS = resolve_loss_config('{"ce": 0.1, "tv": 0.9}')
 
@@ -220,3 +224,116 @@ class TestComputeMetrics:
         # so draft-CAT loss should be <= unweighted loss for the same terms.
         assert float(loss_draft) <= float(loss_none) + 1e-5
         assert "cat_weight_mean_sum" in metrics
+
+
+class TestSampledAcceptanceLoss:
+    def test_credit_matches_formula(self):
+        draft_logp = torch.log(torch.tensor([[0.2, 0.8, 0.5]]))
+        target_logp = torch.log(torch.tensor([[0.4, 0.4, 0.75]]))
+
+        credit = sampled_acceptance_credit(draft_logp, target_logp)
+
+        alpha = torch.tensor([[1.0, 0.5, 1.0]])
+        survival = torch.cumprod(alpha, dim=-1)
+        continuation = torch.flip(
+            torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
+            dims=[-1],
+        )
+        undercovered = torch.tensor([[1.0, 0.0, 1.0]])
+        expected = undercovered * continuation
+        assert torch.allclose(credit, expected)
+
+    def test_exact_loss_only_backprops_through_draft_logp(self):
+        draft_logp = torch.log(torch.tensor([[0.2, 0.8, 0.5]])).requires_grad_()
+        target_logp = torch.log(torch.tensor([[0.4, 0.4, 0.75]])).requires_grad_()
+
+        loss = exact_acceptance_length_loss(draft_logp, target_logp)
+        loss.backward()
+
+        credit = sampled_acceptance_credit(draft_logp, target_logp)
+        expected_grad = -credit / draft_logp.shape[-1]
+        assert torch.allclose(draft_logp.grad, expected_grad)
+        assert target_logp.grad is None
+
+    def test_sampled_metrics_use_credit_instead_of_gamma_decay(self):
+        logits = torch.tensor(
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [0.0, 3.0, 0.0],
+                    [0.0, 0.0, 4.0],
+                ]
+            ],
+            requires_grad=True,
+        )
+        targets = _ids_to_logits(torch.tensor([[0, 0, 1, 2]]), 3)
+        loss_mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.float32)
+        draft_logp = torch.log(torch.tensor([[0.2, 0.8, 0.5]])).requires_grad_()
+        target_logp = torch.log(torch.tensor([[0.4, 0.4, 0.75]]))
+
+        loss, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=resolve_loss_config("ce"),
+            gamma=0.01,
+            sampled_draft_logprobs=draft_logp,
+            sampled_target_logprobs=target_logp,
+            sampled_acceptance_loss_alpha=1.0,
+        )
+
+        credit = sampled_acceptance_credit(draft_logp, target_logp)
+        position_weights = torch.tensor([[0.0, *credit[0].tolist()]])
+        expected_ce = loss_function(
+            logits,
+            targets,
+            loss_mask,
+            torch.tensor([[0, 1, 2, 3]]),
+            loss_fn=ce_loss,
+            decay_fn=None,
+            position_weights=position_weights,
+        )
+        expected_exact = exact_acceptance_length_loss(
+            draft_logp, target_logp, credit=credit
+        )
+
+        assert torch.allclose(loss, expected_ce + expected_exact)
+        assert "sampled_acceptance_loss_sum" in metrics
+        assert "sampled_credit_mean_sum" in metrics
+        assert "cat_weight_mean_sum" not in metrics
+
+    def test_sampled_confidence_loss_uses_credit_weights(self):
+        logits = _ids_to_logits(torch.tensor([[0, 1, 2, 0]]), 4)
+        targets = _ids_to_logits(torch.tensor([[0, 1, 2, 0]]), 4)
+        loss_mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.float32)
+        confidence_logits = torch.zeros(1, 4)
+        draft_logp = torch.log(torch.tensor([[0.2, 0.8, 0.5]]))
+        target_logp = torch.log(torch.tensor([[0.4, 0.4, 0.75]]))
+
+        loss_no_conf, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=resolve_loss_config("ce"),
+            sampled_draft_logprobs=draft_logp,
+            sampled_target_logprobs=target_logp,
+        )
+        loss_conf, metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=4,
+            loss_config=resolve_loss_config("ce"),
+            confidence_head_alpha=1.0,
+            sampled_draft_logprobs=draft_logp,
+            sampled_target_logprobs=target_logp,
+        )
+
+        assert float(loss_conf) > float(loss_no_conf)
+        assert "confidence_loss_sum" in metrics

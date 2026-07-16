@@ -10,6 +10,10 @@ prefix product of a stop-gradient confidence proxy, following PARD-2:
 
 * ``target``: target-model GT-token confidence
 * ``draft``: analytical draft/target acceptance overlap
+
+When on-policy sampled target logprobs are provided, DSpark can replace the
+position/gamma decay with exact speculative-sampling credit weights and add the
+Monte Carlo acceptance-length loss from the sampled path.
 """
 
 from collections.abc import Callable
@@ -20,16 +24,20 @@ import torch
 from torch.nn.functional import binary_cross_entropy_with_logits, softmax
 
 from speculators.models.metrics import (
+    ce_loss,
     LossConfig,
     compound_loss,
     compute_accuracy_multi_step,
     dflash_loss_decay,
     draft_cat_weights,
+    loss_function,
     target_cat_weights,
 )
 
 __all__ = [
     "compute_metrics",
+    "exact_acceptance_length_loss",
+    "sampled_acceptance_credit",
 ]
 
 _EPS = 1e-8
@@ -53,6 +61,109 @@ def _masked_decayed_mean(
         weighted = weighted * position_weights.to(weighted.dtype)
     denominator = loss_mask.sum(dim=1) + _EPS
     return (weighted.sum(dim=1) / denominator).mean()
+
+
+def sampled_acceptance_credit(
+    draft_logp: torch.Tensor,
+    target_logp: torch.Tensor,
+) -> torch.Tensor:
+    """Return stop-gradient exact speculative credit for an on-policy path.
+
+    ``draft_logp`` is ``log q_t(Y_t)`` and must keep gradient. ``target_logp`` is
+    ``log p_t(Y_t)`` from the frozen verifier.  The returned credit is
+
+    ``1[q_t(Y_t) < p_t(Y_t)] * sum_{k=t..K} prod_{i<=k} alpha_i``
+
+    with ``alpha_i = min(1, p_i(Y_i) / q_i(Y_i))``.
+    """
+    if draft_logp.shape != target_logp.shape:
+        raise ValueError(
+            "sampled logprob shape mismatch: "
+            f"draft_logp={draft_logp.shape}, target_logp={target_logp.shape}"
+        )
+    if draft_logp.ndim < 1:
+        raise ValueError("sampled logprobs must have at least one dimension")
+
+    q_detached = draft_logp.detach()
+    p_detached = target_logp.detach().to(device=q_detached.device)
+    log_alpha = torch.minimum(
+        torch.zeros_like(q_detached),
+        p_detached - q_detached,
+    )
+    survival = torch.exp(torch.cumsum(log_alpha, dim=-1))
+    continuation = torch.flip(
+        torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
+        dims=[-1],
+    )
+    undercovered = (q_detached < p_detached).to(dtype=draft_logp.dtype)
+    return (undercovered * continuation.to(dtype=draft_logp.dtype)).detach()
+
+
+def exact_acceptance_length_loss(
+    draft_logp: torch.Tensor,
+    target_logp: torch.Tensor,
+    credit: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Monte Carlo loss whose gradient optimizes expected accepted length."""
+    if credit is None:
+        credit = sampled_acceptance_credit(draft_logp, target_logp)
+    if credit.shape != draft_logp.shape:
+        raise ValueError(
+            f"credit shape mismatch: credit={credit.shape}, draft_logp={draft_logp.shape}"
+        )
+    block_tokens = draft_logp.shape[-1]
+    return -((credit * draft_logp).sum(dim=-1) / block_tokens).mean()
+
+
+def _sampled_credit_position_weights(
+    credit: torch.Tensor,
+    loss_mask: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Map sampled draft-slot credit to ``[1, T]`` position weights.
+
+    The first position in every block is the anchor and remains zero.  Credit is
+    placed on slots ``1..K``.
+    """
+    total_seq_len = loss_mask.shape[1]
+    if total_seq_len % block_size != 0:
+        raise ValueError(
+            f"loss_mask length {total_seq_len} is not divisible by block_size={block_size}"
+        )
+    num_blocks = total_seq_len // block_size
+    if credit.ndim == 3:
+        if credit.shape[0] != 1:
+            raise ValueError(
+                "sampled credit currently expects batch size 1, "
+                f"got credit shape {credit.shape}"
+            )
+        credit = credit.squeeze(0)
+    if credit.ndim == 1:
+        credit = credit.unsqueeze(0)
+    if credit.ndim != 2:
+        raise ValueError(
+            "sampled credit must have shape [K], [num_blocks, K], or "
+            f"[1, num_blocks, K], got {credit.shape}"
+        )
+    if credit.shape[0] != num_blocks:
+        raise ValueError(
+            f"sampled credit has {credit.shape[0]} blocks but loss has {num_blocks}"
+        )
+    sampled_slots = credit.shape[1]
+    if sampled_slots > block_size - 1:
+        raise ValueError(
+            f"sampled credit has {sampled_slots} slots, but block_size={block_size} "
+            f"allows at most {block_size - 1}"
+        )
+
+    weights = torch.zeros(
+        num_blocks,
+        block_size,
+        device=loss_mask.device,
+        dtype=credit.dtype,
+    )
+    weights[:, 1 : 1 + sampled_slots] = credit.to(loss_mask.device)
+    return weights.reshape(1, total_seq_len) * loss_mask.to(dtype=credit.dtype)
 
 
 def _resolve_cat_weights(
@@ -83,26 +194,65 @@ def compute_metrics(
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
     cat_mode: CatMode = "none",
+    sampled_draft_logprobs: torch.Tensor | None = None,
+    sampled_target_logprobs: torch.Tensor | None = None,
+    sampled_acceptance_loss_alpha: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
     device = logits.device
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
-    decay_fn = partial(dflash_loss_decay, gamma=gamma)
-    cat_weights = _resolve_cat_weights(
-        cat_mode, logits, targets, loss_mask, block_size
-    )
-
-    loss, term_losses = compound_loss(
-        logits,
-        targets,
-        loss_mask,
-        pos_idx,
-        loss_config=loss_config,
-        decay_fn=decay_fn,
-        position_weights=cat_weights,
-    )
+    sampled_credit = None
+    sampled_exact_loss = None
+    if sampled_draft_logprobs is not None or sampled_target_logprobs is not None:
+        if sampled_draft_logprobs is None or sampled_target_logprobs is None:
+            raise ValueError(
+                "sampled_draft_logprobs and sampled_target_logprobs must be provided "
+                "together"
+            )
+        sampled_draft_logprobs = sampled_draft_logprobs.to(device=device)
+        sampled_target_logprobs = sampled_target_logprobs.to(device=device)
+        sampled_credit = sampled_acceptance_credit(
+            sampled_draft_logprobs, sampled_target_logprobs
+        )
+        sampled_exact_loss = exact_acceptance_length_loss(
+            sampled_draft_logprobs,
+            sampled_target_logprobs,
+            credit=sampled_credit,
+        )
+        position_weights = _sampled_credit_position_weights(
+            sampled_credit, loss_mask, block_size
+        )
+        decay_fn = None
+        cat_weights = None
+        loss = loss_function(
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_fn=ce_loss,
+            decay_fn=None,
+            position_weights=position_weights,
+        )
+        term_losses = {"ce_loss": loss.detach()}
+    else:
+        decay_fn = partial(dflash_loss_decay, gamma=gamma)
+        cat_weights = _resolve_cat_weights(
+            cat_mode, logits, targets, loss_mask, block_size
+        )
+        position_weights = cat_weights
+        loss, term_losses = compound_loss(
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_config=loss_config,
+            decay_fn=decay_fn,
+            position_weights=position_weights,
+        )
+    if sampled_exact_loss is not None:
+        loss = loss + sampled_acceptance_loss_alpha * sampled_exact_loss
 
     # Analytical per-position acceptance rate = distributional overlap.
     with torch.no_grad():
@@ -123,7 +273,7 @@ def compute_metrics(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
         conf_loss = _masked_decayed_mean(
-            bce, loss_mask, pos_idx, decay_fn, position_weights=cat_weights
+            bce, loss_mask, pos_idx, decay_fn, position_weights=position_weights
         )
         loss = loss + confidence_head_alpha * conf_loss
 
@@ -156,6 +306,24 @@ def compute_metrics(
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones
+
+    if sampled_exact_loss is not None and sampled_credit is not None:
+        metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
+        metrics["sampled_acceptance_loss_total"] = ones
+        with torch.no_grad():
+            metrics["sampled_credit_mean_sum"] = sampled_credit.detach().sum()
+            metrics["sampled_credit_mean_total"] = torch.tensor(
+                sampled_credit.numel(), device=device, dtype=sampled_credit.dtype
+            )
+            log_alpha = torch.minimum(
+                torch.zeros_like(sampled_draft_logprobs.detach()),
+                sampled_target_logprobs.detach() - sampled_draft_logprobs.detach(),
+            )
+            sampled_alpha = torch.exp(log_alpha)
+            metrics["sampled_alpha_mean_sum"] = sampled_alpha.sum()
+            metrics["sampled_alpha_mean_total"] = torch.tensor(
+                sampled_alpha.numel(), device=device, dtype=sampled_alpha.dtype
+            )
 
     if cat_weights is not None:
         with torch.no_grad():
