@@ -37,15 +37,8 @@ DRAFT_ATTN_IMPL="sdpa"
 # Markov + confidence head settings
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"
-# On-policy exact expected-acceptance-length objective: CE regularizer + the
-# acceptance-length term (replaces TV); the presence of "accept_length" turns on
-# the on-policy path (draft rollout + vLLM verifier rescoring). Confidence BCE is
-# kept via CONFIDENCE_HEAD_ALPHA. All three terms share the C_t position weight.
-LOSS_FN='{"ce": 0.1, "accept_length": 0.9}'
+LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
-# Draft sampling temperature T for the on-policy rollout (also applied to the
-# verifier acceptance ratio min(1, p/q)). Floored to 1e-2; small T -> greedy.
-SAMPLING_TEMPERATURE=1.0
 
 # Ascend NPU assignments
 VLLM_NPUS="8,9,10,11"
@@ -123,7 +116,6 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
-    --sampling-temperature "$SAMPLING_TEMPERATURE" \
     --logger tensorboard \
     --on-missing generate \
     --on-generate delete > "$LOG_FILE" 2>&1 &
