@@ -93,7 +93,6 @@ PID_FILE="$LOG_DIR/train.pid"
 
 echo "=== Step 3: Training on NPUs: $TRAIN_NPUS ==="
 echo "Log file: $LOG_FILE"
-set -o pipefail
 env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --nnodes 1 --node_rank 0 --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
@@ -120,7 +119,7 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
     --logger tensorboard \
     --on-missing generate \
-    --on-generate delete 2>&1 | tee -a "$LOG_FILE" &
+    --on-generate delete > "$LOG_FILE" 2>&1 &
 
 echo $! > "$PID_FILE"
 

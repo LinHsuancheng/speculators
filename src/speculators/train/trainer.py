@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 import warnings
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -42,13 +43,19 @@ MIN_STEP_PCT = 0.25
 
 
 def _progress(iterable, *, desc: str, total: int):
+    try:
+        tty = open("/dev/tty", "w")  # noqa: SIM115
+    except OSError:
+        tty = sys.stderr
     return tqdm(
         iterable,
         desc=desc,
         total=total,
+        file=tty,
         dynamic_ncols=True,
         mininterval=1.0,
         disable=False,
+        leave=True,
     )
 
 
