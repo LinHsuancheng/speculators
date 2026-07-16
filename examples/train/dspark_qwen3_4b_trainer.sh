@@ -1,60 +1,53 @@
 #!/bin/bash
 # Online DSpark Training Script for Qwen3-4B on Ascend NPU
 # Baseline configuration for 4v4 setup (4 vLLM + 4 training)
-
 set -euo pipefail
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
-export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
+export NO_PROXY=localhost,127.0.0.1,80.48.17.185 no_proxy=localhost,127.0.0.1,80.48.17.185
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=34655
+export GLOO_SOCKET_IFNAME=lo
 
+export HCCL_CONNECT_TIMEOUT=1800
+export HCCL_EXEC_TIMEOUT=3600
+export HCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NPU_ASYNC_ERROR_HANDLING=1
+export ASCEND_LAUNCH_BLOCKING=0
 # ============ Configuration ============
-MODEL="${MODEL:-Qwen/Qwen3-4B}"
+MODEL="/models/Qwen3-4B"
 DATASET="sharegpt"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/dspark_qwen3_4b_baseline}"
+OUTPUT_DIR="/outputs/dspark_qwen3_4b_real_baseline"
+ARROW_DIR="/data/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072.100k"
 VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=3072
 EPOCHS=5
 LR=6e-4
-
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
 BLOCK_SIZE=8
 MAX_ANCHORS=512
-NUM_LAYERS=3
+NUM_LAYERS=5
 DRAFT_VOCAB_SIZE=32000
-TARGET_LAYER_IDS="2 18 33"
+TARGET_LAYER_IDS="1 9 17 25 33"
 DRAFT_ATTN_IMPL="sdpa"
 
 # Markov + confidence head settings
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"
-# On-policy exact expected-acceptance-length objective: CE (regularizer) + the
-# acceptance-length term replace the old TV term; the confidence BCE is kept via
-# CONFIDENCE_HEAD_ALPHA. The presence of "accept_length" turns on on-policy
-# sampling (draft rollout + vLLM verifier rescoring). Teacher-forced baseline was
-# LOSS_FN='{"ce": 0.1, "tv": 0.9}'.
-LOSS_FN='{"ce": 0.1, "accept_length": 0.9}'
+LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
-# Draft sampling temperature for the on-policy rollout (also applied to the
-# verifier acceptance ratio). Train a greedy serving regime with a small T.
-SAMPLING_TEMPERATURE=1.0
-SAMPLING_TEMPERATURE=1.0
 
 # Ascend NPU assignments
-VLLM_NPUS="0,1,2,3"
-TRAIN_NPUS="4,5,6,7"
+VLLM_NPUS="8,9,10,11"
+TRAIN_NPUS="12,13,14,15"
 NUM_TRAIN_NPUS=4
 
-# vLLM configuration - fix memory + enable parallelism.
-# --enable-prefix-caching lets the fixed gold prefix of each on-policy scoring
-# request hit cache, so only the sampled continuation is recomputed (node 4).
+# vLLM configuration - fix memory + enable parallelism
 VLLM_EXTRA_ARGS=(
     --data-parallel-size 4
-    --max-model-len 4096
-    --max-num-seqs 768
-    --enable-prefix-caching
 )
 
 cleanup() {
@@ -68,20 +61,20 @@ trap cleanup EXIT
 
 # Step 1: Prepare data
 echo "=== Step 1: Preparing data ==="
-python scripts/prepare_data.py \
-    --model "$MODEL" \
-    --data "$DATASET" \
-    --output "$OUTPUT_DIR" \
-    --max-samples "$MAX_SAMPLES" \
-    --seq-length "$SEQ_LENGTH"
+# python scripts/prepare_data.py \
+#     --model "$MODEL" \
+#     --data "$DATASET" \
+#     --output "$OUTPUT_DIR" \
+#     --max-samples "$MAX_SAMPLES" \
+#     --seq-length "$SEQ_LENGTH"
 
 # Step 2: Launch vLLM server
 echo "=== Step 2: Launching vLLM on NPUs: $VLLM_NPUS ==="
-env TASK_QUEUE_ENABLE=1 ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
-    --target-layer-ids $TARGET_LAYER_IDS \
-    --no-include-last-layer \
-    -- --port "$VLLM_PORT" "${VLLM_EXTRA_ARGS[@]}" &
-VLLM_PID=$!
+# env TASK_QUEUE_ENABLE=1 ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
+#     --target-layer-ids $TARGET_LAYER_IDS \
+#     --no-include-last-layer \
+#     -- --port "$VLLM_PORT" "${VLLM_EXTRA_ARGS[@]}" &
+# VLLM_PID=$!
 
 echo "Waiting for vLLM to be ready..."
 until curl --noproxy localhost,127.0.0.1 -sf "http://localhost:${VLLM_PORT}/v1/models" >/dev/null 2>&1; do
@@ -90,17 +83,24 @@ done
 echo "vLLM ready."
 
 # Step 3: Train DSpark
+LOG_DIR="$OUTPUT_DIR/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
+PID_FILE="$LOG_DIR/train.pid"
+
+
+# tensorboard --logdir ./logs --host 0.0.0.0 --port 6007 & 
+
 echo "=== Step 3: Training on NPUs: $TRAIN_NPUS ==="
 env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
-    --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
+    --nnodes 1 --node_rank 0 --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
     --verifier-name-or-path "$MODEL" \
-    --data-path "$OUTPUT_DIR" \
+    --data-path "$ARROW_DIR" \
     --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
     --save-path "$OUTPUT_DIR/checkpoints" \
-    --num-workers 48 \
-    --prefetch-factor 8 \
     --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
+    --log-freq 5 \
     --epochs "$EPOCHS" \
     --lr "$LR" \
     --total-seq-len "$SEQ_LENGTH" \
@@ -116,8 +116,13 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
-    --sampling-temperature "$SAMPLING_TEMPERATURE" \
+    --logger tensorboard \
     --on-missing generate \
     --on-generate delete
+    > "$LOG_FILE" 2>&1 &
 
-echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"
+echo "Log file: $LOG_FILE"
+echo "View log with: tail -f $LOG_FILE"
+echo "Stop with: kill \$(cat $PID_FILE)"
+
+echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/ 
