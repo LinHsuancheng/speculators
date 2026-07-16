@@ -16,7 +16,7 @@ DEEPSPEC_EVAL_DATASETS="${DEEPSPEC_EVAL_DATASETS:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/dspark_deepspec_offline}"
 MAX_SAMPLES="${MAX_SAMPLES:-200}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
-DEVICE="${DEVICE:-cuda}"
+DEVICE="${DEVICE:-npu}"
 DTYPE="${DTYPE:-bfloat16}"
 NUM_WORKERS="${NUM_WORKERS:-auto}"
 DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-auto}"
@@ -42,6 +42,11 @@ if [[ -z "$DEEPSPEC_EVAL_DATASETS" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts/evaluate" && pwd)"
+
+echo "DEVICE=$DEVICE"
+echo "NUM_WORKERS=$NUM_WORKERS"
+echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
 cmd=(
     "$PYTHON" "$SCRIPT_DIR/dspark_offline_eval.py"

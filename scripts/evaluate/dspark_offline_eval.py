@@ -512,6 +512,16 @@ def _visible_devices_for(device: str) -> tuple[str | None, list[str]]:
     return env_name, devices
 
 
+def _worker_device(device: str, worker_rank: int | None) -> str:
+    if worker_rank is None:
+        return device
+    if device == "npu":
+        return "npu:0"
+    if device == "cuda":
+        return "cuda:0"
+    return device
+
+
 def _resolve_num_workers(args: argparse.Namespace) -> int:
     if args.worker_rank is not None:
         return args.worker_count
@@ -638,7 +648,8 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
     worker_root.mkdir(parents=True, exist_ok=True)
     logger.info(
         "Launching %d worker(s) | output_dir=%s | device=%s | max_samples=%s | "
-        "max_new_tokens=%s | log_every=%s | verbose_samples=%s",
+        "max_new_tokens=%s | log_every=%s | verbose_samples=%s | "
+        "ASCEND_RT_VISIBLE_DEVICES=%s | CUDA_VISIBLE_DEVICES=%s",
         worker_count,
         args.output_dir,
         args.device,
@@ -646,6 +657,8 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
         args.max_new_tokens,
         args.log_every,
         args.verbose_samples,
+        os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     )
 
     procs = []
@@ -658,6 +671,10 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
         if env_name is not None:
             visible = devices[rank] if devices else str(rank)
             env[env_name] = visible
+            if env_name == "ASCEND_RT_VISIBLE_DEVICES":
+                env.pop("CUDA_VISIBLE_DEVICES", None)
+            elif env_name == "CUDA_VISIBLE_DEVICES":
+                env.pop("ASCEND_RT_VISIBLE_DEVICES", None)
             logger.info("Worker %d uses %s=%s", rank, env_name, visible)
         cmd = _child_cmd(args, rank, worker_count, worker_dir)
         logger.info("Worker %d command: %s", rank, " ".join(cmd))
@@ -697,18 +714,23 @@ def run(args: argparse.Namespace) -> None:
     from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
 
     torch = torch_module
-    device = torch.device(args.device)
+    resolved_device = _worker_device(args.device, args.worker_rank)
+    device = torch.device(resolved_device)
     dtype = getattr(torch, args.dtype) if args.dtype != "auto" else "auto"
     logger.info(
-        "[%s] Starting offline eval | output_dir=%s | device=%s | dtype=%s | "
-        "max_samples=%s | max_new_tokens=%s | skip_artifacts=%s",
+        "[%s] Starting offline eval | output_dir=%s | device=%s | resolved_device=%s | "
+        "dtype=%s | max_samples=%s | max_new_tokens=%s | skip_artifacts=%s | "
+        "ASCEND_RT_VISIBLE_DEVICES=%s | CUDA_VISIBLE_DEVICES=%s",
         _rank_prefix(args),
         args.output_dir,
         args.device,
+        resolved_device,
         args.dtype,
         args.max_samples,
         args.max_new_tokens,
         args.skip_artifacts,
+        os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     )
     logger.info("Loading tokenizer: %s", args.verifier_model)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -718,7 +740,7 @@ def run(args: argparse.Namespace) -> None:
     logger.info(
         "Loading verifier model: %s (device=%s, dtype=%s)",
         args.verifier_model,
-        args.device,
+        resolved_device,
         args.dtype,
     )
     target = AutoModelForCausalLM.from_pretrained(
