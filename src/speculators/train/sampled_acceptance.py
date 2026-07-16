@@ -137,7 +137,7 @@ class SampledAcceptanceAugmentor:
 
         hidden_blocks = hidden.view(1, block_size, -1)
         logits_blocks = logits.view(1, block_size, -1)
-        prev_token_ids = torch.full(
+        base_prev_token_ids = torch.full(
             (1, block_size),
             int(input_ids[0, anchor_pos].item()),
             dtype=torch.long,
@@ -148,8 +148,13 @@ class SampledAcceptanceAugmentor:
         sampled_draft_ids: list[int] = []
         draft_logprobs: list[torch.Tensor] = []
         for slot in range(1, sampled_len + 1):
-            if slot > 1:
-                prev_token_ids[0, slot] = sampled_target_ids[-1]
+            prev_token_ids = base_prev_token_ids.clone()
+            if sampled_target_ids:
+                prev_token_ids[0, 1 : 1 + len(sampled_target_ids)] = torch.tensor(
+                    sampled_target_ids,
+                    dtype=torch.long,
+                    device=device,
+                )
             biased_logits = logits_blocks
             if model.markov_head is not None:
                 prev_emb = model.markov_head.prev_embeddings(prev_token_ids)
