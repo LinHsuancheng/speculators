@@ -109,7 +109,7 @@ def _hidden_extract_stage(
     model: str,
     item: dict[str, Any],
     args: argparse.Namespace,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     from safetensors.torch import load_file  # noqa: PLC0415
 
     expected_ids = item["input_ids"].tolist()
@@ -126,7 +126,7 @@ def _hidden_extract_stage(
             "ok": False,
             "status": "skipped",
             "reason": "response missing kv_transfer_params.hidden_states_path",
-        }
+        }, None
 
     _wait_for_hidden_state_file(Path(hs_path), args.file_timeout)
     loaded = load_file(hs_path)
@@ -161,6 +161,144 @@ def _hidden_extract_stage(
             "hidden_has_nan": hidden_has_nan,
             "hidden_minus_expected_len": int(hidden.shape[0] - len(expected_ids)),
         },
+    }, {"token_ids": token_ids, "hidden_states": hidden} if ok else None
+
+
+def _auto_device() -> str:
+    import torch  # noqa: PLC0415
+
+    if torch.cuda.is_available():
+        return "cuda"
+    npu = getattr(torch, "npu", None)
+    if npu is not None and npu.is_available():
+        return "npu"
+    return "cpu"
+
+
+def _load_draft_model(args: argparse.Namespace):
+    if not args.draft_checkpoint:
+        return None
+
+    import torch  # noqa: PLC0415
+
+    from speculators.model import SpeculatorModel  # noqa: PLC0415
+
+    device = _auto_device() if args.draft_device == "auto" else args.draft_device
+    dtype = getattr(torch, args.draft_dtype)
+    model = SpeculatorModel.from_pretrained(args.draft_checkpoint)
+    model.to(dtype=dtype)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def _target_token_id(draft_model, draft_token_id: int) -> int:
+    d2t = getattr(draft_model, "d2t", None)
+    if d2t is None:
+        return draft_token_id
+    return int(d2t[draft_token_id].item())
+
+
+def _apply_markov_bias(draft_model, logits, hidden_blocks, prev_token_ids):
+    if getattr(draft_model, "markov_head", None) is None:
+        return logits
+    prev_emb = draft_model.markov_head.prev_embeddings(prev_token_ids)
+    markov_bias = draft_model.markov_head.block_bias(
+        prev_token_ids=prev_token_ids,
+        hidden_states=hidden_blocks,
+        prev_emb=prev_emb,
+    )
+    return logits + markov_bias
+
+
+def _sample_from_draft(
+    *,
+    draft_model,
+    item: dict[str, Any],
+    hidden_artifacts: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    import torch  # noqa: PLC0415
+
+    token_ids = hidden_artifacts["token_ids"].to(next(draft_model.parameters()).device)
+    hidden = hidden_artifacts["hidden_states"].to(
+        device=token_ids.device,
+        dtype=next(draft_model.parameters()).dtype,
+    )
+    total_len = token_ids.shape[0]
+    block_size = int(draft_model.block_size)
+    sampled_len = min(args.score_tokens, block_size - 1)
+    prefix_len = min(max(args.score_prefix_tokens, 1), total_len - sampled_len)
+    anchor_pos = prefix_len - 1
+    if anchor_pos < 0 or anchor_pos + sampled_len >= total_len:
+        raise ValueError(
+            f"Invalid draft sampling window: prefix_len={prefix_len}, "
+            f"sampled_len={sampled_len}, total_len={total_len}"
+        )
+
+    input_ids = token_ids.unsqueeze(0)
+    loss_mask = torch.zeros((1, total_len), dtype=torch.bool, device=token_ids.device)
+    loss_mask[:, anchor_pos] = True
+    document_ids = torch.zeros((1, total_len), dtype=torch.long, device=token_ids.device)
+    position_ids = torch.arange(total_len, dtype=torch.long, device=token_ids.device)
+    position_ids = position_ids.unsqueeze(0)
+    hidden_states = hidden[:, :-1].flatten(1).unsqueeze(0)
+    verifier_last_hidden_states = hidden[:, -1].unsqueeze(0)
+
+    old_max_anchors = draft_model.config.max_anchors
+    draft_model.config.max_anchors = 1
+    try:
+        with torch.no_grad():
+            hidden_out, logits, _, _, _ = draft_model._backbone_forward(
+                hidden_states,
+                input_ids,
+                loss_mask,
+                verifier_last_hidden_states,
+                document_ids,
+                position_ids,
+            )
+    finally:
+        draft_model.config.max_anchors = old_max_anchors
+
+    hidden_blocks = hidden_out.view(1, block_size, -1)
+    logits_blocks = logits.view(1, block_size, -1)
+    prev_token_ids = torch.full(
+        (1, block_size),
+        int(input_ids[0, anchor_pos].item()),
+        dtype=torch.long,
+        device=token_ids.device,
+    )
+
+    sampled_target_ids: list[int] = []
+    sampled_draft_ids: list[int] = []
+    draft_logprobs: list[float] = []
+    for slot in range(1, sampled_len + 1):
+        if slot > 1:
+            prev_token_ids[0, slot] = sampled_target_ids[-1]
+        biased_logits = _apply_markov_bias(
+            draft_model, logits_blocks, hidden_blocks, prev_token_ids
+        )
+        slot_logits = biased_logits[0, slot].float()
+        if args.draft_temperature <= 0:
+            draft_token_id = int(torch.argmax(slot_logits).item())
+            log_probs = torch.log_softmax(slot_logits, dim=-1)
+        else:
+            log_probs = torch.log_softmax(slot_logits / args.draft_temperature, dim=-1)
+            probs = torch.softmax(slot_logits / args.draft_temperature, dim=-1)
+            draft_token_id = int(torch.multinomial(probs, num_samples=1).item())
+        target_token_id = _target_token_id(draft_model, draft_token_id)
+        sampled_draft_ids.append(draft_token_id)
+        sampled_target_ids.append(target_token_id)
+        draft_logprobs.append(float(log_probs[draft_token_id].item()))
+
+    return {
+        "source": "draft",
+        "prefix_ids": token_ids[:prefix_len].tolist(),
+        "sampled_ids": sampled_target_ids,
+        "draft_sampled_token_ids": sampled_draft_ids,
+        "draft_logprobs": draft_logprobs,
+        "anchor_position": anchor_pos,
+        "block_size": block_size,
     }
 
 
@@ -184,17 +322,37 @@ def _score_prompt_logprobs(
     client,
     model: str,
     input_ids: list[int],
+    draft_model,
+    item: dict[str, Any],
+    hidden_artifacts: dict[str, Any] | None,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     from speculators.data_generation.vllm_client import (  # noqa: PLC0415
         score_sampled_tokens,
     )
 
-    prefix_ids, sampled_ids = _build_scoring_prompt(
-        input_ids,
-        prefix_tokens=args.score_prefix_tokens,
-        score_tokens=args.score_tokens,
-    )
+    if draft_model is not None:
+        if hidden_artifacts is None:
+            return {
+                "ok": None,
+                "status": "not_run_hidden_unusable_for_draft_sampling",
+            }
+        sample = _sample_from_draft(
+            draft_model=draft_model,
+            item=item,
+            hidden_artifacts=hidden_artifacts,
+            args=args,
+        )
+        prefix_ids = sample["prefix_ids"]
+        sampled_ids = sample["sampled_ids"]
+    else:
+        prefix_ids, sampled_ids = _build_scoring_prompt(
+            input_ids,
+            prefix_tokens=args.score_prefix_tokens,
+            score_tokens=args.score_tokens,
+        )
+        sample = {"source": "dataset", "prefix_ids": prefix_ids, "sampled_ids": sampled_ids}
+
     scored = score_sampled_tokens(
         client=client,
         model=model,
@@ -211,6 +369,12 @@ def _score_prompt_logprobs(
         "score_prompt_len": len(scored["prompt_token_ids"]),
         "prefix_len": len(prefix_ids),
         "sampled_len": len(sampled_ids),
+        "sample": {
+            key: value
+            for key, value in sample.items()
+            if key not in ("prefix_ids", "sampled_ids")
+        },
+        "sampled_token_ids": sampled_ids,
         "score_positions": scored["score_positions"],
         "target_token_logprobs": scored["token_logprobs"],
         "ignored_hidden_states_path": scored["hidden_states_path"],
@@ -238,6 +402,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-tokens", type=int, default=8)
     parser.add_argument("--prompt-logprobs", type=int, default=1)
     parser.add_argument(
+        "--draft-checkpoint",
+        default=None,
+        help=(
+            "Optional speculator checkpoint. If provided, sampled tokens come from "
+            "the draft model instead of dataset continuation tokens."
+        ),
+    )
+    parser.add_argument("--draft-device", default="auto")
+    parser.add_argument("--draft-dtype", default="bfloat16")
+    parser.add_argument(
+        "--draft-temperature",
+        type=float,
+        default=0.0,
+        help="<=0 uses greedy decoding for the draft smoke test.",
+    )
+    parser.add_argument(
         "--score-only-usable-hidden",
         action="store_true",
         help="Skip scoring when hidden-state extraction skipped the sample.",
@@ -258,6 +438,7 @@ def main() -> None:
 
     dataset = load_from_disk(args.data_path)
     indices = _choose_indices(args, len(dataset))
+    draft_model = _load_draft_model(args)
     client = openai.OpenAI(
         base_url=args.vllm_endpoint,
         api_key="EMPTY",
@@ -282,7 +463,7 @@ def main() -> None:
 
         sample_result: dict[str, Any] = {"sample": index}
         try:
-            hidden_result = _hidden_extract_stage(
+            hidden_result, hidden_artifacts = _hidden_extract_stage(
                 client=client,
                 model=model_id,
                 item=item,
@@ -300,6 +481,9 @@ def main() -> None:
                     client=client,
                     model=model_id,
                     input_ids=expected_ids,
+                    draft_model=draft_model,
+                    item=item,
+                    hidden_artifacts=hidden_artifacts,
                     args=args,
                 )
         except Exception as exc:  # noqa: BLE001
