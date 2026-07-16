@@ -229,20 +229,27 @@ def generate_hidden_states(
     messages = client_item.get("messages")
 
     res: Completion | ChatCompletion
+    # Disable prefix caching for hidden state extraction: APC skips cached tokens
+    # and returns incomplete hidden states, breaking downstream consumers.
+    extra_body = {
+        "return_token_ids": True,
+        "skip_prefix_caching": True,  # per-request override
+    }
     if messages is None:
         res = client.completions.create(
             model=model,
             prompt=token_ids,
             max_tokens=1,
-            extra_body={"return_token_ids": True},
+            extra_body=extra_body,
             timeout=timeout,
         )
     else:
+        extra_body["add_generation_prompt"] = False
         res = client.chat.completions.create(
             model=model,
             messages=messages,
             max_tokens=1,
-            extra_body={"add_generation_prompt": False, "return_token_ids": True},
+            extra_body=extra_body,
             timeout=timeout,
         )
 
