@@ -13,6 +13,22 @@ def conditional_torch_compile(func=None, *args, **kwargs):
     return func
 
 
+def disable_dynamo(func):
+    """Force ``func`` to run eagerly even inside a ``torch.compile`` region.
+
+    The DSpark on-policy path (draft sampling loop, blocking vLLM RPC, hidden-state
+    file IO) is not traceable by TorchDynamo. On Ascend ``torch.cuda.is_available()``
+    is True, so ``conditional_torch_compile`` compiles ``forward``; wrapping the
+    on-policy-only methods with this makes Dynamo graph-break and run them eagerly,
+    leaving the compiled teacher-forced path unaffected. No-op when the compiler
+    API is unavailable (older torch / CPU tests).
+    """
+    disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    if disable is None:
+        disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    return disable(func) if disable is not None else func
+
+
 def get_verifier_config(verifier_name_or_path: str) -> PretrainedConfig:
     verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
     if hasattr(verifier_config, "text_config"):

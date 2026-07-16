@@ -10,7 +10,7 @@ from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
 from speculators.models.dspark.onpolicy import VerifierScorer
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
-from speculators.models.utils import conditional_torch_compile
+from speculators.models.utils import conditional_torch_compile, disable_dynamo
 
 # Draft sampling temperature is floored to this value during on-policy training.
 # The estimator needs a differentiable, full-support proposal q_psi; a strictly
@@ -227,6 +227,7 @@ class DSparkDraftModel(DFlashDraftModel):
             conf_features = hidden_blocks
         return self.confidence_head(conf_features).reshape(1, mask_tokens_size)  # type: ignore[misc]
 
+    @disable_dynamo
     def _sample_block_rollout(
         self,
         base_logits: torch.Tensor,  # [num_blocks, block, draft_vocab]
@@ -315,6 +316,7 @@ class DSparkDraftModel(DFlashDraftModel):
             torch.stack(sampled_verifier, dim=1),
         )
 
+    @disable_dynamo
     def _onpolicy_forward(
         self,
         *,
