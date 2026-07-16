@@ -20,7 +20,17 @@ from typing import Any
 logger = logging.getLogger("dspark_offline_eval")
 torch = None
 
-PROMPT_FIELDS = ("prompt", "input", "question", "instruction", "text")
+PROMPT_FIELDS = (
+    "prompt",
+    "input",
+    "question",
+    "instruction",
+    "text",
+    # Raw fields used by DeepSpec's converter before it writes {"turns": ...}.
+    "problem",
+    "problem_statement",
+    "question_content",
+)
 RESULT_COLUMNS = [
     "dataset",
     "num_requests",
@@ -74,7 +84,23 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _prompt_from_record(record: dict[str, Any], tokenizer) -> str:
+def _string_turns(value: Any) -> list[str] | None:
+    if isinstance(value, str) and value.strip():
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        turns = [item for item in value if item.strip()]
+        return turns or None
+    return None
+
+
+def _prompt_from_record(record: dict[str, Any], tokenizer, *, source: str) -> str:
+    turns = _string_turns(record.get("turns"))
+    if turns is not None:
+        # DeepSpec's eval_datasets/*.jsonl are normalized as {"turns": [...]}. Most
+        # datasets have one turn; multi-turn sets are kept deterministic here by
+        # joining the turns into one prompt for this single-response throughput run.
+        return "\n\n".join(turns)
+
     messages = record.get("messages")
     if isinstance(messages, list):
         return tokenizer.apply_chat_template(
@@ -84,13 +110,14 @@ def _prompt_from_record(record: dict[str, Any], tokenizer) -> str:
         )
 
     for field in PROMPT_FIELDS:
-        value = record.get(field)
-        if isinstance(value, str) and value.strip():
-            return value
+        turns = _string_turns(record.get(field))
+        if turns is not None:
+            return "\n\n".join(turns)
 
+    keys = ", ".join(sorted(record.keys()))
     raise ValueError(
-        "record has no supported prompt field "
-        f"({', '.join(['messages', *PROMPT_FIELDS])})"
+        f"{source}: record has no supported prompt field "
+        f"({', '.join(['turns', 'messages', *PROMPT_FIELDS])}); keys=[{keys}]"
     )
 
 
@@ -314,8 +341,8 @@ def _evaluate_dataset(
     stats = EvalStats()
     artifacts: list[dict[str, Any]] = []
     start = time.perf_counter()
-    for record in records:
-        prompt = _prompt_from_record(record, tokenizer)
+    for row_idx, record in enumerate(records, start=1):
+        prompt = _prompt_from_record(record, tokenizer, source=f"{path}:{row_idx}")
         token_ids, sample_stats = _generate_one(
             target=target,
             draft=draft,
