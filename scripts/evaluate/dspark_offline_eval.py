@@ -348,6 +348,12 @@ def _generate_one(
     return generated, stats
 
 
+def _rank_prefix(args: argparse.Namespace) -> str:
+    if args.worker_rank is None:
+        return "main"
+    return f"rank={args.worker_rank}/{args.worker_count}"
+
+
 def _evaluate_dataset(
     *,
     path: Path,
@@ -386,6 +392,17 @@ def _evaluate_dataset(
         )
     for row_idx, record in iterator:
         prompt = _prompt_from_record(record, tokenizer, source=f"{path}:{row_idx}")
+        sample_start = time.perf_counter()
+        prompt_tokens = len(tokenizer(prompt, return_tensors="pt").input_ids[0])
+        if args.verbose_samples:
+            logger.info(
+                "[%s] [%s] sample %d/%d start | prompt_tokens=%d",
+                _rank_prefix(args),
+                path.stem,
+                row_idx,
+                len(records),
+                prompt_tokens,
+            )
         token_ids, sample_stats = _generate_one(
             target=target,
             draft=draft,
@@ -401,8 +418,30 @@ def _evaluate_dataset(
         if not args.skip_artifacts:
             artifacts.append({"prompt": prompt, "output_token_ids": token_ids})
         elapsed = time.perf_counter() - start
+        sample_elapsed = time.perf_counter() - sample_start
         if elapsed > 0:
             out_tps = stats.total_output_tokens / elapsed
+            if args.verbose_samples:
+                logger.info(
+                    "[%s] [%s] sample %d/%d done | prompt_tokens=%d | "
+                    "generated=%d | sample_s=%.2f | proposals=%d | "
+                    "proposed_draft=%d | accepted_draft=%d | sample_acc_len=%.3f | "
+                    "total_out=%d | total_out_tps=%.2f | total_acc_len=%.3f",
+                    _rank_prefix(args),
+                    path.stem,
+                    row_idx,
+                    len(records),
+                    prompt_tokens,
+                    sample_stats.total_output_tokens,
+                    sample_elapsed,
+                    sample_stats.num_proposals,
+                    sample_stats.num_proposed_draft_tokens,
+                    sample_stats.num_accepted_draft_tokens,
+                    sample_stats.acceptance_length,
+                    stats.total_output_tokens,
+                    out_tps,
+                    stats.acceptance_length,
+                )
             if use_tqdm:
                 iterator.set_postfix(
                     out_tok=stats.total_output_tokens,
@@ -520,6 +559,8 @@ def _child_cmd(args: argparse.Namespace, rank: int, worker_count: int, output_di
         cmd.append("--trust-remote-code")
     if args.skip_artifacts:
         cmd.append("--skip-artifacts")
+    if args.verbose_samples:
+        cmd.append("--verbose-samples")
     return cmd
 
 
@@ -595,7 +636,17 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
 
     worker_root = args.output_dir / "workers"
     worker_root.mkdir(parents=True, exist_ok=True)
-    logger.info("Launching %d worker(s)", worker_count)
+    logger.info(
+        "Launching %d worker(s) | output_dir=%s | device=%s | max_samples=%s | "
+        "max_new_tokens=%s | log_every=%s | verbose_samples=%s",
+        worker_count,
+        args.output_dir,
+        args.device,
+        args.max_samples,
+        args.max_new_tokens,
+        args.log_every,
+        args.verbose_samples,
+    )
 
     procs = []
     worker_dirs = []
@@ -603,11 +654,13 @@ def _run_multi_worker(args: argparse.Namespace, worker_count: int) -> None:
         worker_dir = worker_root / f"rank{rank}"
         worker_dirs.append(worker_dir)
         env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
         if env_name is not None:
             visible = devices[rank] if devices else str(rank)
             env[env_name] = visible
             logger.info("Worker %d uses %s=%s", rank, env_name, visible)
         cmd = _child_cmd(args, rank, worker_count, worker_dir)
+        logger.info("Worker %d command: %s", rank, " ".join(cmd))
         procs.append(subprocess.Popen(cmd, env=env))  # noqa: S603
 
     failed = []
@@ -646,6 +699,17 @@ def run(args: argparse.Namespace) -> None:
     torch = torch_module
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype) if args.dtype != "auto" else "auto"
+    logger.info(
+        "[%s] Starting offline eval | output_dir=%s | device=%s | dtype=%s | "
+        "max_samples=%s | max_new_tokens=%s | skip_artifacts=%s",
+        _rank_prefix(args),
+        args.output_dir,
+        args.device,
+        args.dtype,
+        args.max_samples,
+        args.max_new_tokens,
+        args.skip_artifacts,
+    )
     logger.info("Loading tokenizer: %s", args.verifier_model)
     tokenizer = AutoTokenizer.from_pretrained(
         args.verifier_model,
@@ -674,6 +738,16 @@ def run(args: argparse.Namespace) -> None:
     ).to(device)
     target.eval()
     draft.eval()
+    logger.info(
+        "[%s] Models ready | draft_block_size=%s | max_anchors=%s | "
+        "target_layers=%s | draft_vocab=%s | verifier_vocab=%s",
+        _rank_prefix(args),
+        draft.block_size,
+        draft.config.max_anchors,
+        draft.target_layer_ids,
+        getattr(draft, "draft_vocab_size", "unknown"),
+        getattr(draft, "verifier_vocab_size", "unknown"),
+    )
 
     dataset_names = args.datasets.split(",") if args.datasets else None
     dataset_paths = _discover_datasets(args.datasets_root, dataset_names)
@@ -752,6 +826,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-artifacts",
         action="store_true",
         help="Do not write per-sample output_token_ids artifacts.",
+    )
+    parser.add_argument(
+        "--verbose-samples",
+        action="store_true",
+        help="Log every sample start/end with timing, token and acceptance stats.",
     )
     parser.add_argument("--worker-rank", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)

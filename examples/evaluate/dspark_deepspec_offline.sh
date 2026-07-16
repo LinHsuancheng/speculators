@@ -8,6 +8,7 @@
 #   bash examples/evaluate/dspark_deepspec_offline.sh
 
 set -euo pipefail
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 VERIFIER_MODEL="${VERIFIER_MODEL:-}"
 DRAFT_MODEL="${DRAFT_MODEL:-}"
@@ -22,6 +23,7 @@ DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-auto}"
 DATASETS="${DATASETS:-}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
 SKIP_ARTIFACTS="${SKIP_ARTIFACTS:-0}"
+VERBOSE_SAMPLES="${VERBOSE_SAMPLES:-1}"
 PYTHON="${PYTHON:-python3}"
 
 if [[ -z "$VERIFIER_MODEL" ]]; then
@@ -66,6 +68,10 @@ fi
 
 if [[ "$SKIP_ARTIFACTS" == "1" ]]; then
     cmd+=(--skip-artifacts)
+fi
+
+if [[ "$VERBOSE_SAMPLES" == "1" ]]; then
+    cmd+=(--verbose-samples)
 fi
 
 "${cmd[@]}"
