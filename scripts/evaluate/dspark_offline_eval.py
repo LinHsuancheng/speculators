@@ -397,6 +397,14 @@ def _write_outputs(
                 f.write(json.dumps(artifact) + "\n")
 
 
+def _resolve_draft_attn_impl(args: argparse.Namespace) -> str | None:
+    if args.draft_attn_impl != "auto":
+        return args.draft_attn_impl
+    if str(args.device).startswith("npu"):
+        return "sdpa"
+    return None
+
+
 def run(args: argparse.Namespace) -> None:
     global torch
 
@@ -417,7 +425,15 @@ def run(args: argparse.Namespace) -> None:
         torch_dtype=dtype,
         trust_remote_code=args.trust_remote_code,
     ).to(device)
-    draft = DSparkDraftModel.from_pretrained(args.draft_model).to(device)
+    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    draft_attn_impl = _resolve_draft_attn_impl(args)
+    if draft_attn_impl is not None:
+        logger.info("Using draft attention backend: %s", draft_attn_impl)
+        draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
+    draft = DSparkDraftModel.from_pretrained(
+        args.draft_model,
+        config=draft_config,
+    ).to(device)
     target.eval()
     draft.eval()
 
@@ -461,6 +477,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument(
+        "--draft-attn-impl",
+        choices=["auto", "simple_flex_attention", "sdpa", "eager"],
+        default="auto",
+        help=(
+            "Draft attention backend. auto keeps the checkpoint setting except on "
+            "NPU, where it uses sdpa because FlexAttention is unsupported."
+        ),
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser.parse_args()
 

@@ -17,6 +17,7 @@ MAX_SAMPLES="${MAX_SAMPLES:-200}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
+DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-auto}"
 DATASETS="${DATASETS:-}"
 PYTHON="${PYTHON:-python3}"
 
@@ -47,6 +48,7 @@ cmd=(
     --max-new-tokens "$MAX_NEW_TOKENS"
     --device "$DEVICE"
     --dtype "$DTYPE"
+    --draft-attn-impl "$DRAFT_ATTN_IMPL"
     --trust-remote-code
 )
 
