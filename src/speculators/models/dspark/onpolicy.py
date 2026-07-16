@@ -28,6 +28,7 @@ Two implementations:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+import warnings
 
 import torch
 
@@ -157,6 +158,8 @@ class VLLMVerifierScorer:
         )
 
         out = torch.zeros(num_blocks, k, self.hidden_size, device=device)
+        valid_mask = torch.ones(num_blocks, dtype=torch.bool, device=device)
+
         for b, seq in enumerate(sequences):
             prefix_len = len(seq) - k
             path = generate_hidden_states(
@@ -173,14 +176,15 @@ class VLLMVerifierScorer:
             first = prefix_len - 1
             actual_len = hs.shape[0]
             if actual_len < first + k:
-                raise RuntimeError(
-                    f"Hidden states from vLLM are too short ({actual_len}) "
-                    f"to extract {k} positions starting at {first}. "
-                    f"Prefix caching likely caused incomplete hidden state extraction. "
-                    f"Sequence had {len(seq)} tokens, needed positions [{first}:{first+k}]."
+                warnings.warn(
+                    f"Sample {b}: vLLM returned incomplete hidden states ({actual_len} tokens) "
+                    f"for sequence with {len(seq)} tokens. Needed positions [{first}:{first+k}]. "
+                    f"Skipping this sample (prefix caching interference)."
                 )
-            out[b] = hs[first : first + k]
-        return out
+                valid_mask[b] = False
+            else:
+                out[b] = hs[first : first + k]
+        return out, valid_mask
 
 
 class MockVerifierScorer:

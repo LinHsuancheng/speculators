@@ -354,12 +354,12 @@ class DSparkDraftModel(DFlashDraftModel):
         #    non-cacheable step). Returns verifier hidden states aligned so that
         #    row t predicts the token that fills draft slot t+1.
         with torch.no_grad():
-            verifier_hidden = self.verifier_scorer.score(
+            verifier_hidden, valid_mask = self.verifier_scorer.score(
                 gold_input_ids=input_ids,
                 document_ids=document_ids,
                 anchor_positions=anchor_positions,
                 sampled_verifier_ids=sampled_verifier_ids,
-            )  # [num_blocks, K, hidden]
+            )  # [num_blocks, K, hidden], [num_blocks]
 
             # 3. p_t(Y_t): apply the frozen verifier head locally. verifier_lm_head
             #    is already sliced to the draft-vocab subset, so p and q share the
@@ -371,6 +371,9 @@ class DSparkDraftModel(DFlashDraftModel):
             p_logp = p_log_probs.gather(
                 -1, sampled_draft_ids.unsqueeze(-1)
             ).squeeze(-1)  # [num_blocks, K]
+
+            # Mask out invalid samples (APC-corrupted hidden states)
+            p_logp = p_logp * valid_mask.unsqueeze(-1)
 
         # 4. Gold-conditioned Markov-biased logits for the CE regulariser and the
         #    confidence head. The CE term keeps the same teacher-forced semantics
