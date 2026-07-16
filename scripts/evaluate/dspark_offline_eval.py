@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 logger = logging.getLogger("dspark_offline_eval")
 torch = None
 
@@ -355,7 +360,17 @@ def _evaluate_dataset(
     stats = EvalStats()
     artifacts: list[dict[str, Any]] = []
     start = time.perf_counter()
-    for row_idx, record in enumerate(records, start=1):
+    use_tqdm = tqdm is not None and not args.no_progress
+    iterator = enumerate(records, start=1)
+    if use_tqdm:
+        iterator = tqdm(
+            iterator,
+            total=len(records),
+            desc=f"{path.stem}",
+            unit="sample",
+            dynamic_ncols=True,
+        )
+    for row_idx, record in iterator:
         prompt = _prompt_from_record(record, tokenizer, source=f"{path}:{row_idx}")
         token_ids, sample_stats = _generate_one(
             target=target,
@@ -370,6 +385,25 @@ def _evaluate_dataset(
         stats.num_proposed_draft_tokens += sample_stats.num_proposed_draft_tokens
         stats.num_accepted_draft_tokens += sample_stats.num_accepted_draft_tokens
         artifacts.append({"prompt": prompt, "output_token_ids": token_ids})
+        elapsed = time.perf_counter() - start
+        if elapsed > 0:
+            out_tps = stats.total_output_tokens / elapsed
+            if use_tqdm:
+                iterator.set_postfix(
+                    out_tok=stats.total_output_tokens,
+                    out_tps=f"{out_tps:.2f}",
+                    acc_len=f"{stats.acceptance_length:.3f}",
+                )
+            elif row_idx == 1 or row_idx % args.log_every == 0 or row_idx == len(records):
+                logger.info(
+                    "[%s] %d/%d samples | out_tok=%d | out_tps=%.2f | acc_len=%.3f",
+                    path.stem,
+                    row_idx,
+                    len(records),
+                    stats.total_output_tokens,
+                    out_tps,
+                    stats.acceptance_length,
+                )
     stats.elapsed_s = time.perf_counter() - start
 
     row = {
@@ -430,15 +464,23 @@ def run(args: argparse.Namespace) -> None:
     torch = torch_module
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype) if args.dtype != "auto" else "auto"
+    logger.info("Loading tokenizer: %s", args.verifier_model)
     tokenizer = AutoTokenizer.from_pretrained(
         args.verifier_model,
         trust_remote_code=args.trust_remote_code,
+    )
+    logger.info(
+        "Loading verifier model: %s (device=%s, dtype=%s)",
+        args.verifier_model,
+        args.device,
+        args.dtype,
     )
     target = AutoModelForCausalLM.from_pretrained(
         args.verifier_model,
         torch_dtype=dtype,
         trust_remote_code=args.trust_remote_code,
     ).to(device)
+    logger.info("Loading DSpark draft model: %s", args.draft_model)
     draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
     draft_attn_impl = _resolve_draft_attn_impl(args)
     if draft_attn_impl is not None:
@@ -453,11 +495,16 @@ def run(args: argparse.Namespace) -> None:
 
     dataset_names = args.datasets.split(",") if args.datasets else None
     dataset_paths = _discover_datasets(args.datasets_root, dataset_names)
+    logger.info(
+        "Discovered %d dataset(s): %s",
+        len(dataset_paths),
+        ", ".join(path.stem for path in dataset_paths),
+    )
     rows: list[dict[str, Any]] = []
     artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
 
     for path in dataset_paths:
-        logger.info("[%s] evaluating", path.stem)
+        logger.info("[%s] evaluating %s", path.stem, path)
         row, artifacts = _evaluate_dataset(
             path=path,
             target=target,
@@ -499,6 +546,17 @@ def parse_args() -> argparse.Namespace:
             "Draft attention backend. auto keeps the checkpoint setting except on "
             "NPU, where it uses sdpa because FlexAttention is unsupported."
         ),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm sample progress bars.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=10,
+        help="When tqdm is unavailable or disabled, log progress every N samples.",
     )
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser.parse_args()

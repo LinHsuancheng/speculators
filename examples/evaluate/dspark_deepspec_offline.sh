@@ -19,6 +19,7 @@ DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
 DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-auto}"
 DATASETS="${DATASETS:-}"
+NO_PROGRESS="${NO_PROGRESS:-0}"
 PYTHON="${PYTHON:-python3}"
 
 if [[ -z "$VERIFIER_MODEL" ]]; then
@@ -54,6 +55,10 @@ cmd=(
 
 if [[ -n "$DATASETS" ]]; then
     cmd+=(--datasets "$DATASETS")
+fi
+
+if [[ "$NO_PROGRESS" == "1" ]]; then
+    cmd+=(--no-progress)
 fi
 
 "${cmd[@]}"
