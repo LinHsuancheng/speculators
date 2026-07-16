@@ -172,18 +172,38 @@ class VLLMVerifierScorer:
             # Keep only the last-layer block if a multi-layer row was returned.
             if hs.shape[-1] != self.hidden_size:
                 hs = hs[:, -self.hidden_size :]
-            # Row predicting draft slot t (1-indexed) sits at prefix_len-1+(t-1).
-            first = prefix_len - 1
+
             actual_len = hs.shape[0]
-            if actual_len < first + k:
-                warnings.warn(
-                    f"Sample {b}: vLLM returned incomplete hidden states ({actual_len} tokens) "
-                    f"for sequence with {len(seq)} tokens. Needed positions [{first}:{first+k}]. "
-                    f"Skipping this sample (prefix caching interference)."
-                )
-                valid_mask[b] = False
-            else:
-                out[b] = hs[first : first + k]
+            # APC causes vLLM to return only the non-cached suffix.
+            # If we requested N tokens and got M < N, assume the first (N-M) were cached
+            # and vLLM returned positions [N-M:N]. We need positions [prefix_len-1:prefix_len-1+k].
+            if actual_len < len(seq):
+                # Compute which absolute positions vLLM returned
+                cache_hit_len = len(seq) - actual_len
+                returned_start = cache_hit_len
+                returned_end = len(seq)
+
+                # We need positions [prefix_len-1, prefix_len-1+k)
+                needed_start = prefix_len - 1
+                needed_end = prefix_len - 1 + k
+
+                # Check if our needed range is within the returned range
+                if needed_start >= returned_start and needed_end <= returned_end:
+                    # Extract from the returned subset
+                    offset = needed_start - returned_start
+                    out[b] = hs[offset : offset + k]
+                    continue
+                else:
+                    warnings.warn(
+                        f"Sample {b}: vLLM returned positions [{returned_start}:{returned_end}) "
+                        f"but we need [{needed_start}:{needed_end}). Skipping (APC mismatch)."
+                    )
+                    valid_mask[b] = False
+                    continue
+
+            # Full sequence returned, normal path
+            first = prefix_len - 1
+            out[b] = hs[first : first + k]
         return out, valid_mask
 
 
