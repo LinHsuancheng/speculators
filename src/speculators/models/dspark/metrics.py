@@ -295,4 +295,42 @@ def compute_metrics(
         metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
         metrics["sampled_acceptance_loss_total"] = ones
 
+        # Log per-position metrics (for debugging and monitoring)
+        with torch.no_grad():
+            K = sampled_draft_logprobs.shape[-1]
+
+            # Compute alpha, survival, credit for all positions
+            log_alpha = torch.minimum(
+                torch.zeros_like(sampled_draft_logprobs),
+                sampled_target_logprobs - sampled_draft_logprobs,
+            )
+            alpha = torch.exp(log_alpha)
+            log_survival = torch.cumsum(log_alpha, dim=-1)
+            survival = torch.exp(log_survival)
+            undercovered = (sampled_draft_logprobs < sampled_target_logprobs).float()
+
+            # Log per-position metrics (averaged across blocks)
+            for k in range(K):
+                pos_label = k + 1  # Position 1-indexed
+
+                # Draft log-prob (qlogp)
+                metrics[f"sampled_pos{pos_label}_qlogp_sum"] = sampled_draft_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_qlogp_total"] = ones
+
+                # Target log-prob (plogp)
+                metrics[f"sampled_pos{pos_label}_plogp_sum"] = sampled_target_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_plogp_total"] = ones
+
+                # Alpha (acceptance ratio)
+                metrics[f"sampled_pos{pos_label}_alpha_sum"] = alpha[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_alpha_total"] = ones
+
+                # Survival probability
+                metrics[f"sampled_pos{pos_label}_survival_sum"] = survival[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_survival_total"] = ones
+
+                # Undercovered indicator
+                metrics[f"sampled_pos{pos_label}_undercovered_sum"] = undercovered[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_undercovered_total"] = ones
+
     return loss, metrics
