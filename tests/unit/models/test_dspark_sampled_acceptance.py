@@ -218,7 +218,7 @@ class FakeDraftModel:
         self.block_size = 4
         self.config = SimpleNamespace(max_anchors=512)
         self.markov_head = RecordingMarkovHead(draft_vocab_size=6)
-        self.d2t = torch.tensor([20, 21, 22, 23, 24, 25])
+        self.d2t = torch.tensor([20, 20, 20, 20, 20, 20])
         self._param = torch.nn.Parameter(torch.zeros(()))
         self.backbone_anchor_positions: torch.Tensor | None = None
         self.backbone_anchor_valid: torch.Tensor | None = None
@@ -285,6 +285,15 @@ def test_sample_from_draft_uses_shifted_prev_history_and_explicit_anchor():
 
 def test_sampled_acceptance_default_temperature_is_on_policy():
     assert SampledAcceptanceConfig("http://unused").temperature == 1.0
+
+
+def test_target_token_id_uses_d2t_offset_convention():
+    model = DSparkDraftModel.__new__(DSparkDraftModel)
+    model.d2t = torch.zeros(128, dtype=torch.long)
+    model.d2t[90] = 1805
+
+    assert SampledAcceptanceAugmentor._target_token_id(model, 11) == 11
+    assert SampledAcceptanceAugmentor._target_token_id(model, 90) == 1895
 
 
 def test_augmentor_globally_skips_when_any_rank_has_no_anchor(monkeypatch):

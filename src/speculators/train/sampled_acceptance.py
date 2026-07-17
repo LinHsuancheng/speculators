@@ -145,7 +145,9 @@ class SampledAcceptanceAugmentor:
     def _target_token_id(model: DSparkDraftModel, draft_token_id: int) -> int:
         if model.d2t is None:
             return draft_token_id
-        return int(model.d2t[draft_token_id].item())
+        # d2t stores an offset, matching Eagle/DFlash convention:
+        # target_token_id = draft_token_id + d2t[draft_token_id].
+        return int(draft_token_id + model.d2t[draft_token_id].item())
 
     @classmethod
     def _valid_anchor_positions(

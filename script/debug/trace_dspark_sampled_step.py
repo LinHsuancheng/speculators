@@ -599,16 +599,88 @@ def _local_verifier_gt_logprobs(
     import torch
 
     device = batch["input_ids"].device
-    positions = torch.tensor(token_positions, dtype=torch.long, device=device)
+    # verifier_logits[:, t] predicts input_ids[:, t + 1].
+    logit_positions = torch.tensor(
+        [pos - 1 for pos in token_positions],
+        dtype=torch.long,
+        device=device,
+    )
     with torch.no_grad():
         verifier_logits = model.verifier_lm_head(
             model.verifier_norm(batch["verifier_last_hidden_states"])
         )
-        verifier_logits = torch.roll(verifier_logits, 1, dims=1)
-        token_ids = batch["input_ids"][0, positions].to(device=device, dtype=torch.long)
-        logprobs = torch.log_softmax(verifier_logits[0, positions].float(), dim=-1)
-        gathered = logprobs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
+        target_ids = batch["input_ids"][0, token_positions].to(
+            device=device, dtype=torch.long
+        )
+        if model.t2d is not None:
+            in_draft_vocab = model.t2d[target_ids.to(model.t2d.device)].to(device)
+            if not bool(in_draft_vocab.all().item()):
+                missing = target_ids[~in_draft_vocab.bool()].detach().cpu().tolist()
+                print(f"TRACE gt_verifier_compare.local_missing_from_draft_vocab={missing}")
+            # t2d is a boolean mask. Convert target ids to their ordinal in the
+            # pruned draft vocab by cumulative rank among selected target ids.
+            target_to_draft_index = (
+                torch.cumsum(model.t2d.to(device=device, dtype=torch.long), dim=0) - 1
+            )
+            gather_ids = target_to_draft_index[target_ids]
+        else:
+            in_draft_vocab = torch.ones_like(target_ids, dtype=torch.bool)
+            gather_ids = target_ids
+        logprobs = torch.log_softmax(
+            verifier_logits[0, logit_positions].float(),
+            dim=-1,
+        )
+        safe_gather_ids = gather_ids.clamp_min(0)
+        gathered = logprobs.gather(-1, safe_gather_ids.unsqueeze(-1)).squeeze(-1)
+        gathered = torch.where(
+            in_draft_vocab.bool(),
+            gathered,
+            torch.full_like(gathered, float("nan")),
+        )
     return [float(x) for x in gathered.detach().cpu().tolist()]
+
+
+def _print_vocab_mapping_invariants(model: Any, sampled_draft_ids: list[int]) -> None:
+    import torch
+
+    if model.d2t is None or model.t2d is None:
+        print("TRACE vocab_mapping_invariants skipped: full verifier vocab")
+        return
+
+    d2t = model.d2t.detach().cpu().long()
+    t2d = model.t2d.detach().cpu().bool()
+    draft_ids = torch.arange(d2t.numel(), dtype=torch.long)
+    mapped_target_ids = draft_ids + d2t
+    selected_target_ids = torch.nonzero(t2d, as_tuple=False).flatten().long()
+    unique_count = int(torch.unique(mapped_target_ids).numel())
+    in_range = bool(
+        (mapped_target_ids.min() >= 0)
+        and (mapped_target_ids.max() < t2d.numel())
+    )
+    selected_equal = bool(torch.equal(mapped_target_ids, selected_target_ids))
+
+    print("TRACE vocab_mapping_invariants")
+    print(f"  draft_vocab_size={d2t.numel()}")
+    print(f"  target_vocab_size={t2d.numel()}")
+    print(f"  mapped_min={int(mapped_target_ids.min().item())}")
+    print(f"  mapped_max={int(mapped_target_ids.max().item())}")
+    print(f"  mapped_in_range={in_range}")
+    print(f"  unique_mapped_count={unique_count}")
+    print(f"  unique_matches_draft_vocab={unique_count == d2t.numel()}")
+    print(f"  t2d_selected_count={int(t2d.sum(dtype=torch.long).item())}")
+    print(f"  mapped_equals_t2d_selected_ordinals={selected_equal}")
+    print("  sampled_draft_id,target_id,offset,t2d_contains,target_rank")
+    target_to_rank = torch.full((t2d.numel(),), -1, dtype=torch.long)
+    target_to_rank[selected_target_ids] = torch.arange(selected_target_ids.numel())
+    for draft_id in sampled_draft_ids:
+        target_id = int(mapped_target_ids[draft_id].item())
+        print(
+            f"  {draft_id},"
+            f"{target_id},"
+            f"{int(d2t[draft_id].item())},"
+            f"{bool(t2d[target_id].item())},"
+            f"{int(target_to_rank[target_id].item())}"
+        )
 
 
 def _print_tokenizer_mapping_check(
@@ -705,7 +777,7 @@ def _compare_gt_verifier_paths(
     print(f"  position_id_anchor={doc_pos_anchor}")
     print(f"  gt_positions={gt_positions}")
     print(f"  gt_ids={gt_ids}")
-    print(f"  local_cached_verifier_logprobs={local_logprobs}")
+    print(f"  local_pruned_verifier_logprobs={local_logprobs}")
 
     full_vllm = _score_with_vllm(
         augmentor=augmentor,
@@ -721,7 +793,7 @@ def _compare_gt_verifier_paths(
     )
 
     print("TRACE gt_verifier_compare.summary")
-    print("  pos,gt_id,local_cached,full_prefix_vllm,diff_full,doc_prefix_vllm,diff_doc")
+    print("  pos,gt_id,local_pruned,full_prefix_vllm,diff_full,doc_prefix_vllm,diff_doc")
     for i, local in enumerate(local_logprobs):
         full = None if full_vllm is None else full_vllm[i]
         doc = None if doc_vllm is None else doc_vllm[i]
@@ -924,7 +996,10 @@ def trace_real_step(args: argparse.Namespace) -> None:
             return
 
         if model.d2t is not None:
-            mapped = model.d2t[gpu_batch["sampled_draft_ids"].to(model.d2t.device)].to(
+            sampled_draft_for_map = gpu_batch["sampled_draft_ids"].to(model.d2t.device)
+            mapped = (
+                sampled_draft_for_map + model.d2t[sampled_draft_for_map]
+            ).to(
                 gpu_batch["sampled_target_ids"].device
             )
             equal = bool(torch.equal(mapped, gpu_batch["sampled_target_ids"]))
@@ -932,17 +1007,21 @@ def trace_real_step(args: argparse.Namespace) -> None:
             print(f"  mapped_target_ids={mapped.detach().cpu().flatten().tolist()}")
             print(f"  equals_sampled_target_ids={equal}")
 
+        sampled_draft_id_list = (
+            gpu_batch["sampled_draft_ids"][0].detach().cpu().tolist()
+        )
+        sampled_target_id_list = (
+            gpu_batch["sampled_target_ids"][0].detach().cpu().tolist()
+        )
+        _print_vocab_mapping_invariants(
+            model=model,
+            sampled_draft_ids=sampled_draft_id_list,
+        )
         _print_tokenizer_mapping_check(
             args=args,
             model=model,
-            sampled_draft_ids=gpu_batch["sampled_draft_ids"][0]
-            .detach()
-            .cpu()
-            .tolist(),
-            sampled_target_ids=gpu_batch["sampled_target_ids"][0]
-            .detach()
-            .cpu()
-            .tolist(),
+            sampled_draft_ids=sampled_draft_id_list,
+            sampled_target_ids=sampled_target_id_list,
         )
         _compare_gt_verifier_paths(
             args=args,
