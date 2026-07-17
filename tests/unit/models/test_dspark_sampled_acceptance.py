@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import speculators.models.dflash.core as dflash_core
+import speculators.train.sampled_acceptance as sampled_acceptance
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.train.sampled_acceptance import (
@@ -284,3 +285,44 @@ def test_sample_from_draft_uses_shifted_prev_history_and_explicit_anchor():
 
 def test_sampled_acceptance_default_temperature_is_on_policy():
     assert SampledAcceptanceConfig("http://unused").temperature == 1.0
+
+
+def test_augmentor_globally_skips_when_any_rank_has_no_anchor(monkeypatch):
+    class FakeDist:
+        class ReduceOp:
+            MIN = "min"
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def all_reduce(tensor, op):
+            tensor.zero_()
+
+    model = DSparkDraftModel.__new__(DSparkDraftModel)
+    model.block_size = 4
+    model.config = SimpleNamespace(max_anchors=2)
+    model._attn_impl = "eager"
+
+    def fail_sample(*args, **kwargs):  # pragma: no cover - failure path
+        raise AssertionError("sampling must be skipped on all ranks")
+
+    augmentor = SampledAcceptanceAugmentor.__new__(SampledAcceptanceAugmentor)
+    augmentor.config = SampledAcceptanceConfig("http://unused")
+    augmentor.skipped_no_anchor = 0
+    augmentor._sample_from_draft = fail_sample
+
+    monkeypatch.setattr(sampled_acceptance, "dist", FakeDist)
+
+    batch = {
+        "loss_mask": torch.tensor([[True, True, True, True, False, False]]),
+    }
+
+    assert augmentor(model, batch) is batch
+    assert "anchor_positions" not in batch
+    assert augmentor.skipped_no_anchor == 1

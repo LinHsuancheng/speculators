@@ -8,6 +8,7 @@ from typing import Any
 
 import openai
 import torch
+import torch.distributed as dist
 
 from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
@@ -71,12 +72,20 @@ class SampledAcceptanceAugmentor:
             int(draft_model.config.max_anchors),
             block_size,
         )
-        if not bool(anchor_valid.any()):
+        has_anchor = torch.tensor(
+            [int(bool(anchor_valid.any()))],
+            device=batch["loss_mask"].device,
+            dtype=torch.int,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(has_anchor, op=dist.ReduceOp.MIN)
+        if not bool(has_anchor.item()):
             self.skipped_no_anchor += 1
             if self.skipped_no_anchor <= 5:
                 logger.warning(
                     "Skipping batch for sampled acceptance loss: no valid anchor "
-                    f"position (skipped {self.skipped_no_anchor} so far)"
+                    "on at least one rank "
+                    f"(skipped {self.skipped_no_anchor} so far)"
                 )
             return batch
         batch["anchor_positions"] = anchor_positions
