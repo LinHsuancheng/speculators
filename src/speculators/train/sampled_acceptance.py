@@ -77,12 +77,38 @@ class SampledAcceptanceAugmentor:
             cleanup_hidden_states=True,
             hidden_states_file_timeout=self.config.hidden_states_file_timeout,
         )
-        batch["sampled_draft_logprobs"] = sample["draft_logprobs"].unsqueeze(0)
-        batch["sampled_target_logprobs"] = torch.tensor(
+
+        draft_logprobs = sample["draft_logprobs"]
+        target_logprobs = torch.tensor(
             scored["token_logprobs"],
-            device=sample["draft_logprobs"].device,
-            dtype=sample["draft_logprobs"].dtype,
-        ).unsqueeze(0)
+            device=draft_logprobs.device,
+            dtype=draft_logprobs.dtype,
+        )
+
+        # Log detailed sampling statistics
+        with torch.no_grad():
+            log_alpha = torch.minimum(
+                torch.zeros_like(draft_logprobs),
+                target_logprobs - draft_logprobs,
+            )
+            alpha = torch.exp(log_alpha)
+            survival = torch.exp(torch.cumsum(log_alpha, dim=-1))
+
+            logger.info(
+                f"[SampledAcceptance] anchor_pos={sample['anchor_positions'].item()}, "
+                f"sampled_len={len(sample['sampled_target_token_ids'])}, "
+                f"draft_logp_mean={draft_logprobs.mean().item():.4f}, "
+                f"draft_logp_min={draft_logprobs.min().item():.4f}, "
+                f"target_logp_mean={target_logprobs.mean().item():.4f}, "
+                f"target_logp_min={target_logprobs.min().item():.4f}, "
+                f"alpha_mean={alpha.mean().item():.4f}, "
+                f"alpha_min={alpha.min().item():.4f}, "
+                f"final_survival={survival[-1].item():.4f}, "
+                f"undercovered={(draft_logprobs < target_logprobs).sum().item()}/{draft_logprobs.numel()}"
+            )
+
+        batch["sampled_draft_logprobs"] = draft_logprobs.unsqueeze(0)
+        batch["sampled_target_logprobs"] = target_logprobs.unsqueeze(0)
         batch["anchor_positions"] = sample["anchor_positions"]
         batch["anchor_valid"] = sample["anchor_valid"]
         return batch

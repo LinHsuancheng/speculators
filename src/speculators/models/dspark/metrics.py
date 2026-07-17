@@ -311,10 +311,19 @@ def compute_metrics(
         metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
         metrics["sampled_acceptance_loss_total"] = ones
         with torch.no_grad():
+            # Credit statistics
             metrics["sampled_credit_mean_sum"] = sampled_credit.detach().sum()
             metrics["sampled_credit_mean_total"] = torch.tensor(
                 sampled_credit.numel(), device=device, dtype=sampled_credit.dtype
             )
+            metrics["sampled_credit_min_sum"] = sampled_credit.detach().min()
+            metrics["sampled_credit_min_total"] = ones
+            metrics["sampled_credit_max_sum"] = sampled_credit.detach().max()
+            metrics["sampled_credit_max_total"] = ones
+            metrics["sampled_credit_std_sum"] = sampled_credit.detach().std()
+            metrics["sampled_credit_std_total"] = ones
+
+            # Alpha (acceptance ratio) statistics
             log_alpha = torch.minimum(
                 torch.zeros_like(sampled_draft_logprobs.detach()),
                 sampled_target_logprobs.detach() - sampled_draft_logprobs.detach(),
@@ -323,6 +332,84 @@ def compute_metrics(
             metrics["sampled_alpha_mean_sum"] = sampled_alpha.sum()
             metrics["sampled_alpha_mean_total"] = torch.tensor(
                 sampled_alpha.numel(), device=device, dtype=sampled_alpha.dtype
+            )
+            metrics["sampled_alpha_min_sum"] = sampled_alpha.min()
+            metrics["sampled_alpha_min_total"] = ones
+            metrics["sampled_alpha_max_sum"] = sampled_alpha.max()
+            metrics["sampled_alpha_max_total"] = ones
+
+            # Draft log-probabilities (log q_t(Y_t))
+            draft_logp_detached = sampled_draft_logprobs.detach()
+            metrics["sampled_draft_logp_mean_sum"] = draft_logp_detached.sum()
+            metrics["sampled_draft_logp_mean_total"] = torch.tensor(
+                draft_logp_detached.numel(), device=device, dtype=draft_logp_detached.dtype
+            )
+            metrics["sampled_draft_logp_min_sum"] = draft_logp_detached.min()
+            metrics["sampled_draft_logp_min_total"] = ones
+            metrics["sampled_draft_logp_max_sum"] = draft_logp_detached.max()
+            metrics["sampled_draft_logp_max_total"] = ones
+
+            # Target log-probabilities (log p_t(Y_t))
+            target_logp_detached = sampled_target_logprobs.detach()
+            metrics["sampled_target_logp_mean_sum"] = target_logp_detached.sum()
+            metrics["sampled_target_logp_mean_total"] = torch.tensor(
+                target_logp_detached.numel(), device=device, dtype=target_logp_detached.dtype
+            )
+            metrics["sampled_target_logp_min_sum"] = target_logp_detached.min()
+            metrics["sampled_target_logp_min_total"] = ones
+            metrics["sampled_target_logp_max_sum"] = target_logp_detached.max()
+            metrics["sampled_target_logp_max_total"] = ones
+
+            # Log probability ratio: log(p/q) = log_p - log_q
+            logp_ratio = target_logp_detached - draft_logp_detached
+            metrics["sampled_logp_ratio_mean_sum"] = logp_ratio.sum()
+            metrics["sampled_logp_ratio_mean_total"] = torch.tensor(
+                logp_ratio.numel(), device=device, dtype=logp_ratio.dtype
+            )
+            metrics["sampled_logp_ratio_min_sum"] = logp_ratio.min()
+            metrics["sampled_logp_ratio_min_total"] = ones
+            metrics["sampled_logp_ratio_max_sum"] = logp_ratio.max()
+            metrics["sampled_logp_ratio_max_total"] = ones
+
+            # Undercovered tokens (q < p, should get credit)
+            undercovered = (draft_logp_detached < target_logp_detached).float()
+            metrics["sampled_undercovered_ratio_sum"] = undercovered.sum()
+            metrics["sampled_undercovered_ratio_total"] = torch.tensor(
+                undercovered.numel(), device=device, dtype=undercovered.dtype
+            )
+
+            # Overcovered tokens (q >= p, should not get credit)
+            overcovered = (draft_logp_detached >= target_logp_detached).float()
+            metrics["sampled_overcovered_ratio_sum"] = overcovered.sum()
+            metrics["sampled_overcovered_ratio_total"] = torch.tensor(
+                overcovered.numel(), device=device, dtype=overcovered.dtype
+            )
+
+            # Survival probability statistics (per-block cumulative acceptance)
+            log_survival = torch.cumsum(log_alpha, dim=-1)
+            survival = torch.exp(log_survival)
+            metrics["sampled_survival_mean_sum"] = survival.sum()
+            metrics["sampled_survival_mean_total"] = torch.tensor(
+                survival.numel(), device=device, dtype=survival.dtype
+            )
+            # Final survival probability per block (last position)
+            final_survival = survival[:, -1]
+            metrics["sampled_final_survival_mean_sum"] = final_survival.sum()
+            metrics["sampled_final_survival_mean_total"] = torch.tensor(
+                final_survival.numel(), device=device, dtype=final_survival.dtype
+            )
+
+            # Estimated acceptance length per block: sum_k S_k
+            continuation = torch.flip(
+                torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
+                dims=[-1],
+            )
+            estimated_accept_len_per_block = continuation[:, 0]  # sum over all k
+            metrics["sampled_estimated_accept_len_sum"] = estimated_accept_len_per_block.sum()
+            metrics["sampled_estimated_accept_len_total"] = torch.tensor(
+                estimated_accept_len_per_block.numel(),
+                device=device,
+                dtype=estimated_accept_len_per_block.dtype
             )
 
     if cat_weights is not None:
