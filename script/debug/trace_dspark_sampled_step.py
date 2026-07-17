@@ -668,9 +668,40 @@ def _batch_indices_for_loader(train_loader: Any, batch_index: int) -> list[int] 
     return [int(x) for x in batch]
 
 
+def _clone_trace_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value.detach().cpu().clone() if hasattr(value, "detach") else value
+        for key, value in item.items()
+    }
+
+
+def _captured_item_for_doc(
+    *,
+    train_loader: Any,
+    captured_items: list[dict[str, Any]],
+    batch_index: int,
+    doc_id: int,
+) -> dict[str, Any] | None:
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    if batch_sampler is None:
+        return None
+    try:
+        batches = list(batch_sampler)
+    except Exception:  # noqa: BLE001
+        return None
+    if batch_index < 0 or batch_index >= len(batches):
+        return None
+    offset = sum(len(batch) for batch in batches[:batch_index])
+    capture_index = offset + doc_id
+    if capture_index < 0 or capture_index >= len(captured_items):
+        return None
+    return captured_items[capture_index]
+
+
 def _print_packed_raw_alignment(
     *,
     train_loader: Any,
+    captured_items: list[dict[str, Any]],
     batch: dict[str, Any],
     batch_index: int,
     anchor_pos: int,
@@ -699,21 +730,14 @@ def _print_packed_raw_alignment(
     doc_start = int(doc_positions[0].detach().cpu().item())
     local_pos = anchor_pos - doc_start
     dataset_index = indices[doc_id]
-    dataset = getattr(train_loader, "dataset", None)
-    if dataset is None:
-        print("  skipped=no_dataset")
-        return
-
-    transform = getattr(dataset, "transform", None)
-    try:
-        if hasattr(dataset, "transform"):
-            dataset.transform = None
-        raw_item = dataset[dataset_index]
-    finally:
-        if hasattr(dataset, "transform"):
-            dataset.transform = transform
+    raw_item = _captured_item_for_doc(
+        train_loader=train_loader,
+        captured_items=captured_items,
+        batch_index=batch_index,
+        doc_id=doc_id,
+    )
     if raw_item is None:
-        print(f"  skipped=raw_item_none dataset_index={dataset_index}")
+        print(f"  skipped=no_captured_raw_item dataset_index={dataset_index}")
         return
 
     raw_len = int(raw_item["input_ids"].shape[0])
@@ -735,23 +759,19 @@ def _print_packed_raw_alignment(
     hidden_abs = (packed_hidden - raw_hidden).abs()
     last_abs = (packed_last - raw_last).abs()
 
-    print(f"  batch_index={batch_index}")
-    print(f"  batch_dataset_indices={indices}")
-    print(f"  anchor_pos={anchor_pos}")
-    print(f"  doc_id={doc_id}")
-    print(f"  dataset_index={dataset_index}")
-    print(f"  doc_start={doc_start}")
-    print(f"  local_pos={local_pos}")
-    print(f"  raw_len={raw_len}")
-    print(f"  token_match={packed_token == raw_token}")
-    print(f"  packed_token={packed_token}")
-    print(f"  raw_token={raw_token}")
-    print("  note=raw_item_read_with_dataset_transform_disabled")
-    print("  note_hidden_states_diff_includes_training_noise_if_noise_std_nonzero")
+    print(
+        "  "
+        f"batch_index={batch_index} doc_id={doc_id} dataset_index={dataset_index} "
+        f"anchor_pos={anchor_pos} doc_start={doc_start} local_pos={local_pos}"
+    )
+    print(
+        "  "
+        f"token_match={packed_token == raw_token} "
+        f"packed_token={packed_token} raw_token={raw_token} raw_len={raw_len}"
+    )
+    print("  raw_source=captured_collate_preprocess_same_loader_pass")
     print(f"  hidden_max_abs_diff={_fmt(float(hidden_abs.max().item()))}")
-    print(f"  hidden_mean_abs_diff={_fmt(float(hidden_abs.mean().item()))}")
     print(f"  verifier_last_max_abs_diff={_fmt(float(last_abs.max().item()))}")
-    print(f"  verifier_last_mean_abs_diff={_fmt(float(last_abs.mean().item()))}")
 
 
 def _print_added_batch_keys(batch: dict[str, Any], before_keys: set[str], *, limit: int) -> None:
@@ -1436,6 +1456,12 @@ def trace_real_step(args: argparse.Namespace) -> None:
     print(f"  t2d_present={model.t2d is not None}")
 
     hidden_size = model.config.transformer_layer_config.hidden_size
+    captured_raw_items: list[dict[str, Any]] = []
+
+    def capture_raw_item(item: dict[str, Any]) -> dict[str, Any]:
+        captured_raw_items.append(_clone_trace_item(item))
+        return item
+
     train_loader, _ = create_train_val_loaders(
         data_path=args.data_path,
         total_seq_len=args.total_seq_len,
@@ -1453,7 +1479,7 @@ def trace_real_step(args: argparse.Namespace) -> None:
         num_target_layers=len(model.target_layer_ids),
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
-        preprocess=None,
+        preprocess=capture_raw_item,
     )
     train_call_kwargs, _ = model_class.get_trainer_kwargs(**vars(train_args))
     print("TRACE train_call_kwargs")
@@ -1535,6 +1561,7 @@ def trace_real_step(args: argparse.Namespace) -> None:
         anchor_pos = int(gpu_batch["sampled_anchor_pos"][0].detach().cpu().item())
         _print_packed_raw_alignment(
             train_loader=train_loader,
+            captured_items=captured_raw_items,
             batch=gpu_batch,
             batch_index=args.batch_index,
             anchor_pos=anchor_pos,
