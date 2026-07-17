@@ -19,7 +19,7 @@ export ASCEND_LAUNCH_BLOCKING=0
 # ============ Configuration ============
 MODEL="/models/Qwen3-4B"
 DATASET="sharegpt"
-OUTPUT_DIR="./outputs/dspark_qwen3_4b_real_baseline"
+OUTPUT_DIR="./outputs/dspark_qwen3_4b_test_only"
 ARROW_DIR="/data/open_perfectblend_qwen3_4b_100k"
 VLLM_PORT=8000
 MAX_SAMPLES=5000
@@ -48,7 +48,7 @@ TRAIN_NPUS="12,13,14,15"
 NUM_TRAIN_NPUS=4
 
 # vLLM configuration - fix memory + enable parallelism
-VLLM_EXTRA_ARGS=( --data-parallel-size 4 )
+VLLM_EXTRA_ARGS=( --data-parallel-size 4 --no-enable-prefix-caching --block-size 128)
 
 # Step 2: Launch vLLM server in the background
 echo "=== Step 2: Launching vLLM server on Ascend NPU(s): $VLLM_NPUS ==="
