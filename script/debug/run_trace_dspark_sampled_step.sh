@@ -42,6 +42,7 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 BATCH_INDEX="${BATCH_INDEX:-0}"
 TOPK="${TOPK:-5}"
 PRINT_ANCHOR_LIMIT="${PRINT_ANCHOR_LIMIT:-24}"
+GT_COMPARE_LEN="${GT_COMPARE_LEN:-7}"
 LR="${LR:-6e-4}"
 
 RUN_BACKWARD="${RUN_BACKWARD:-1}"
@@ -85,6 +86,7 @@ args=(
   --batch-index "${BATCH_INDEX}"
   --topk "${TOPK}"
   --print-anchor-limit "${PRINT_ANCHOR_LIMIT}"
+  --gt-compare-len "${GT_COMPARE_LEN}"
   --lr "${LR}"
 )
 

@@ -101,6 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--print-anchor-limit", type=int, default=24)
+    parser.add_argument("--gt-compare-len", type=int, default=7)
     parser.add_argument("--skip-backward", action="store_true")
     parser.add_argument("--lr", type=float, default=6e-4)
     return parser
@@ -545,6 +546,196 @@ def _print_added_batch_keys(batch: dict[str, Any], before_keys: set[str], *, lim
         print(f"  target_ids={target_ids}")
 
 
+def _document_prefix_bounds(batch: dict[str, Any], anchor_pos: int) -> tuple[int, int]:
+    document_ids = batch.get("document_ids")
+    if document_ids is None:
+        return 0, anchor_pos + 1
+    anchor_doc = document_ids[0, anchor_pos]
+    same_doc = document_ids[0, : anchor_pos + 1] == anchor_doc
+    positions = same_doc.nonzero(as_tuple=False).flatten()
+    if positions.numel() == 0:
+        return 0, anchor_pos + 1
+    return int(positions[0].item()), anchor_pos + 1
+
+
+def _score_with_vllm(
+    *,
+    augmentor: Any,
+    prefix_token_ids: list[int],
+    token_ids: list[int],
+    label: str,
+) -> list[float] | None:
+    import speculators.train.sampled_acceptance as sampled_acceptance_mod
+
+    try:
+        scored = sampled_acceptance_mod.score_sampled_tokens(
+            client=augmentor.client,
+            model=augmentor.model_id,
+            prefix_token_ids=prefix_token_ids,
+            sampled_token_ids=token_ids,
+            prompt_logprobs=augmentor.config.prompt_logprobs,
+            timeout=augmentor.config.request_timeout,
+            cleanup_hidden_states=True,
+            hidden_states_file_timeout=augmentor.config.hidden_states_file_timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"TRACE {label}.vllm_error={type(exc).__name__}: {exc}")
+        return None
+    out = [float(x) for x in scored["token_logprobs"]]
+    print(f"TRACE {label}.vllm")
+    print(f"  prefix_len={len(prefix_token_ids)}")
+    print(f"  token_ids={token_ids}")
+    print(f"  score_positions={scored['score_positions']}")
+    print(f"  logprobs={out}")
+    return out
+
+
+def _local_verifier_gt_logprobs(
+    *,
+    model: Any,
+    batch: dict[str, Any],
+    token_positions: list[int],
+) -> list[float]:
+    import torch
+
+    device = batch["input_ids"].device
+    positions = torch.tensor(token_positions, dtype=torch.long, device=device)
+    with torch.no_grad():
+        verifier_logits = model.verifier_lm_head(
+            model.verifier_norm(batch["verifier_last_hidden_states"])
+        )
+        verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+        token_ids = batch["input_ids"][0, positions].to(device=device, dtype=torch.long)
+        logprobs = torch.log_softmax(verifier_logits[0, positions].float(), dim=-1)
+        gathered = logprobs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
+    return [float(x) for x in gathered.detach().cpu().tolist()]
+
+
+def _print_tokenizer_mapping_check(
+    *,
+    args: argparse.Namespace,
+    model: Any,
+    sampled_draft_ids: list[int],
+    sampled_target_ids: list[int],
+) -> None:
+    try:
+        from speculators.data_generation.preprocessing import get_tokenizer, load_processor
+
+        processor = load_processor(
+            args.verifier_name_or_path,
+            trust_remote_code=args.trust_remote_code,
+        )
+        target_tokenizer = get_tokenizer(processor)
+    except Exception as exc:  # noqa: BLE001
+        print(f"TRACE tokenizer_mapping_check skipped: {type(exc).__name__}: {exc}")
+        return
+
+    # DSpark currently samples from a pruned vocabulary whose ids are indices
+    # into d2t, not ids for an independent tokenizer. Decode the mapped target ids
+    # and re-encode the cumulative target text to catch non-1:1 assumptions.
+    print("TRACE tokenizer_mapping_check")
+    for i, (draft_id, target_id) in enumerate(
+        zip(sampled_draft_ids, sampled_target_ids, strict=True),
+        start=1,
+    ):
+        target_piece = target_tokenizer.decode(
+            [target_id],
+            skip_special_tokens=False,
+        )
+        reencoded = target_tokenizer.encode(target_piece, add_special_tokens=False)
+        print(
+            f"  pos={i} draft_id={draft_id} target_id={target_id} "
+            f"target_piece={target_piece!r} reencoded_piece={reencoded}"
+        )
+
+    target_text = target_tokenizer.decode(
+        sampled_target_ids,
+        skip_special_tokens=False,
+    )
+    target_reencoded = target_tokenizer.encode(target_text, add_special_tokens=False)
+    print(f"  mapped_target_text={target_text!r}")
+    print(f"  mapped_target_ids={sampled_target_ids}")
+    print(f"  reencoded_target_ids={target_reencoded}")
+
+    if model.d2t is not None:
+        print("  note=draft ids are pruned-vocab ids; d2t maps them into target ids")
+
+
+def _compare_gt_verifier_paths(
+    *,
+    args: argparse.Namespace,
+    model: Any,
+    batch: dict[str, Any],
+    augmentor: Any,
+) -> None:
+    if "sampled_anchor_pos" not in batch:
+        return
+
+    anchor_pos = int(batch["sampled_anchor_pos"][0].detach().cpu().item())
+    K = min(args.gt_compare_len, int(batch["input_ids"].shape[1]) - anchor_pos - 1)
+    if K <= 0:
+        print("TRACE gt_verifier_compare skipped: no continuation after anchor")
+        return
+
+    full_prefix = batch["input_ids"][0, : anchor_pos + 1].detach().cpu().tolist()
+    doc_start, doc_end = _document_prefix_bounds(batch, anchor_pos)
+    doc_prefix = batch["input_ids"][0, doc_start:doc_end].detach().cpu().tolist()
+    gt_positions = list(range(anchor_pos + 1, anchor_pos + 1 + K))
+    gt_ids = batch["input_ids"][0, gt_positions].detach().cpu().tolist()
+    local_logprobs = _local_verifier_gt_logprobs(
+        model=model,
+        batch=batch,
+        token_positions=gt_positions,
+    )
+    doc_id = int(batch["document_ids"][0, anchor_pos].detach().cpu().item())
+    position_ids = batch.get("position_ids")
+    doc_pos_start = None
+    doc_pos_anchor = None
+    if position_ids is not None:
+        doc_pos_start = int(position_ids[0, doc_start].detach().cpu().item())
+        doc_pos_anchor = int(position_ids[0, anchor_pos].detach().cpu().item())
+
+    print("TRACE gt_verifier_compare.setup")
+    print(f"  anchor_pos={anchor_pos}")
+    print(f"  anchor_doc_id={doc_id}")
+    print(f"  full_prefix_len={len(full_prefix)}")
+    print(f"  doc_start={doc_start}")
+    print(f"  doc_prefix_len={len(doc_prefix)}")
+    print(f"  position_id_doc_start={doc_pos_start}")
+    print(f"  position_id_anchor={doc_pos_anchor}")
+    print(f"  gt_positions={gt_positions}")
+    print(f"  gt_ids={gt_ids}")
+    print(f"  local_cached_verifier_logprobs={local_logprobs}")
+
+    full_vllm = _score_with_vllm(
+        augmentor=augmentor,
+        prefix_token_ids=full_prefix,
+        token_ids=gt_ids,
+        label="gt_full_prefix",
+    )
+    doc_vllm = _score_with_vllm(
+        augmentor=augmentor,
+        prefix_token_ids=doc_prefix,
+        token_ids=gt_ids,
+        label="gt_doc_prefix",
+    )
+
+    print("TRACE gt_verifier_compare.summary")
+    print("  pos,gt_id,local_cached,full_prefix_vllm,diff_full,doc_prefix_vllm,diff_doc")
+    for i, local in enumerate(local_logprobs):
+        full = None if full_vllm is None else full_vllm[i]
+        doc = None if doc_vllm is None else doc_vllm[i]
+        print(
+            f"  {i + 1},"
+            f"{gt_ids[i]},"
+            f"{_fmt(local)},"
+            f"{'<err>' if full is None else _fmt(full)},"
+            f"{'<err>' if full is None else _fmt(full - local)},"
+            f"{'<err>' if doc is None else _fmt(doc)},"
+            f"{'<err>' if doc is None else _fmt(doc - local)}"
+        )
+
+
 def _print_metrics(raw: dict[str, float], normalized: dict[str, float], block_size: int) -> None:
     print("TRACE metrics.raw")
     for key in sorted(raw):
@@ -740,6 +931,25 @@ def trace_real_step(args: argparse.Namespace) -> None:
             print("TRACE d2t_check")
             print(f"  mapped_target_ids={mapped.detach().cpu().flatten().tolist()}")
             print(f"  equals_sampled_target_ids={equal}")
+
+        _print_tokenizer_mapping_check(
+            args=args,
+            model=model,
+            sampled_draft_ids=gpu_batch["sampled_draft_ids"][0]
+            .detach()
+            .cpu()
+            .tolist(),
+            sampled_target_ids=gpu_batch["sampled_target_ids"][0]
+            .detach()
+            .cpu()
+            .tolist(),
+        )
+        _compare_gt_verifier_paths(
+            args=args,
+            model=model,
+            batch=gpu_batch,
+            augmentor=augmentor,
+        )
 
         draft_tokens, loss, metrics = model(**gpu_batch, **train_call_kwargs)
         print("TRACE forward.done")
