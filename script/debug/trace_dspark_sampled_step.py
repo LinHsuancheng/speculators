@@ -1026,6 +1026,39 @@ def _compare_vllm_hidden_projection(
         _delete_trace_hidden_states(hidden_states_path)
 
 
+def _compare_cached_and_fresh_doc_hidden(
+    *,
+    batch: dict[str, Any],
+    scored: dict[str, Any] | None,
+    doc_start: int,
+    gt_positions: list[int],
+    label: str,
+) -> None:
+    if scored is None or scored.get("hidden_states_path") is None:
+        print(f"TRACE {label}.cached_vs_fresh_hidden skipped")
+        return
+    try:
+        from safetensors.torch import load_file
+
+        loaded = load_file(scored["hidden_states_path"])
+        fresh = loaded["hidden_states"]
+        prompt_ids = scored["prompt_token_ids"]
+        token_match = loaded["token_ids"].detach().cpu().tolist() == prompt_ids
+        max_diffs = []
+        for packed_pos in gt_positions:
+            cached_pos = packed_pos - 1
+            fresh_pos = packed_pos - doc_start - 1
+            cached_h = batch["verifier_last_hidden_states"][0, cached_pos].detach().float().cpu()
+            fresh_h = fresh[fresh_pos, -1].detach().float().cpu()
+            max_diffs.append(float((cached_h - fresh_h).abs().max().item()))
+        print(f"TRACE {label}.cached_vs_fresh_hidden")
+        print(f"  token_ids_match={token_match}")
+        print(f"  fresh_hidden_shape={tuple(fresh.shape)}")
+        print(f"  max_abs_diffs={[_fmt(x) for x in max_diffs]}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"TRACE {label}.cached_vs_fresh_hidden error={type(exc).__name__}: {exc}")
+
+
 def _print_local_verifier_slot_diagnostics(
     *,
     model: Any,
@@ -1241,6 +1274,13 @@ def _compare_gt_verifier_paths(
         label="gt_doc_prefix",
     )
     doc_vllm_logprobs = None if doc_vllm is None else doc_vllm["token_logprobs_float"]
+    _compare_cached_and_fresh_doc_hidden(
+        batch=batch,
+        scored=doc_vllm,
+        doc_start=doc_start,
+        gt_positions=gt_positions,
+        label="gt_doc_prefix",
+    )
     doc_hidden_logprobs = _compare_vllm_hidden_projection(
         model=model,
         scored=doc_vllm,
@@ -1678,6 +1718,9 @@ def _summarize_trace(text: str, *, tol: float = 1e-5) -> int:
                 if "hidden_state_source=" in line:
                     failures.append(line.strip())
                     break
+        direct_hidden = _trace_section(text, "gt_doc_prefix.cached_vs_fresh_hidden")
+        if direct_hidden:
+            failures.append(direct_hidden.strip())
         failures.append("gt cached-hidden mismatch:\n" + "\n".join(bad_gt))
 
     if failures:
