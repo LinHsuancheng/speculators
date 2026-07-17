@@ -35,6 +35,7 @@ class SampledAcceptanceAugmentor:
 
     def __init__(self, config: SampledAcceptanceConfig) -> None:
         self.config = config
+        self.skipped_no_anchor = 0
         self.client = openai.OpenAI(
             base_url=config.vllm_endpoint,
             api_key="EMPTY",
@@ -54,6 +55,14 @@ class SampledAcceptanceAugmentor:
             )
 
         self._ensure_sdpa_mask(draft_model)
+        if not self._has_valid_anchor(batch["loss_mask"], int(draft_model.block_size)):
+            self.skipped_no_anchor += 1
+            if self.skipped_no_anchor <= 5:
+                logger.warning(
+                    "Skipping batch for sampled acceptance loss: no valid anchor position "
+                    f"(skipped {self.skipped_no_anchor} so far)"
+                )
+            return batch
         sample = self._sample_from_draft(draft_model, batch)
         scored = score_sampled_tokens(
             client=self.client,
@@ -86,12 +95,26 @@ class SampledAcceptanceAugmentor:
             return draft_token_id
         return int(model.d2t[draft_token_id].item())
 
-    @staticmethod
-    def _sample_anchor_position(loss_mask: torch.Tensor, block_size: int) -> int:
+    @classmethod
+    def _valid_anchor_positions(
+        cls,
+        loss_mask: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
         valid_positions = torch.nonzero(loss_mask[0].bool(), as_tuple=False).flatten()
-        valid_positions = valid_positions[
-            valid_positions + block_size - 1 < loss_mask.shape[1]
-        ]
+        return valid_positions[valid_positions + block_size - 1 < loss_mask.shape[1]]
+
+    @classmethod
+    def _has_valid_anchor(cls, loss_mask: torch.Tensor, block_size: int) -> bool:
+        return cls._valid_anchor_positions(loss_mask, block_size).numel() > 0
+
+    @classmethod
+    def _sample_anchor_position(
+        cls,
+        loss_mask: torch.Tensor,
+        block_size: int,
+    ) -> int:
+        valid_positions = cls._valid_anchor_positions(loss_mask, block_size)
         if valid_positions.numel() == 0:
             raise ValueError("No valid anchor position for sampled acceptance loss")
         return int(valid_positions[0].item())
@@ -137,7 +160,7 @@ class SampledAcceptanceAugmentor:
 
         hidden_blocks = hidden.view(1, block_size, -1)
         logits_blocks = logits.view(1, block_size, -1)
-        prev_token_ids = torch.full(
+        base_prev_token_ids = torch.full(
             (1, block_size),
             int(input_ids[0, anchor_pos].item()),
             dtype=torch.long,
@@ -148,8 +171,13 @@ class SampledAcceptanceAugmentor:
         sampled_draft_ids: list[int] = []
         draft_logprobs: list[torch.Tensor] = []
         for slot in range(1, sampled_len + 1):
-            if slot > 1:
-                prev_token_ids[0, slot] = sampled_target_ids[-1]
+            prev_token_ids = base_prev_token_ids.clone()
+            if sampled_target_ids:
+                prev_token_ids[0, 1 : 1 + len(sampled_target_ids)] = torch.tensor(
+                    sampled_target_ids,
+                    dtype=torch.long,
+                    device=device,
+                )
             biased_logits = logits_blocks
             if model.markov_head is not None:
                 prev_emb = model.markov_head.prev_embeddings(prev_token_ids)
