@@ -781,6 +781,42 @@ def _print_packed_raw_alignment(
     print(f"  verifier_last_max_abs_diff={_fmt(float(last_abs.max().item()))}")
 
 
+def _print_raw_doc_regen_compare(
+    *,
+    augmentor: Any,
+    raw_item: dict[str, Any] | None,
+    local_pos: int,
+    label: str,
+) -> None:
+    print(f"TRACE {label}.raw_doc_regen_compare")
+    if raw_item is None:
+        print("  skipped=no_raw_item")
+        return
+    try:
+        from safetensors.torch import load_file
+        from speculators.data_generation.vllm_client import generate_hidden_states
+
+        token_ids = raw_item["input_ids"].detach().cpu().tolist()
+        path = generate_hidden_states(
+            augmentor.client,
+            augmentor.model_id,
+            {"input_ids": token_ids},
+            timeout=augmentor.config.request_timeout,
+        )
+        loaded = load_file(path)
+        fresh = loaded["hidden_states"]
+        token_match = loaded["token_ids"].detach().cpu().tolist() == token_ids
+        cached = raw_item["verifier_last_hidden_states"][local_pos].detach().float().cpu()
+        fresh_h = fresh[local_pos, -1].detach().float().cpu()
+        print(f"  generated_path={path}")
+        print(f"  token_ids_match={token_match}")
+        print(f"  fresh_hidden_shape={tuple(fresh.shape)}")
+        print(f"  local_pos={local_pos}")
+        print(f"  verifier_last_max_abs_diff={_fmt(float((cached - fresh_h).abs().max().item()))}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  error={type(exc).__name__}: {exc}")
+
+
 def _print_added_batch_keys(batch: dict[str, Any], before_keys: set[str], *, limit: int) -> None:
     added = sorted(set(batch) - before_keys)
     print(f"TRACE augmentor.added_keys={added}")
@@ -1614,6 +1650,25 @@ def trace_real_step(args: argparse.Namespace) -> None:
             batch_index=args.batch_index,
             anchor_pos=anchor_pos,
         )
+        batch_indices = _batch_indices_for_loader(train_loader, args.batch_index)
+        raw_item_for_anchor = None
+        local_pos_for_anchor = 0
+        if batch_indices is not None and "document_ids" in gpu_batch:
+            doc_id = int(gpu_batch["document_ids"][0, anchor_pos].detach().cpu().item())
+            raw_item_for_anchor = _captured_item_for_doc(
+                train_loader=train_loader,
+                captured_items=captured_raw_items,
+                batch_index=args.batch_index,
+                doc_id=doc_id,
+            )
+            doc_start, _ = _document_prefix_bounds(gpu_batch, anchor_pos)
+            local_pos_for_anchor = anchor_pos - doc_start
+        _print_raw_doc_regen_compare(
+            augmentor=augmentor,
+            raw_item=raw_item_for_anchor,
+            local_pos=local_pos_for_anchor,
+            label="gt_doc_prefix",
+        )
         _compare_gt_verifier_paths(
             args=args,
             model=model,
@@ -1721,6 +1776,9 @@ def _summarize_trace(text: str, *, tol: float = 1e-5) -> int:
         direct_hidden = _trace_section(text, "gt_doc_prefix.cached_vs_fresh_hidden")
         if direct_hidden:
             failures.append(direct_hidden.strip())
+        raw_regen = _trace_section(text, "gt_doc_prefix.raw_doc_regen_compare")
+        if raw_regen:
+            failures.append(raw_regen.strip())
         failures.append("gt cached-hidden mismatch:\n" + "\n".join(bad_gt))
 
     if failures:
