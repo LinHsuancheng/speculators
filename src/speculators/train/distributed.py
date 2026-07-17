@@ -13,7 +13,11 @@ import os
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import (
+    MixedPrecisionPolicy,
+    fully_shard,
+    register_fsdp_forward_method,
+)
 
 logger = logging.getLogger("speculators")
 
@@ -210,5 +214,14 @@ def apply_fully_sharded(model: torch.nn.Module):
         fully_shard(layer, mp_policy=mp_policy)
 
     fully_shard(model)
+
+    # Register get_backbone_outputs as FSDP forward method.
+    # This ensures FSDP hooks (unshard/reshard) are triggered when
+    # sampled_acceptance calls model.get_backbone_outputs().
+    # Without registration, parameters remain as sharded DTensor,
+    # causing "mixed Tensor and DTensor" errors.
+    # Must be called AFTER fully_shard(model).
+    if hasattr(model, "get_backbone_outputs"):
+        register_fsdp_forward_method(model, "get_backbone_outputs")
 
     return model
