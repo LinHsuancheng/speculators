@@ -37,6 +37,89 @@ _EPS = 1e-8
 CatMode = Literal["none", "target", "draft"]
 
 
+def acceptance_length_credit(
+    q_logp: torch.Tensor,  # [num_blocks, K] log q_t(Y_t), sampled tokens
+    p_logp: torch.Tensor,  # [num_blocks, K] log p_t(Y_t), same tokens, frozen
+    mask: torch.Tensor | None = None,  # [num_blocks, K] 1 for valid draft slots
+) -> torch.Tensor:
+    """Exact per-position credit ``C_t`` for the expected-acceptance-length loss.
+
+    Implements ``C_t = 1[q_t(Y_t) < p_t(Y_t)] * sum_{k>=t} S_k`` with
+    ``S_k = prod_{i<=k} alpha_i`` and ``alpha_i = min(1, p_i / q_i)`` (trials.md
+    §7-§9). Everything here is a function of *sampled* tokens under the frozen
+    verifier, so the returned tensor is detached (stop-gradient): it is meant to
+    be used as a per-position weight on ``log q_t(Y_t)``.
+    """
+    if q_logp.shape != p_logp.shape:
+        raise ValueError(
+            f"q_logp and p_logp shape mismatch: {q_logp.shape} vs {p_logp.shape}"
+        )
+
+    q_detached = q_logp.detach()
+    p_detached = p_logp.detach()
+
+    # log(alpha_t) = min(0, log p_t - log q_t)
+    log_alpha = torch.minimum(torch.zeros_like(q_detached), p_detached - q_detached)
+
+    if mask is not None:
+        # Masked slots act as alpha = 1 (log_alpha = 0) so they do not shrink the
+        # prefix product of the real slots that follow within the block.
+        log_alpha = log_alpha * mask.to(log_alpha.dtype)
+
+    # S_k = prod_{i<=k} alpha_i   (per block, over draft slots)
+    log_survival = torch.cumsum(log_alpha, dim=-1)
+    survival = torch.exp(log_survival)
+
+    # continuation_t = sum_{k>=t} S_k   (reverse cumsum along the block)
+    continuation = torch.flip(
+        torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
+        dims=[-1],
+    )
+
+    # I_t = 1[q_t(Y_t) < p_t(Y_t)]  (the under-covered / accept-with-prob-1 slots)
+    undercovered = (q_detached < p_detached).to(q_logp.dtype)
+
+    credit = undercovered * continuation
+    if mask is not None:
+        credit = credit * mask.to(credit.dtype)
+
+    return credit.detach()
+
+
+def exact_acceptance_length_loss(
+    q_logp: torch.Tensor,  # [num_blocks, K] log q_t(Y_t), grad flows here
+    p_logp: torch.Tensor,  # [num_blocks, K] log p_t(Y_t), frozen
+    mask: torch.Tensor | None = None,  # [num_blocks, K]
+) -> torch.Tensor:
+    """On-policy Monte-Carlo loss for negative expected acceptance length.
+
+    ``L_hat = -(1/K) * sum_t sg(C_t) * log q_t(Y_t)`` (trials.md §9, §13). Its
+    gradient is an unbiased estimator of ``-grad R_K`` (negative expected
+    acceptance length) under standard speculative sampling.
+
+    Only ``q_logp`` carries gradient; the credit ``C_t`` is stop-gradient.
+    Normalisation is by a fixed ``K`` (the number of draft slots per block), not
+    by the random ``sum_t C_t`` — see trials.md §18.4.
+    """
+    credit = acceptance_length_credit(q_logp, p_logp, mask=mask)  # [num_blocks, K]
+
+    weighted = credit * q_logp  # grad only through q_logp
+    if mask is not None:
+        weighted = weighted * mask.to(weighted.dtype)
+
+    block_size_k = q_logp.shape[-1]
+    # Divide by a fixed K (block draft length), never by the random credit sum.
+    loss_per_block = -weighted.sum(dim=-1) / block_size_k  # [num_blocks]
+
+    if mask is not None:
+        # Average only over blocks that have at least one valid draft slot.
+        block_valid = (mask.sum(dim=-1) > 0).to(loss_per_block.dtype)
+        denom = block_valid.sum().clamp_min(1.0)
+        return (loss_per_block * block_valid).sum() / denom
+
+    return loss_per_block.mean()
+
+
 def _masked_decayed_mean(
     elementwise: torch.Tensor,  # [1, T]
     loss_mask: torch.Tensor,  # [1, T]
