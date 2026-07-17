@@ -45,10 +45,6 @@ SAMPLED_ACCEPTANCE_LOSS_ALPHA=1.0
 VLLM_NPUS="8,9,10,11"
 TRAIN_NPU="12"
 
-# vLLM configuration - fix memory + enable parallelism
-VLLM_EXTRA_ARGS=(
-    --data-parallel-size 4
-)
 
 cleanup() {
     if [[ -n "${VLLM_PID:-}" ]]; then

@@ -48,7 +48,7 @@ TRAIN_NPUS="12,13,14,15"
 NUM_TRAIN_NPUS=4
 
 # vLLM configuration - fix memory + enable parallelism
-VLLM_EXTRA_ARGS=( --data-parallel-size 4 )
+VLLM_EXTRA_ARGS=( --data-parallel-size 4 --no-enable-prefix-caching --block-size 128)
 
 # Step 2: Launch vLLM server in the background
 echo "=== Step 2: Launching vLLM server on Ascend NPU(s): $VLLM_NPUS ==="
