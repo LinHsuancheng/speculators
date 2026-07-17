@@ -10,10 +10,6 @@ prefix product of a stop-gradient confidence proxy, following PARD-2:
 
 * ``target``: target-model GT-token confidence
 * ``draft``: analytical draft/target acceptance overlap
-
-When on-policy sampled target logprobs are provided, DSpark can replace the
-position/gamma decay with exact speculative-sampling credit weights and add the
-Monte Carlo acceptance-length loss from the sampled path.
 """
 
 from collections.abc import Callable
@@ -24,43 +20,23 @@ import torch
 from torch.nn.functional import binary_cross_entropy_with_logits, softmax
 
 from speculators.models.metrics import (
-    ce_loss,
     LossConfig,
     compound_loss,
     compute_accuracy_multi_step,
     dflash_loss_decay,
     draft_cat_weights,
-    loss_function,
     target_cat_weights,
 )
 
 __all__ = [
     "compute_metrics",
-    "exact_acceptance_length_loss",
     "sampled_acceptance_credit",
+    "exact_acceptance_length_loss",
 ]
 
 _EPS = 1e-8
 
 CatMode = Literal["none", "target", "draft"]
-
-
-def _masked_decayed_mean(
-    elementwise: torch.Tensor,  # [1, T]
-    loss_mask: torch.Tensor,  # [1, T]
-    pos_idx: torch.Tensor,  # [1, T]
-    decay_fn: Callable[[torch.Tensor], torch.Tensor] | None,
-    position_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Masked, optionally position-decayed mean of a precomputed per-position term."""
-    loss_mask = loss_mask.to(elementwise.dtype)
-    weighted = elementwise * loss_mask
-    if decay_fn is not None:
-        weighted = weighted * decay_fn(pos_idx.to(weighted.dtype))
-    if position_weights is not None:
-        weighted = weighted * position_weights.to(weighted.dtype)
-    denominator = loss_mask.sum(dim=1) + _EPS
-    return (weighted.sum(dim=1) / denominator).mean()
 
 
 def sampled_acceptance_credit(
@@ -115,55 +91,22 @@ def exact_acceptance_length_loss(
     return -((credit * draft_logp).sum(dim=-1) / block_tokens).mean()
 
 
-def _sampled_credit_position_weights(
-    credit: torch.Tensor,
-    loss_mask: torch.Tensor,
-    block_size: int,
+def _masked_decayed_mean(
+    elementwise: torch.Tensor,  # [1, T]
+    loss_mask: torch.Tensor,  # [1, T]
+    pos_idx: torch.Tensor,  # [1, T]
+    decay_fn: Callable[[torch.Tensor], torch.Tensor] | None,
+    position_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Map sampled draft-slot credit to ``[1, T]`` position weights.
-
-    The first position in every block is the anchor and remains zero.  Credit is
-    placed on slots ``1..K``.
-    """
-    total_seq_len = loss_mask.shape[1]
-    if total_seq_len % block_size != 0:
-        raise ValueError(
-            f"loss_mask length {total_seq_len} is not divisible by block_size={block_size}"
-        )
-    num_blocks = total_seq_len // block_size
-    if credit.ndim == 3:
-        if credit.shape[0] != 1:
-            raise ValueError(
-                "sampled credit currently expects batch size 1, "
-                f"got credit shape {credit.shape}"
-            )
-        credit = credit.squeeze(0)
-    if credit.ndim == 1:
-        credit = credit.unsqueeze(0)
-    if credit.ndim != 2:
-        raise ValueError(
-            "sampled credit must have shape [K], [num_blocks, K], or "
-            f"[1, num_blocks, K], got {credit.shape}"
-        )
-    if credit.shape[0] != num_blocks:
-        raise ValueError(
-            f"sampled credit has {credit.shape[0]} blocks but loss has {num_blocks}"
-        )
-    sampled_slots = credit.shape[1]
-    if sampled_slots > block_size - 1:
-        raise ValueError(
-            f"sampled credit has {sampled_slots} slots, but block_size={block_size} "
-            f"allows at most {block_size - 1}"
-        )
-
-    weights = torch.zeros(
-        num_blocks,
-        block_size,
-        device=loss_mask.device,
-        dtype=credit.dtype,
-    )
-    weights[:, 1 : 1 + sampled_slots] = credit.to(loss_mask.device)
-    return weights.reshape(1, total_seq_len) * loss_mask.to(dtype=credit.dtype)
+    """Masked, optionally position-decayed mean of a precomputed per-position term."""
+    loss_mask = loss_mask.to(elementwise.dtype)
+    weighted = elementwise * loss_mask
+    if decay_fn is not None:
+        weighted = weighted * decay_fn(pos_idx.to(weighted.dtype))
+    if position_weights is not None:
+        weighted = weighted * position_weights.to(weighted.dtype)
+    denominator = loss_mask.sum(dim=1) + _EPS
+    return (weighted.sum(dim=1) / denominator).mean()
 
 
 def _resolve_cat_weights(
@@ -203,12 +146,11 @@ def compute_metrics(
     device = logits.device
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
-    # Always use the original loss (gamma decay + compound loss)
     decay_fn = partial(dflash_loss_decay, gamma=gamma)
     cat_weights = _resolve_cat_weights(
         cat_mode, logits, targets, loss_mask, block_size
     )
-    position_weights = cat_weights
+
     loss, term_losses = compound_loss(
         logits,
         targets,
@@ -216,30 +158,8 @@ def compute_metrics(
         pos_idx,
         loss_config=loss_config,
         decay_fn=decay_fn,
-        position_weights=position_weights,
+        position_weights=cat_weights,
     )
-
-    # Compute sampled exact loss as auxiliary loss if sampled logprobs provided
-    sampled_credit = None
-    sampled_exact_loss = None
-    if sampled_draft_logprobs is not None or sampled_target_logprobs is not None:
-        if sampled_draft_logprobs is None or sampled_target_logprobs is None:
-            raise ValueError(
-                "sampled_draft_logprobs and sampled_target_logprobs must be provided "
-                "together"
-            )
-        sampled_draft_logprobs = sampled_draft_logprobs.to(device=device)
-        sampled_target_logprobs = sampled_target_logprobs.to(device=device)
-        sampled_credit = sampled_acceptance_credit(
-            sampled_draft_logprobs, sampled_target_logprobs
-        )
-        sampled_exact_loss = exact_acceptance_length_loss(
-            sampled_draft_logprobs,
-            sampled_target_logprobs,
-            credit=sampled_credit,
-        )
-        # Add as auxiliary loss
-        loss = loss + sampled_acceptance_loss_alpha * sampled_exact_loss
 
     # Analytical per-position acceptance rate = distributional overlap.
     with torch.no_grad():
@@ -260,7 +180,7 @@ def compute_metrics(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
         conf_loss = _masked_decayed_mean(
-            bce, loss_mask, pos_idx, decay_fn, position_weights=position_weights
+            bce, loss_mask, pos_idx, decay_fn, position_weights=cat_weights
         )
         loss = loss + confidence_head_alpha * conf_loss
 
@@ -294,69 +214,6 @@ def compute_metrics(
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones
 
-    if sampled_exact_loss is not None and sampled_credit is not None:
-        metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
-        metrics["sampled_acceptance_loss_total"] = ones
-        with torch.no_grad():
-            # Compute per-position statistics
-            log_alpha = torch.minimum(
-                torch.zeros_like(sampled_draft_logprobs.detach()),
-                sampled_target_logprobs.detach() - sampled_draft_logprobs.detach(),
-            )
-            sampled_alpha = torch.exp(log_alpha)
-            log_survival = torch.cumsum(log_alpha, dim=-1)
-            survival = torch.exp(log_survival)
-            continuation = torch.flip(
-                torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
-                dims=[-1],
-            )
-            undercovered = (sampled_draft_logprobs.detach() < sampled_target_logprobs.detach()).float()
-
-            # Average across all blocks, per position k
-            # Shape: [num_blocks, K] -> [K] via mean over blocks
-            K = sampled_draft_logprobs.shape[-1]
-
-            for k in range(K):
-                pos_label = k + 1  # Position 1-indexed for logging (position 0 is anchor)
-
-                # Draft log-prob at position k
-                metrics[f"sampled_pos{pos_label}_draft_logp_sum"] = sampled_draft_logprobs[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_draft_logp_total"] = ones
-
-                # Target log-prob at position k
-                metrics[f"sampled_pos{pos_label}_target_logp_sum"] = sampled_target_logprobs[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_target_logp_total"] = ones
-
-                # Alpha (acceptance ratio) at position k
-                metrics[f"sampled_pos{pos_label}_alpha_sum"] = sampled_alpha[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_alpha_total"] = ones
-
-                # Survival probability S_k
-                metrics[f"sampled_pos{pos_label}_survival_sum"] = survival[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_survival_total"] = ones
-
-                # Credit at position k
-                metrics[f"sampled_pos{pos_label}_credit_sum"] = sampled_credit[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_credit_total"] = ones
-
-                # Undercovered indicator at position k
-                metrics[f"sampled_pos{pos_label}_undercovered_sum"] = undercovered[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_undercovered_total"] = ones
-
-                # Log ratio: log(p/q)
-                logp_ratio = sampled_target_logprobs[:, k] - sampled_draft_logprobs[:, k]
-                metrics[f"sampled_pos{pos_label}_logp_ratio_sum"] = logp_ratio.mean()
-                metrics[f"sampled_pos{pos_label}_logp_ratio_total"] = ones
-
-            # Also keep some aggregate metrics for overview
-            estimated_accept_len_per_block = continuation[:, 0]
-            metrics["sampled_estimated_accept_len_sum"] = estimated_accept_len_per_block.mean()
-            metrics["sampled_estimated_accept_len_total"] = ones
-
-            # First position is most critical for diagnosis
-            metrics["sampled_first_alpha_sum"] = sampled_alpha[:, 0].mean()
-            metrics["sampled_first_alpha_total"] = ones
-
     if cat_weights is not None:
         with torch.no_grad():
             mask_f = loss_mask.to(cat_weights.dtype)
@@ -388,5 +245,77 @@ def compute_metrics(
     for pos in range(1, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
+
+    # Sampled acceptance loss (auxiliary) and position-wise metrics
+    if sampled_draft_logprobs is not None and sampled_target_logprobs is not None:
+        sampled_draft_logprobs = sampled_draft_logprobs.to(device=device)
+        sampled_target_logprobs = sampled_target_logprobs.to(device=device)
+
+        # Compute credit and exact loss
+        sampled_credit = sampled_acceptance_credit(
+            sampled_draft_logprobs, sampled_target_logprobs
+        )
+        sampled_exact_loss = exact_acceptance_length_loss(
+            sampled_draft_logprobs,
+            sampled_target_logprobs,
+            credit=sampled_credit,
+        )
+
+        # Add as auxiliary loss
+        loss = loss + sampled_acceptance_loss_alpha * sampled_exact_loss
+
+        # Log the auxiliary loss
+        ones = torch.ones((), device=device)
+        metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
+        metrics["sampled_acceptance_loss_total"] = ones
+
+        # Position-wise metrics
+        with torch.no_grad():
+            log_alpha = torch.minimum(
+                torch.zeros_like(sampled_draft_logprobs),
+                sampled_target_logprobs - sampled_draft_logprobs,
+            )
+            sampled_alpha = torch.exp(log_alpha)
+            log_survival = torch.cumsum(log_alpha, dim=-1)
+            survival = torch.exp(log_survival)
+            continuation = torch.flip(
+                torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
+                dims=[-1],
+            )
+            undercovered = (sampled_draft_logprobs < sampled_target_logprobs).float()
+
+            K = sampled_draft_logprobs.shape[-1]
+            for k in range(K):
+                pos_label = k + 1  # Position 1-indexed for logging
+
+                metrics[f"sampled_pos{pos_label}_draft_logp_sum"] = sampled_draft_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_draft_logp_total"] = ones
+
+                metrics[f"sampled_pos{pos_label}_target_logp_sum"] = sampled_target_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_target_logp_total"] = ones
+
+                metrics[f"sampled_pos{pos_label}_alpha_sum"] = sampled_alpha[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_alpha_total"] = ones
+
+                metrics[f"sampled_pos{pos_label}_survival_sum"] = survival[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_survival_total"] = ones
+
+                metrics[f"sampled_pos{pos_label}_credit_sum"] = sampled_credit[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_credit_total"] = ones
+
+                metrics[f"sampled_pos{pos_label}_undercovered_sum"] = undercovered[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_undercovered_total"] = ones
+
+                logp_ratio = sampled_target_logprobs[:, k] - sampled_draft_logprobs[:, k]
+                metrics[f"sampled_pos{pos_label}_logp_ratio_sum"] = logp_ratio.mean()
+                metrics[f"sampled_pos{pos_label}_logp_ratio_total"] = ones
+
+            # Aggregate metrics
+            estimated_accept_len_per_block = continuation[:, 0]
+            metrics["sampled_estimated_accept_len_sum"] = estimated_accept_len_per_block.mean()
+            metrics["sampled_estimated_accept_len_total"] = ones
+
+            metrics["sampled_first_alpha_sum"] = sampled_alpha[:, 0].mean()
+            metrics["sampled_first_alpha_total"] = ones
 
     return loss, metrics
