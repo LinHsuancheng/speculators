@@ -25,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+_ACTIVE_TRACE_BATCH: dict[str, Any] = {}
+
 
 def _fmt(x: float) -> str:
     if math.isnan(x) or math.isinf(x):
@@ -102,6 +104,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--print-anchor-limit", type=int, default=24)
     parser.add_argument("--gt-compare-len", type=int, default=7)
+    parser.add_argument(
+        "--anchor-selection",
+        choices=["first", "prefer-packed", "require-packed"],
+        default="prefer-packed",
+        help=(
+            "Debug anchor choice. prefer-packed moves a doc_start>0 anchor to "
+            "ordinal 0 when available; require-packed errors if none exists."
+        ),
+    )
     parser.add_argument("--skip-backward", action="store_true")
     parser.add_argument("--lr", type=float, default=6e-4)
     return parser
@@ -225,6 +236,93 @@ def _restore_score_trace(original: Any) -> None:
     import speculators.train.sampled_acceptance as sampled_acceptance_mod
 
     sampled_acceptance_mod.score_sampled_tokens = original
+
+
+def _doc_start_for_position(document_ids: Any, pos: int) -> int:
+    anchor_doc = document_ids[0, pos]
+    same_doc = document_ids[0, : pos + 1] == anchor_doc
+    positions = same_doc.nonzero(as_tuple=False).flatten()
+    if positions.numel() == 0:
+        return 0
+    return int(positions[0].item())
+
+
+def _first_packed_anchor_position(
+    *,
+    loss_mask: Any,
+    document_ids: Any,
+    block_size: int,
+) -> int | None:
+    valid = loss_mask[0].bool().clone()
+    valid[-block_size:] = False
+    valid_positions = valid.nonzero(as_tuple=False).flatten()
+    for pos_tensor in valid_positions.detach().cpu().tolist():
+        pos = int(pos_tensor)
+        if _doc_start_for_position(document_ids, pos) > 0:
+            return pos
+    return None
+
+
+def _install_anchor_selection_trace(mode: str) -> Any:
+    import speculators.train.sampled_acceptance as sampled_acceptance_mod
+
+    original = sampled_acceptance_mod.select_anchors
+
+    def wrapped(loss_mask: Any, num_anchors: int, block_size: int):
+        anchors, anchor_valid = original(loss_mask, num_anchors, block_size)
+        if mode == "first":
+            print("TRACE anchor_selection mode=first")
+            return anchors, anchor_valid
+
+        document_ids = _ACTIVE_TRACE_BATCH.get("document_ids")
+        if document_ids is None:
+            message = "TRACE anchor_selection no document_ids available"
+            if mode == "require-packed":
+                raise RuntimeError(message)
+            print(message)
+            return anchors, anchor_valid
+
+        packed_anchor = _first_packed_anchor_position(
+            loss_mask=loss_mask,
+            document_ids=document_ids,
+            block_size=block_size,
+        )
+        if packed_anchor is None:
+            message = "TRACE anchor_selection no doc_start>0 valid anchor in batch"
+            if mode == "require-packed":
+                raise RuntimeError(message)
+            print(f"{message}; falling back to ordinal 0")
+            return anchors, anchor_valid
+
+        device = anchors.device
+        packed_anchor_tensor = anchors.new_tensor(packed_anchor)
+        matches = (anchors == packed_anchor_tensor).nonzero(as_tuple=False).flatten()
+        if matches.numel() > 0:
+            src = int(matches[0].item())
+            anchors[[0, src]] = anchors[[src, 0]]
+            anchor_valid[[0, src]] = anchor_valid[[src, 0]]
+        else:
+            anchors[0] = packed_anchor_tensor.to(device=device)
+            anchor_valid[0] = True
+
+        doc_start = _doc_start_for_position(document_ids, packed_anchor)
+        doc_id = int(document_ids[0, packed_anchor].detach().cpu().item())
+        print("TRACE anchor_selection")
+        print(f"  mode={mode}")
+        print(f"  selected_anchor_pos={packed_anchor}")
+        print(f"  selected_doc_id={doc_id}")
+        print(f"  selected_doc_start={doc_start}")
+        print(f"  selected_doc_prefix_len={packed_anchor - doc_start + 1}")
+        return anchors, anchor_valid
+
+    sampled_acceptance_mod.select_anchors = wrapped
+    return original
+
+
+def _restore_anchor_selection(original: Any) -> None:
+    import speculators.train.sampled_acceptance as sampled_acceptance_mod
+
+    sampled_acceptance_mod.select_anchors = original
 
 
 def _install_model_traces(model: Any, *, topk: int) -> dict[str, Any]:
@@ -829,6 +927,7 @@ def _compare_gt_verifier_paths(
     print(f"  full_prefix_len={len(full_prefix)}")
     print(f"  doc_start={doc_start}")
     print(f"  doc_prefix_len={len(doc_prefix)}")
+    print(f"  packed_prefix_covered={doc_start > 0}")
     print(f"  position_id_doc_start={doc_pos_start}")
     print(f"  position_id_anchor={doc_pos_anchor}")
     print(f"  gt_positions={gt_positions}")
@@ -857,6 +956,14 @@ def _compare_gt_verifier_paths(
     )
 
     print("TRACE gt_verifier_compare.summary")
+    if doc_start == 0:
+        print("  packed_prefix_status=not_covered_doc_start_is_0")
+    elif full_vllm is not None and doc_vllm is not None:
+        full_doc_max_diff = max(
+            abs(a - b) for a, b in zip(full_vllm, doc_vllm, strict=True)
+        )
+        print(f"  packed_prefix_status=covered_doc_start_gt_0")
+        print(f"  full_vs_doc_max_abs_diff={_fmt(full_doc_max_diff)}")
     print("  pos,gt_id,local_pruned,full_prefix_vllm,diff_full,doc_prefix_vllm,diff_doc")
     for i, local in enumerate(local_logprobs):
         full = None if full_vllm is None else full_vllm[i]
@@ -1033,6 +1140,7 @@ def trace_real_step(args: argparse.Namespace) -> None:
     print(f"  prompt_logprobs={augmentor.config.prompt_logprobs}")
 
     score_calls, original_score = _install_score_trace()
+    original_select_anchors = _install_anchor_selection_trace(args.anchor_selection)
     model_trace = _install_model_traces(model, topk=args.topk)
     sample_trace = _install_sampling_trace(augmentor, topk=args.topk)
 
@@ -1049,6 +1157,8 @@ def trace_real_step(args: argparse.Namespace) -> None:
             k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
         }
+        _ACTIVE_TRACE_BATCH.clear()
+        _ACTIVE_TRACE_BATCH.update(gpu_batch)
         _print_batch(gpu_batch, limit=args.print_anchor_limit)
 
         before_keys = set(gpu_batch)
@@ -1135,6 +1245,8 @@ def trace_real_step(args: argparse.Namespace) -> None:
         sample_trace["restore"]()
         model_trace["restore"]()
         _restore_score_trace(original_score)
+        _restore_anchor_selection(original_select_anchors)
+        _ACTIVE_TRACE_BATCH.clear()
 
 
 def main() -> None:
