@@ -166,6 +166,9 @@ def compute_metrics(
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
     cat_mode: CatMode = "none",
+    sampled_draft_logprobs: torch.Tensor | None = None,  # [num_blocks, K]
+    sampled_target_logprobs: torch.Tensor | None = None,  # [num_blocks, K]
+    sampled_acceptance_loss_alpha: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
