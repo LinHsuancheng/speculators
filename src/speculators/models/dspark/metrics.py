@@ -30,65 +30,11 @@ from speculators.models.metrics import (
 
 __all__ = [
     "compute_metrics",
-    "sampled_acceptance_credit",
-    "exact_acceptance_length_loss",
 ]
 
 _EPS = 1e-8
 
 CatMode = Literal["none", "target", "draft"]
-
-
-def sampled_acceptance_credit(
-    draft_logp: torch.Tensor,
-    target_logp: torch.Tensor,
-) -> torch.Tensor:
-    """Return stop-gradient exact speculative credit for an on-policy path.
-
-    ``draft_logp`` is ``log q_t(Y_t)`` and must keep gradient. ``target_logp`` is
-    ``log p_t(Y_t)`` from the frozen verifier.  The returned credit is
-
-    ``1[q_t(Y_t) < p_t(Y_t)] * sum_{k=t..K} prod_{i<=k} alpha_i``
-
-    with ``alpha_i = min(1, p_i(Y_i) / q_i(Y_i))``.
-    """
-    if draft_logp.shape != target_logp.shape:
-        raise ValueError(
-            "sampled logprob shape mismatch: "
-            f"draft_logp={draft_logp.shape}, target_logp={target_logp.shape}"
-        )
-    if draft_logp.ndim < 1:
-        raise ValueError("sampled logprobs must have at least one dimension")
-
-    q_detached = draft_logp.detach()
-    p_detached = target_logp.detach().to(device=q_detached.device)
-    log_alpha = torch.minimum(
-        torch.zeros_like(q_detached),
-        p_detached - q_detached,
-    )
-    survival = torch.exp(torch.cumsum(log_alpha, dim=-1))
-    continuation = torch.flip(
-        torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
-        dims=[-1],
-    )
-    undercovered = (q_detached < p_detached).to(dtype=draft_logp.dtype)
-    return (undercovered * continuation.to(dtype=draft_logp.dtype)).detach()
-
-
-def exact_acceptance_length_loss(
-    draft_logp: torch.Tensor,
-    target_logp: torch.Tensor,
-    credit: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Monte Carlo loss whose gradient optimizes expected accepted length."""
-    if credit is None:
-        credit = sampled_acceptance_credit(draft_logp, target_logp)
-    if credit.shape != draft_logp.shape:
-        raise ValueError(
-            f"credit shape mismatch: credit={credit.shape}, draft_logp={draft_logp.shape}"
-        )
-    block_tokens = draft_logp.shape[-1]
-    return -((credit * draft_logp).sum(dim=-1) / block_tokens).mean()
 
 
 def _masked_decayed_mean(
@@ -137,9 +83,6 @@ def compute_metrics(
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
     cat_mode: CatMode = "none",
-    sampled_draft_logprobs: torch.Tensor | None = None,
-    sampled_target_logprobs: torch.Tensor | None = None,
-    sampled_acceptance_loss_alpha: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -245,77 +188,5 @@ def compute_metrics(
     for pos in range(1, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
-
-    # Sampled acceptance loss (auxiliary) and position-wise metrics
-    if sampled_draft_logprobs is not None and sampled_target_logprobs is not None:
-        sampled_draft_logprobs = sampled_draft_logprobs.to(device=device)
-        sampled_target_logprobs = sampled_target_logprobs.to(device=device)
-
-        # Compute credit and exact loss
-        sampled_credit = sampled_acceptance_credit(
-            sampled_draft_logprobs, sampled_target_logprobs
-        )
-        sampled_exact_loss = exact_acceptance_length_loss(
-            sampled_draft_logprobs,
-            sampled_target_logprobs,
-            credit=sampled_credit,
-        )
-
-        # Add as auxiliary loss
-        loss = loss + sampled_acceptance_loss_alpha * sampled_exact_loss
-
-        # Log the auxiliary loss
-        ones = torch.ones((), device=device)
-        metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
-        metrics["sampled_acceptance_loss_total"] = ones
-
-        # Position-wise metrics
-        with torch.no_grad():
-            log_alpha = torch.minimum(
-                torch.zeros_like(sampled_draft_logprobs),
-                sampled_target_logprobs - sampled_draft_logprobs,
-            )
-            sampled_alpha = torch.exp(log_alpha)
-            log_survival = torch.cumsum(log_alpha, dim=-1)
-            survival = torch.exp(log_survival)
-            continuation = torch.flip(
-                torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
-                dims=[-1],
-            )
-            undercovered = (sampled_draft_logprobs < sampled_target_logprobs).float()
-
-            K = sampled_draft_logprobs.shape[-1]
-            for k in range(K):
-                pos_label = k + 1  # Position 1-indexed for logging
-
-                metrics[f"sampled_pos{pos_label}_draft_logp_sum"] = sampled_draft_logprobs[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_draft_logp_total"] = ones
-
-                metrics[f"sampled_pos{pos_label}_target_logp_sum"] = sampled_target_logprobs[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_target_logp_total"] = ones
-
-                metrics[f"sampled_pos{pos_label}_alpha_sum"] = sampled_alpha[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_alpha_total"] = ones
-
-                metrics[f"sampled_pos{pos_label}_survival_sum"] = survival[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_survival_total"] = ones
-
-                metrics[f"sampled_pos{pos_label}_credit_sum"] = sampled_credit[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_credit_total"] = ones
-
-                metrics[f"sampled_pos{pos_label}_undercovered_sum"] = undercovered[:, k].mean()
-                metrics[f"sampled_pos{pos_label}_undercovered_total"] = ones
-
-                logp_ratio = sampled_target_logprobs[:, k] - sampled_draft_logprobs[:, k]
-                metrics[f"sampled_pos{pos_label}_logp_ratio_sum"] = logp_ratio.mean()
-                metrics[f"sampled_pos{pos_label}_logp_ratio_total"] = ones
-
-            # Aggregate metrics
-            estimated_accept_len_per_block = continuation[:, 0]
-            metrics["sampled_estimated_accept_len_sum"] = estimated_accept_len_per_block.mean()
-            metrics["sampled_estimated_accept_len_total"] = ones
-
-            metrics["sampled_first_alpha_sum"] = sampled_alpha[:, 0].mean()
-            metrics["sampled_first_alpha_total"] = ones
 
     return loss, metrics
