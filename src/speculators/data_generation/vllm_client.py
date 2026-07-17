@@ -3,6 +3,7 @@ import fcntl
 import functools
 import logging
 import os
+from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -23,6 +24,14 @@ RETRY_BACKOFF_BASE = 2  # seconds
 
 class InvalidResponseError(Exception):
     pass
+
+
+class ScoredTokens(TypedDict):
+    prompt_token_ids: list[int]
+    score_positions: list[int]
+    token_logprobs: list[float]
+    hidden_states_path: str | None
+    hidden_states_deleted: bool
 
 
 def _handle_retry_error(
@@ -91,15 +100,109 @@ def with_retries(fn):
     return sync_wrapper
 
 
-def extract_output(
-    response: Completion | ChatCompletion,
-    token_ids: list[int],
-) -> str:
+def _prompt_token_ids(response: Completion | ChatCompletion) -> list[int] | None:
     if isinstance(response, Completion):
         prompt_token_ids = getattr(response.choices[0], "prompt_token_ids", None)
     else:
         prompt_token_ids = getattr(response, "prompt_token_ids", None)
+    return None if prompt_token_ids is None else list(prompt_token_ids)
 
+
+def _kv_hidden_states_path(response: Completion | ChatCompletion) -> str | None:
+    kv_transfer_params = getattr(response, "kv_transfer_params", None)
+    if isinstance(kv_transfer_params, dict):
+        return kv_transfer_params.get("hidden_states_path")
+    return None
+
+
+def _prompt_logprobs(response: Completion | ChatCompletion) -> Any:
+    if isinstance(response, Completion):
+        prompt_logprobs = getattr(response.choices[0], "prompt_logprobs", None)
+        if prompt_logprobs is not None:
+            return prompt_logprobs
+
+    prompt_logprobs = getattr(response, "prompt_logprobs", None)
+    if prompt_logprobs is not None:
+        return prompt_logprobs
+
+    if hasattr(response, "model_dump"):
+        dumped = response.model_dump()
+        if dumped.get("choices"):
+            return dumped["choices"][0].get("prompt_logprobs")
+        return dumped.get("prompt_logprobs")
+
+    return None
+
+
+def _logprob_value(value: Any) -> float:
+    if isinstance(value, dict):
+        if "logprob" not in value:
+            raise InvalidResponseError(f"Logprob entry missing 'logprob': {value}")
+        return float(value["logprob"])
+    logprob = getattr(value, "logprob", None)
+    if logprob is None:
+        raise InvalidResponseError(f"Logprob entry missing 'logprob': {value}")
+    return float(logprob)
+
+
+def _extract_token_logprob(prompt_logprobs: Any, position: int, token_id: int) -> float:
+    try:
+        position_logprobs = prompt_logprobs[position]
+    except (IndexError, TypeError) as e:
+        raise InvalidResponseError(
+            f"Missing prompt logprobs for position {position}"
+        ) from e
+
+    if position_logprobs is None:
+        raise InvalidResponseError(f"Prompt logprobs for position {position} are None")
+
+    if isinstance(position_logprobs, dict):
+        for key in (token_id, str(token_id)):
+            if key in position_logprobs:
+                return _logprob_value(position_logprobs[key])
+        raise InvalidResponseError(
+            f"Token {token_id} not found in prompt logprobs at position {position}"
+        )
+
+    if hasattr(position_logprobs, "get"):
+        for key in (token_id, str(token_id)):
+            value = position_logprobs.get(key)
+            if value is not None:
+                return _logprob_value(value)
+
+    raise InvalidResponseError(
+        f"Unsupported prompt logprobs entry at position {position}: "
+        f"{type(position_logprobs).__name__}"
+    )
+
+
+def _delete_hidden_states_file(path_value: str | None, timeout: float = 30.0) -> bool:
+    if path_value is None:
+        return False
+
+    path = Path(path_value)
+    lock_path = Path(str(path) + ".lock")
+    deadline = time.monotonic() + timeout
+    if lock_path.exists():
+        wait_for_lock(str(lock_path), timeout=timeout)
+    while lock_path.exists() or not path.exists():
+        if time.monotonic() >= deadline:
+            break
+        if lock_path.exists():
+            wait_for_lock(str(lock_path), timeout=max(deadline - time.monotonic(), 0.1))
+            continue
+        time.sleep(0.05)
+
+    path.unlink(missing_ok=True)
+    lock_path.unlink(missing_ok=True)
+    return True
+
+
+def extract_output(
+    response: Completion | ChatCompletion,
+    token_ids: list[int],
+) -> str:
+    prompt_token_ids = _prompt_token_ids(response)
     if prompt_token_ids is None:
         raise InvalidResponseError("Response missing prompt_token_ids")
 
@@ -108,11 +211,11 @@ def extract_output(
             f"Prompt token IDs mismatch: expected {token_ids}, got {prompt_token_ids}"
         )
 
-    kv_transfer_params = getattr(response, "kv_transfer_params", None)
-    if kv_transfer_params is None:
+    hidden_states_path = _kv_hidden_states_path(response)
+    if hidden_states_path is None:
         raise InvalidResponseError("Response missing kv_transfer_params")
 
-    return kv_transfer_params.get("hidden_states_path")
+    return hidden_states_path
 
 
 class ClientItem(TypedDict):
@@ -247,3 +350,75 @@ def generate_hidden_states(
         )
 
     return extract_output(res, token_ids)
+
+
+@with_retries
+def score_sampled_tokens(
+    client: openai.Client,
+    model: str,
+    prefix_token_ids: list[int],
+    sampled_token_ids: list[int],
+    *,
+    prompt_logprobs: int = 1,
+    timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+    cleanup_hidden_states: bool = True,
+    hidden_states_file_timeout: float = 30.0,
+) -> ScoredTokens:
+    """Score sampled tokens with the target model without reading hidden states.
+
+    The request uses vLLM prompt logprobs over ``prefix + sampled``.  If the
+    server is configured with the hidden-state connector, vLLM may still write a
+    hidden-state file for this request; this function deliberately ignores that
+    file and deletes it by default.
+    """
+    if not prefix_token_ids:
+        raise ValueError("prefix_token_ids must not be empty")
+    if not sampled_token_ids:
+        raise ValueError("sampled_token_ids must not be empty")
+
+    prompt = [*prefix_token_ids, *sampled_token_ids]
+    score_positions = list(range(len(prefix_token_ids), len(prompt)))
+
+    response = client.completions.create(
+        model=model,
+        prompt=prompt,
+        max_tokens=1,
+        extra_body={
+            "return_token_ids": True,
+            "prompt_logprobs": prompt_logprobs,
+        },
+        timeout=timeout,
+    )
+
+    response_prompt_ids = _prompt_token_ids(response)
+    if response_prompt_ids is None:
+        raise InvalidResponseError("Response missing prompt_token_ids")
+    if response_prompt_ids != prompt:
+        raise InvalidResponseError(
+            "Prompt token IDs mismatch while scoring sampled tokens: "
+            f"expected {prompt}, got {response_prompt_ids}"
+        )
+
+    response_prompt_logprobs = _prompt_logprobs(response)
+    if response_prompt_logprobs is None:
+        raise InvalidResponseError("Response missing prompt_logprobs")
+
+    token_logprobs = [
+        _extract_token_logprob(response_prompt_logprobs, pos, prompt[pos])
+        for pos in score_positions
+    ]
+
+    hidden_states_path = _kv_hidden_states_path(response)
+    hidden_states_deleted = False
+    if cleanup_hidden_states:
+        hidden_states_deleted = _delete_hidden_states_file(
+            hidden_states_path, timeout=hidden_states_file_timeout
+        )
+
+    return {
+        "prompt_token_ids": response_prompt_ids,
+        "score_positions": score_positions,
+        "token_logprobs": token_logprobs,
+        "hidden_states_path": hidden_states_path,
+        "hidden_states_deleted": hidden_states_deleted,
+    }
