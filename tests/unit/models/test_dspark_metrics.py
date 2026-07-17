@@ -1,9 +1,11 @@
 """Unit tests for the DSpark loss and metrics."""
 
+import pytest
 import torch
 
 from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.metrics import resolve_loss_config
+from speculators.train.utils import normalize_counted_metrics
 
 _DEFAULT_LOSS = resolve_loss_config('{"ce": 0.1, "tv": 0.9}')
 
@@ -133,6 +135,53 @@ class TestComputeMetrics:
             loss_config=resolve_loss_config('{"tv": 1.0}'),
         )
         assert float(loss_large) > float(loss_small)
+
+    def test_sampled_position_alpha_matches_logged_qlogp_plogp(self):
+        logits = _ids_to_logits(torch.tensor([[0, 1, 2, 0, 3, 4]]), 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[0, 1, 1, 0, 1, 1]], dtype=torch.float32)
+        sampled_draft_logprobs = torch.tensor([[-0.113, -0.142]])
+        sampled_target_logprobs = torch.tensor([[-1.258, -0.381]])
+
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=3,
+            loss_config=_DEFAULT_LOSS,
+            sampled_draft_logprobs=sampled_draft_logprobs,
+            sampled_target_logprobs=sampled_target_logprobs,
+        )
+        normalized = normalize_counted_metrics(
+            {k: float(v) for k, v in metrics.items()}
+        )
+
+        expected_pos1 = torch.exp(
+            torch.clamp(
+                sampled_target_logprobs[0, 0] - sampled_draft_logprobs[0, 0],
+                max=0,
+            )
+        )
+        expected_pos2 = torch.exp(
+            torch.clamp(
+                sampled_target_logprobs[0, 1] - sampled_draft_logprobs[0, 1],
+                max=0,
+            )
+        )
+
+        assert normalized["sampled_pos1_qlogp"] == pytest.approx(-0.113)
+        assert normalized["sampled_pos1_plogp"] == pytest.approx(-1.258)
+        assert normalized["sampled_pos1_alpha"] == pytest.approx(
+            float(expected_pos1), rel=1e-6
+        )
+        assert normalized["sampled_pos1_alpha"] == pytest.approx(0.318, rel=1e-2)
+        assert normalized["sampled_pos2_qlogp"] == pytest.approx(-0.142)
+        assert normalized["sampled_pos2_plogp"] == pytest.approx(-0.381)
+        assert normalized["sampled_pos2_alpha"] == pytest.approx(
+            float(expected_pos2), rel=1e-6
+        )
+        assert normalized["sampled_pos2_alpha"] == pytest.approx(0.787, rel=1e-2)
 
     def test_metric_keys_present(self):
         ids = torch.tensor([[0, 1, 0, 2]])

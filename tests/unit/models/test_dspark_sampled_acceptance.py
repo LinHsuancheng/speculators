@@ -325,4 +325,6 @@ def test_augmentor_globally_skips_when_any_rank_has_no_anchor(monkeypatch):
 
     assert augmentor(model, batch) is batch
     assert "anchor_positions" not in batch
+    assert "sampled_draft_ids" not in batch
+    assert "sampled_target_logprobs" not in batch
     assert augmentor.skipped_no_anchor == 1

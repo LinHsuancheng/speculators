@@ -305,6 +305,15 @@ def compute_metrics(
                 sampled_target_logprobs - sampled_draft_logprobs,
             )
             alpha = torch.exp(log_alpha)
+            alpha_ref = torch.exp(
+                (sampled_target_logprobs - sampled_draft_logprobs).clamp(max=0)
+            )
+            if not torch.allclose(alpha, alpha_ref, atol=1e-6, rtol=1e-5):
+                max_diff = (alpha - alpha_ref).abs().max()
+                raise RuntimeError(
+                    "Sampled acceptance alpha mismatch: "
+                    f"max_diff={float(max_diff.item())}"
+                )
             log_survival = torch.cumsum(log_alpha, dim=-1)
             survival = torch.exp(log_survival)
             undercovered = (sampled_draft_logprobs < sampled_target_logprobs).float()
