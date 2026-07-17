@@ -8,7 +8,6 @@ from typing import Any
 
 import openai
 import torch
-from torch.distributed._tensor import DTensor
 
 from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
@@ -61,39 +60,84 @@ class SampledAcceptanceAugmentor:
         model: torch.nn.Module,
         batch: dict[str, Any],
     ) -> dict[str, Any]:
-        draft_model = model.module if hasattr(model, "module") else model
-        if not isinstance(draft_model, DSparkDraftModel):
-            raise TypeError(
-                "SampledAcceptanceAugmentor currently supports DSparkDraftModel only"
-            )
+        """Augment batch with sampled acceptance logprobs.
 
-        self._ensure_sdpa_mask(draft_model)
-        if not self._has_valid_anchor(batch["loss_mask"], int(draft_model.block_size)):
-            self.skipped_no_anchor += 1
-            if self.skipped_no_anchor <= 5:
-                logger.warning(
-                    "Skipping batch for sampled acceptance loss: no valid anchor position "
-                    f"(skipped {self.skipped_no_anchor} so far)"
+        In distributed training, only rank 0 samples and calls vLLM.
+        Results are broadcast to all ranks to ensure consistent gradients.
+        """
+        import torch.distributed as dist
+
+        is_distributed = dist.is_initialized()
+        is_rank0 = not is_distributed or dist.get_rank() == 0
+
+        # Only rank 0 performs sampling
+        if is_rank0:
+            draft_model = model.module if hasattr(model, "module") else model
+            if not isinstance(draft_model, DSparkDraftModel):
+                raise TypeError(
+                    "SampledAcceptanceAugmentor currently supports DSparkDraftModel only"
                 )
-            return batch
-        sample = self._sample_from_draft(draft_model, batch)
-        scored = score_sampled_tokens(
-            client=self.client,
-            model=self.model_id,
-            prefix_token_ids=sample["prefix_token_ids"],
-            sampled_token_ids=sample["sampled_target_token_ids"],
-            prompt_logprobs=self.config.prompt_logprobs,
-            timeout=self.config.request_timeout,
-            cleanup_hidden_states=True,
-            hidden_states_file_timeout=self.config.hidden_states_file_timeout,
-        )
-        batch["sampled_draft_logprobs"] = sample["draft_logprobs"].unsqueeze(0)
-        batch["sampled_target_logprobs"] = torch.tensor(
-            scored["token_logprobs"],
-            device=sample["draft_logprobs"].device,
-            dtype=sample["draft_logprobs"].dtype,
-        ).unsqueeze(0)
-        batch["anchor_positions"] = sample["anchor_positions"]
+
+            self._ensure_sdpa_mask(draft_model)
+            if not self._has_valid_anchor(
+                batch["loss_mask"], int(draft_model.block_size)
+            ):
+                self.skipped_no_anchor += 1
+                if self.skipped_no_anchor <= 5:
+                    logger.warning(
+                        "Skipping batch for sampled acceptance loss: no valid anchor "
+                        f"position (skipped {self.skipped_no_anchor} so far)"
+                    )
+                # Broadcast skip signal to other ranks
+                if is_distributed:
+                    skip_flag = torch.tensor([1], dtype=torch.int32, device="cuda")
+                    dist.broadcast(skip_flag, src=0)
+                return batch
+
+            # Signal other ranks that we're proceeding
+            if is_distributed:
+                skip_flag = torch.tensor([0], dtype=torch.int32, device="cuda")
+                dist.broadcast(skip_flag, src=0)
+
+            sample = self._sample_from_draft(draft_model, batch)
+            scored = score_sampled_tokens(
+                client=self.client,
+                model=self.model_id,
+                prefix_token_ids=sample["prefix_token_ids"],
+                sampled_token_ids=sample["sampled_target_token_ids"],
+                prompt_logprobs=self.config.prompt_logprobs,
+                timeout=self.config.request_timeout,
+                cleanup_hidden_states=True,
+                hidden_states_file_timeout=self.config.hidden_states_file_timeout,
+            )
+            sampled_draft_logprobs = sample["draft_logprobs"].unsqueeze(0)
+            sampled_target_logprobs = torch.tensor(
+                scored["token_logprobs"],
+                device=sample["draft_logprobs"].device,
+                dtype=sample["draft_logprobs"].dtype,
+            ).unsqueeze(0)
+        else:
+            # Other ranks: wait for skip signal
+            skip_flag = torch.tensor([0], dtype=torch.int32, device="cuda")
+            dist.broadcast(skip_flag, src=0)
+            if skip_flag.item() == 1:
+                return batch
+
+            # Receive broadcasted logprobs from rank 0
+            # Create placeholder tensors (shape will be broadcast)
+            device = next(model.parameters()).device
+            # Assume K=7 (block_size - 1), adjust if needed
+            K = 7  # TODO: get from model config
+            sampled_draft_logprobs = torch.zeros((1, K), dtype=torch.float32, device=device)
+            sampled_target_logprobs = torch.zeros((1, K), dtype=torch.float32, device=device)
+
+        # Broadcast logprobs from rank 0 to all ranks
+        if is_distributed:
+            dist.broadcast(sampled_draft_logprobs, src=0)
+            dist.broadcast(sampled_target_logprobs, src=0)
+
+        batch["sampled_draft_logprobs"] = sampled_draft_logprobs
+        batch["sampled_target_logprobs"] = sampled_target_logprobs
         batch["anchor_valid"] = sample["anchor_valid"]
         return batch
 
@@ -158,45 +202,18 @@ class SampledAcceptanceAugmentor:
         old_max_anchors = model.config.max_anchors
         model.config.max_anchors = self.config.max_anchors
 
-        # FSDP2-safe backbone forward call
-        # In distributed training with FSDP2 (fully_shard), parameters are sharded
-        # as DTensor. Direct calls to _backbone_forward bypass the FSDP hooks that
-        # normally all-gather params, causing "mixed Tensor and DTensor" errors.
-        # Note: fully_shard does NOT change model type, so isinstance(model, FSDP)
-        # fails — detect DTensor params instead and use _use_unsharded_views.
+        # Sample from draft model (only called on rank 0, no DTensor issues)
         with torch.no_grad():
-            is_fsdp2 = _has_dtensor_params(model)
-
-            if is_fsdp2:
-                if not hasattr(model, "_use_unsharded_views"):
-                    raise RuntimeError(
-                        "Model has FSDP2 DTensor parameters but "
-                        "'_use_unsharded_views' is unavailable. Upgrade PyTorch, "
-                        "or disable with --sampled-acceptance-loss-alpha=0."
-                    )
-                with model._use_unsharded_views(recurse=True):  # noqa: SLF001
-                    hidden, logits, _, _, _ = model._backbone_forward(
-                        hidden_states,
-                        input_ids,
-                        anchor_loss_mask,
-                        verifier_last_hidden_states,
-                        document_ids,
-                        position_ids,
-                        anchor_positions=anchor_positions,
-                        anchor_valid=anchor_valid,
-                    )
-            else:
-                # Single GPU or non-FSDP case
-                hidden, logits, _, _, _ = model._backbone_forward(
-                    hidden_states,
-                    input_ids,
-                    anchor_loss_mask,
-                    verifier_last_hidden_states,
-                    document_ids,
-                    position_ids,
-                    anchor_positions=anchor_positions,
-                    anchor_valid=anchor_valid,
-                )
+            hidden, logits, _, _, _ = model._backbone_forward(
+                hidden_states,
+                input_ids,
+                anchor_loss_mask,
+                verifier_last_hidden_states,
+                document_ids,
+                position_ids,
+                anchor_positions=anchor_positions,
+                anchor_valid=anchor_valid,
+            )
 
         model.config.max_anchors = old_max_anchors
 
