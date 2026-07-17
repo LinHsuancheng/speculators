@@ -165,6 +165,29 @@ def _resolve_device(torch: Any, device_arg: str | None):
     return torch.device("cpu")
 
 
+def _force_npu_supported_attention(model: Any, device: Any) -> None:
+    """Switch checkpoint flex attention to eager masks for NPU-only tracing."""
+    if getattr(device, "type", str(device).split(":", 1)[0]) != "npu":
+        return
+    if getattr(model, "_attn_impl", None) != "simple_flex_attention":
+        return
+
+    from speculators.models.attention import create_float_mask
+
+    print("TRACE npu_attention_override")
+    print("  checkpoint_attn_impl=simple_flex_attention")
+    print("  override_attn_impl=eager")
+    print("  reason=PyTorch FlexAttention does not support npu tensors")
+
+    model._attn_impl = "eager"
+    model._create_mask_fn = create_float_mask
+    model.config.transformer_layer_config._attn_implementation = "eager"  # noqa: SLF001
+    for layer in getattr(model, "layers", []):
+        layer.config._attn_implementation = "eager"  # noqa: SLF001
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.config._attn_implementation = "eager"  # noqa: SLF001
+
+
 def _install_score_trace() -> tuple[list[dict[str, Any]], Any]:
     import speculators.train.sampled_acceptance as sampled_acceptance_mod
 
@@ -627,6 +650,7 @@ def trace_real_step(args: argparse.Namespace) -> None:
     )
     if not isinstance(model, DSparkDraftModel):
         raise TypeError(f"Expected DSparkDraftModel, got {type(model).__name__}")
+    _force_npu_supported_attention(model, device)
     model.to(device=device, dtype=hidden_states_dtype)  # type: ignore[call-arg]
     model.train()
 
