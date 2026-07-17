@@ -37,7 +37,7 @@ DRAFT_ATTN_IMPL="sdpa"
 # Markov + confidence head settings
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"
-LOSS_FN="ce"
+LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
 SAMPLED_ACCEPTANCE_LOSS_ALPHA=1.0
 
