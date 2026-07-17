@@ -671,11 +671,14 @@ def _batch_indices_for_loader(train_loader: Any, batch_index: int) -> list[int] 
     return [int(x) for x in batch]
 
 
-def _clone_trace_item(item: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _clone_trace_item(item: dict[str, Any], source: Any = None) -> dict[str, Any]:
+    cloned = {
         key: value.detach().cpu().clone() if hasattr(value, "detach") else value
         for key, value in item.items()
     }
+    if source is not None:
+        cloned["_hidden_state_source"] = dict(source)
+    return cloned
 
 
 def _captured_item_for_doc(
@@ -767,6 +770,7 @@ def _print_packed_raw_alignment(
         f"batch_index={batch_index} doc_id={doc_id} dataset_index={dataset_index} "
         f"anchor_pos={anchor_pos} doc_start={doc_start} local_pos={local_pos}"
     )
+    print(f"  hidden_state_source={raw_item.get('_hidden_state_source')}")
     print(
         "  "
         f"token_match={packed_token == raw_token} "
@@ -1462,7 +1466,8 @@ def trace_real_step(args: argparse.Namespace) -> None:
     captured_raw_items: list[dict[str, Any]] = []
 
     def capture_raw_item(item: dict[str, Any]) -> dict[str, Any]:
-        captured_raw_items.append(_clone_trace_item(item))
+        source = getattr(train_loader.dataset, "_last_hidden_state_source", None)
+        captured_raw_items.append(_clone_trace_item(item, source))
         return item
 
     train_loader, _ = create_train_val_loaders(
@@ -1668,6 +1673,11 @@ def _summarize_trace(text: str, *, tol: float = 1e-5) -> int:
             if diff_hidden > tol:
                 bad_gt.append(line.strip())
     if bad_gt:
+        if packed:
+            for line in packed.splitlines():
+                if "hidden_state_source=" in line:
+                    failures.append(line.strip())
+                    break
         failures.append("gt cached-hidden mismatch:\n" + "\n".join(bad_gt))
 
     if failures:
