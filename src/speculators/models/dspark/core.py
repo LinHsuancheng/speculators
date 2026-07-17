@@ -112,6 +112,10 @@ class DSparkDraftModel(DFlashDraftModel):
         sampled_draft_logprobs: torch.Tensor | None = None,
         sampled_target_logprobs: torch.Tensor | None = None,
         sampled_acceptance_loss_alpha: float = 1.0,
+        # Phase 3 sampled acceptance: recompute q_logp from sampled_ids
+        sampled_draft_ids: torch.Tensor | None = None,
+        sampled_target_ids: torch.Tensor | None = None,
+        sampled_anchor_pos: torch.Tensor | None = None,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -140,6 +144,7 @@ class DSparkDraftModel(DFlashDraftModel):
 
         confidence_logits = None
         prev_emb = None
+        logits_base = logits  # Backbone logits before Markov bias (for sampled replay)
         if self.markov_head is not None:
             prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
             markov_bias = self.markov_head.block_bias(
@@ -164,6 +169,23 @@ class DSparkDraftModel(DFlashDraftModel):
                 1, mask_tokens_size
             )
 
+        # Phase 3: Recompute sampled q_logp if sampled data present
+        # This happens during training forward, after no-grad sampling + target verify
+        if sampled_draft_ids is not None and sampled_anchor_pos is not None:
+            sampled_draft_logprobs, sampled_target_logprobs = (
+                self._recompute_sampled_qlogp(
+                    hidden=hidden,
+                    logits_base=logits_base,  # base logits before markov bias
+                    input_ids=input_ids,
+                    sampled_draft_ids=sampled_draft_ids,
+                    sampled_target_ids=sampled_target_ids,
+                    sampled_anchor_pos=sampled_anchor_pos,
+                    sampled_target_logprobs=sampled_target_logprobs,
+                    num_blocks=num_blocks,
+                    block=block,
+                )
+            )
+
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -180,3 +202,79 @@ class DSparkDraftModel(DFlashDraftModel):
         )
         draft_tokens = torch.argmax(logits, dim=-1)
         return draft_tokens, loss, metrics
+
+    def _recompute_sampled_qlogp(
+        self,
+        hidden: torch.Tensor,
+        logits_base: torch.Tensor,
+        input_ids: torch.Tensor,
+        sampled_draft_ids: torch.Tensor,  # [K] draft vocab (for gather)
+        sampled_target_ids: torch.Tensor,  # [K] target vocab (for prev history)
+        sampled_anchor_pos: torch.Tensor,  # [1]
+        sampled_target_logprobs: torch.Tensor,  # [K]
+        num_blocks: int,
+        block: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recompute draft q_logp for sampled trajectory (phase 3).
+
+        Given detached sampled ids from phase-1 no-grad sampling, recompute
+        q_logp using current model state. This is the ONLY gradient-enabled
+        graph, matching the sampling logic in SampledAcceptanceAugmentor:
+        - prev token history uses TARGET ids (as during sampling)
+        - q_logp is gathered at the DRAFT id (the token sampled from q)
+
+        Returns:
+            sampled_draft_logprobs: [1, K] with gradient (through markov head)
+            sampled_target_logprobs: [1, K] detached
+        """
+        device = hidden.device
+        anchor_pos = int(sampled_anchor_pos[0].item())
+        K = int(sampled_draft_ids.shape[0])
+
+        # The sampling used max_anchors=1, producing a single block from the
+        # anchor. Here the training forward may have many blocks; the anchor's
+        # block is the one whose slot 0 sits at anchor_pos.
+        block_idx = anchor_pos // block
+        block_idx = min(block_idx, num_blocks - 1)
+
+        hidden_block = hidden.view(num_blocks, block, -1)[block_idx : block_idx + 1]
+        logits_block = logits_base.view(num_blocks, block, -1)[
+            block_idx : block_idx + 1
+        ]
+
+        anchor_token = int(input_ids[0, anchor_pos].item())
+
+        sampled_draft_logprobs_list = []
+        for k in range(K):
+            slot = k + 1
+            if slot >= block:
+                break
+            # Rebuild prev history exactly as during sampling: anchor token at
+            # position 0, previously sampled TARGET tokens at positions 1..k.
+            prev_token_ids = torch.full(
+                (1, block), anchor_token, dtype=torch.long, device=device
+            )
+            if k > 0:
+                prev_token_ids[0, 1 : 1 + k] = sampled_target_ids[:k]
+
+            biased_logits = logits_block
+            if self.markov_head is not None:
+                prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
+                biased_logits = logits_block + self.markov_head.block_bias(
+                    prev_token_ids=prev_token_ids,
+                    hidden_states=hidden_block,
+                    prev_emb=prev_emb,
+                )
+
+            slot_logits = biased_logits[0, slot].float()
+            log_probs = torch.log_softmax(slot_logits, dim=-1)
+            token_logp = log_probs[int(sampled_draft_ids[k].item())]
+            sampled_draft_logprobs_list.append(token_logp)
+
+        sampled_draft_logprobs = torch.stack(sampled_draft_logprobs_list).unsqueeze(0)
+        sampled_target_logprobs_out = sampled_target_logprobs[
+            : len(sampled_draft_logprobs_list)
+        ].unsqueeze(0)
+
+        return sampled_draft_logprobs, sampled_target_logprobs_out
+

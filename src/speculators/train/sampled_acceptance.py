@@ -60,11 +60,14 @@ class SampledAcceptanceAugmentor:
         model: torch.nn.Module,
         batch: dict[str, Any],
     ) -> dict[str, Any]:
-        """Augment batch with sampled acceptance logprobs.
+        """Augment batch with sampled acceptance data.
 
-        Each rank independently samples from its own batch. Using the public
-        get_backbone_outputs method ensures FSDP hooks are triggered, properly
-        handling DTensor parameters in distributed training.
+        Three-phase approach to avoid FSDP2 graph lifecycle issues:
+        1. No-grad sampling: only save detached sampled_ids
+        2. Target verify: external vLLM call, detached logprobs
+        3. Training forward will recompute sampled q_logp using sampled_ids
+
+        This ensures only one backward graph exists at backward time.
         """
         draft_model = model.module if hasattr(model, "module") else model
         if not isinstance(draft_model, DSparkDraftModel):
@@ -82,24 +85,43 @@ class SampledAcceptanceAugmentor:
                 )
             return batch
 
-        sample = self._sample_from_draft(draft_model, batch)
+        # Phase 1: No-grad sampling (only discrete token IDs)
+        with torch.no_grad():
+            sample = self._sample_from_draft(draft_model, batch)
+
+        # Extract and detach discrete results
+        sampled_target_ids = [int(x) for x in sample["sampled_target_token_ids"]]
+        sampled_draft_ids = [int(x) for x in sample["sampled_draft_token_ids"]]
+        anchor_pos = int(sample["anchor_positions"][0].item())
+
+        # Phase 2: Target verify (external, detached)
         scored = score_sampled_tokens(
             client=self.client,
             model=self.model_id,
             prefix_token_ids=sample["prefix_token_ids"],
-            sampled_token_ids=sample["sampled_target_token_ids"],
+            sampled_token_ids=sampled_target_ids,
             prompt_logprobs=self.config.prompt_logprobs,
             timeout=self.config.request_timeout,
             cleanup_hidden_states=True,
             hidden_states_file_timeout=self.config.hidden_states_file_timeout,
         )
-        batch["sampled_draft_logprobs"] = sample["draft_logprobs"].unsqueeze(0)
+
+        # Store detached data for phase 3 (training forward will recompute q_logp)
+        # Note: sampled_draft_ids are in DRAFT vocab (for q_logp recompute),
+        # sampled_target_ids are in TARGET vocab (used for vLLM verify).
+        device = batch["input_ids"].device
+        batch["sampled_draft_ids"] = torch.tensor(
+            sampled_draft_ids, dtype=torch.long, device=device
+        )
+        batch["sampled_target_ids"] = torch.tensor(
+            sampled_target_ids, dtype=torch.long, device=device
+        )
         batch["sampled_target_logprobs"] = torch.tensor(
-            scored["token_logprobs"],
-            device=sample["draft_logprobs"].device,
-            dtype=sample["draft_logprobs"].dtype,
-        ).unsqueeze(0)
-        batch["anchor_valid"] = sample["anchor_valid"]
+            scored["token_logprobs"], dtype=torch.float32, device=device
+        )
+        batch["sampled_anchor_pos"] = torch.tensor(
+            [anchor_pos], dtype=torch.long, device=device
+        )
         return batch
 
     @staticmethod
