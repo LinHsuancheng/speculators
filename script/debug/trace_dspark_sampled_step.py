@@ -15,6 +15,8 @@ inside the training forward, and the exact raw/normalized train metrics.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import math
 from pathlib import Path
 import sys
@@ -114,6 +116,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--skip-backward", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Print full trace log.")
     parser.add_argument("--lr", type=float, default=6e-4)
     return parser
 
@@ -1622,9 +1625,72 @@ def trace_real_step(args: argparse.Namespace) -> None:
         _ACTIVE_TRACE_BATCH.clear()
 
 
+def _trace_section(text: str, name: str) -> str:
+    marker = f"TRACE {name}"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    next_start = text.find("\nTRACE ", start + len(marker))
+    return text[start:] if next_start < 0 else text[start:next_start]
+
+
+def _summarize_trace(text: str, *, tol: float = 1e-5) -> int:
+    failures: list[str] = []
+
+    packed = _trace_section(text, "packed_raw_alignment")
+    if not packed:
+        failures.append("packed_raw_alignment missing")
+    elif (
+        "token_match=True" not in packed
+        or "hidden_max_abs_diff=0.000000" not in packed
+        or "verifier_last_max_abs_diff=0.000000" not in packed
+    ):
+        failures.append(packed.strip())
+
+    sampled = _trace_section(text, "sampled_verifier_prefix_compare.summary")
+    if not sampled:
+        failures.append("sampled verifier prefix summary missing")
+    else:
+        bad_sampled = []
+        for line in sampled.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) == 7 and parts[0].isdigit() and abs(float(parts[-1])) > tol:
+                bad_sampled.append(line.strip())
+        if bad_sampled:
+            failures.append("sampled doc-prefix mismatch:\n" + "\n".join(bad_sampled))
+
+    gt = _trace_section(text, "gt_verifier_compare.summary")
+    bad_gt = []
+    for line in gt.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) == 9 and parts[0].isdigit():
+            diff_hidden = abs(float(parts[-1]))
+            if diff_hidden > tol:
+                bad_gt.append(line.strip())
+    if bad_gt:
+        failures.append("gt cached-hidden mismatch:\n" + "\n".join(bad_gt))
+
+    if failures:
+        print("TRACE CHECK FAIL")
+        for failure in failures:
+            print(failure)
+            print()
+        return 1
+
+    print("TRACE CHECK OK")
+    return 0
+
+
 def main() -> None:
     args = _parser().parse_args()
-    trace_real_step(args)
+    if args.verbose:
+        trace_real_step(args)
+        return
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        trace_real_step(args)
+    raise SystemExit(_summarize_trace(buf.getvalue()))
 
 
 if __name__ == "__main__":
