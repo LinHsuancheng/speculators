@@ -8,6 +8,7 @@ from typing import Any
 
 import openai
 import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
@@ -144,19 +145,43 @@ class SampledAcceptanceAugmentor:
 
         old_max_anchors = model.config.max_anchors
         model.config.max_anchors = self.config.max_anchors
-        try:
-            hidden, logits, _, _, _ = model._backbone_forward(
-                hidden_states,
-                input_ids,
-                anchor_loss_mask,
-                verifier_last_hidden_states,
-                document_ids,
-                position_ids,
-                anchor_positions=anchor_positions,
-                anchor_valid=anchor_valid,
-            )
-        finally:
-            model.config.max_anchors = old_max_anchors
+
+        # FSDP-safe backbone forward call
+        # In distributed training with FSDP, parameters are sharded as DTensor.
+        # Direct calls to _backbone_forward bypass FSDP hooks, causing DTensor errors.
+        # Use summon_full_params to temporarily all-gather parameters.
+        with torch.no_grad():
+            # Check if model is wrapped with FSDP
+            # Note: model might be the raw model or FSDP-wrapped
+            is_fsdp = isinstance(model, FSDP)
+
+            if is_fsdp:
+                # Temporarily all-gather FSDP parameters
+                with FSDP.summon_full_params(model):
+                    hidden, logits, _, _, _ = model._backbone_forward(
+                        hidden_states,
+                        input_ids,
+                        anchor_loss_mask,
+                        verifier_last_hidden_states,
+                        document_ids,
+                        position_ids,
+                        anchor_positions=anchor_positions,
+                        anchor_valid=anchor_valid,
+                    )
+            else:
+                # Single GPU or non-FSDP case
+                hidden, logits, _, _, _ = model._backbone_forward(
+                    hidden_states,
+                    input_ids,
+                    anchor_loss_mask,
+                    verifier_last_hidden_states,
+                    document_ids,
+                    position_ids,
+                    anchor_positions=anchor_positions,
+                    anchor_valid=anchor_valid,
+                )
+
+        model.config.max_anchors = old_max_anchors
 
         hidden_blocks = hidden.view(1, block_size, -1)
         logits_blocks = logits.view(1, block_size, -1)
