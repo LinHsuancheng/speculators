@@ -255,6 +255,77 @@ def test_collate_fn_length_truncation():
         assert collated[key].shape[1] == max_len
 
 
+def test_collate_fn_preserves_raw_hidden_alignment_after_packing():
+    """Packed positions must map back to the same raw document-local positions."""
+    max_len = 9
+    hidden_size = 2
+    num_target_layers = 2
+    collate_fn = create_collate_fn(
+        max_len, hidden_size, num_target_layers=num_target_layers
+    )
+
+    sample0 = {
+        "input_ids": torch.tensor([101, 102, 103], dtype=torch.long),
+        "hidden_states": torch.tensor(
+            [
+                [1000.0, 1001.0, 1100.0, 1101.0],
+                [1010.0, 1011.0, 1110.0, 1111.0],
+                [1020.0, 1021.0, 1120.0, 1121.0],
+            ]
+        ),
+        "verifier_last_hidden_states": torch.tensor(
+            [[1900.0, 1901.0], [1910.0, 1911.0], [1920.0, 1921.0]]
+        ),
+        "loss_mask": torch.tensor([0, 1, 1], dtype=torch.long),
+        "lengths": torch.tensor([3], dtype=torch.long),
+        "position_ids": torch.arange(3, dtype=torch.long),
+    }
+    sample1 = {
+        "input_ids": torch.tensor([201, 202, 203, 204], dtype=torch.long),
+        "hidden_states": torch.tensor(
+            [
+                [2000.0, 2001.0, 2100.0, 2101.0],
+                [2010.0, 2011.0, 2110.0, 2111.0],
+                [2020.0, 2021.0, 2120.0, 2121.0],
+                [2030.0, 2031.0, 2130.0, 2131.0],
+            ]
+        ),
+        "verifier_last_hidden_states": torch.tensor(
+            [
+                [2900.0, 2901.0],
+                [2910.0, 2911.0],
+                [2920.0, 2921.0],
+                [2930.0, 2931.0],
+            ]
+        ),
+        "loss_mask": torch.tensor([0, 1, 1, 1], dtype=torch.long),
+        "lengths": torch.tensor([4], dtype=torch.long),
+        "position_ids": torch.arange(4, dtype=torch.long),
+    }
+
+    collated = collate_fn([sample0, sample1])
+
+    for doc_id, raw_sample in enumerate([sample0, sample1]):
+        packed_positions = torch.nonzero(
+            collated["document_ids"][0] == doc_id, as_tuple=False
+        ).flatten()
+        assert packed_positions.numel() == raw_sample["input_ids"].numel()
+
+        for local_pos, packed_pos in enumerate(packed_positions.tolist()):
+            assert collated["position_ids"][0, packed_pos].item() == local_pos
+            assert collated["input_ids"][0, packed_pos].item() == raw_sample[
+                "input_ids"
+            ][local_pos].item()
+            assert torch.equal(
+                collated["hidden_states"][0, packed_pos],
+                raw_sample["hidden_states"][local_pos],
+            )
+            assert torch.equal(
+                collated["verifier_last_hidden_states"][0, packed_pos],
+                raw_sample["verifier_last_hidden_states"][local_pos],
+            )
+
+
 def test_dataset_getitem_v1_format(tmp_path: Path):
     """Test dataset __getitem__ with v1 data format and dtype conversion."""
 

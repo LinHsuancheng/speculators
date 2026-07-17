@@ -652,6 +652,108 @@ def _print_batch(batch: dict[str, Any], *, limit: int) -> None:
         print(f"  input_ids_head={batch['input_ids'][0, :limit].detach().cpu().tolist()}")
 
 
+def _batch_indices_for_loader(train_loader: Any, batch_index: int) -> list[int] | None:
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    if batch_sampler is None:
+        return None
+    try:
+        batches = list(batch_sampler)
+    except Exception:  # noqa: BLE001
+        return None
+    if batch_index < 0 or batch_index >= len(batches):
+        return None
+    batch = batches[batch_index]
+    if hasattr(batch, "tolist"):
+        return [int(x) for x in batch.tolist()]
+    return [int(x) for x in batch]
+
+
+def _print_packed_raw_alignment(
+    *,
+    train_loader: Any,
+    batch: dict[str, Any],
+    batch_index: int,
+    anchor_pos: int,
+) -> None:
+    print("TRACE packed_raw_alignment")
+    indices = _batch_indices_for_loader(train_loader, batch_index)
+    if indices is None:
+        print("  skipped=unavailable_batch_sampler_indices")
+        return
+    if "document_ids" not in batch:
+        print("  skipped=no_document_ids")
+        return
+
+    document_ids = batch["document_ids"]
+    doc_id = int(document_ids[0, anchor_pos].detach().cpu().item())
+    if doc_id < 0 or doc_id >= len(indices):
+        print(f"  skipped=doc_id_out_of_range doc_id={doc_id} indices={indices}")
+        return
+
+    same_doc = document_ids[0, : anchor_pos + 1] == document_ids[0, anchor_pos]
+    doc_positions = same_doc.nonzero(as_tuple=False).flatten()
+    if doc_positions.numel() == 0:
+        print("  skipped=no_doc_positions")
+        return
+
+    doc_start = int(doc_positions[0].detach().cpu().item())
+    local_pos = anchor_pos - doc_start
+    dataset_index = indices[doc_id]
+    dataset = getattr(train_loader, "dataset", None)
+    if dataset is None:
+        print("  skipped=no_dataset")
+        return
+
+    transform = getattr(dataset, "transform", None)
+    try:
+        if hasattr(dataset, "transform"):
+            dataset.transform = None
+        raw_item = dataset[dataset_index]
+    finally:
+        if hasattr(dataset, "transform"):
+            dataset.transform = transform
+    if raw_item is None:
+        print(f"  skipped=raw_item_none dataset_index={dataset_index}")
+        return
+
+    raw_len = int(raw_item["input_ids"].shape[0])
+    if local_pos < 0 or local_pos >= raw_len:
+        print(
+            "  skipped=local_pos_out_of_range "
+            f"dataset_index={dataset_index} raw_len={raw_len} local_pos={local_pos}"
+        )
+        return
+
+    packed_token = int(batch["input_ids"][0, anchor_pos].detach().cpu().item())
+    raw_token = int(raw_item["input_ids"][local_pos].detach().cpu().item())
+    packed_hidden = batch["hidden_states"][0, anchor_pos].detach().float().cpu()
+    raw_hidden = raw_item["hidden_states"][local_pos].detach().float().cpu()
+    packed_last = (
+        batch["verifier_last_hidden_states"][0, anchor_pos].detach().float().cpu()
+    )
+    raw_last = raw_item["verifier_last_hidden_states"][local_pos].detach().float().cpu()
+    hidden_abs = (packed_hidden - raw_hidden).abs()
+    last_abs = (packed_last - raw_last).abs()
+
+    print(f"  batch_index={batch_index}")
+    print(f"  batch_dataset_indices={indices}")
+    print(f"  anchor_pos={anchor_pos}")
+    print(f"  doc_id={doc_id}")
+    print(f"  dataset_index={dataset_index}")
+    print(f"  doc_start={doc_start}")
+    print(f"  local_pos={local_pos}")
+    print(f"  raw_len={raw_len}")
+    print(f"  token_match={packed_token == raw_token}")
+    print(f"  packed_token={packed_token}")
+    print(f"  raw_token={raw_token}")
+    print("  note=raw_item_read_with_dataset_transform_disabled")
+    print("  note_hidden_states_diff_includes_training_noise_if_noise_std_nonzero")
+    print(f"  hidden_max_abs_diff={_fmt(float(hidden_abs.max().item()))}")
+    print(f"  hidden_mean_abs_diff={_fmt(float(hidden_abs.mean().item()))}")
+    print(f"  verifier_last_max_abs_diff={_fmt(float(last_abs.max().item()))}")
+    print(f"  verifier_last_mean_abs_diff={_fmt(float(last_abs.mean().item()))}")
+
+
 def _print_added_batch_keys(batch: dict[str, Any], before_keys: set[str], *, limit: int) -> None:
     added = sorted(set(batch) - before_keys)
     print(f"TRACE augmentor.added_keys={added}")
@@ -1429,6 +1531,13 @@ def trace_real_step(args: argparse.Namespace) -> None:
             model=model,
             sampled_draft_ids=sampled_draft_id_list,
             sampled_target_ids=sampled_target_id_list,
+        )
+        anchor_pos = int(gpu_batch["sampled_anchor_pos"][0].detach().cpu().item())
+        _print_packed_raw_alignment(
+            train_loader=train_loader,
+            batch=gpu_batch,
+            batch_index=args.batch_index,
+            anchor_pos=anchor_pos,
         )
         _compare_gt_verifier_paths(
             args=args,
