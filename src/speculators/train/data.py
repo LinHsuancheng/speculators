@@ -277,7 +277,6 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
-        self._last_hidden_state_source: dict[str, Any] | None = None
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -326,7 +325,7 @@ class ArrowDataset(BaseDataset):
             loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states from {hs_filepath}")
-            self._last_hidden_state_source = {
+            loaded_hs["_hidden_state_source"] = {
                 "source": "generated",
                 "path": str(hs_filepath),
                 "index": int(index),
@@ -356,12 +355,24 @@ class ArrowDataset(BaseDataset):
         file_idx = self._map_to_file_idx(index)
         candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
         loaded_hs = _maybe_load_hs_file(candidate_path)
-        self._last_hidden_state_source = None
+        hidden_state_source = {
+            "source": "cache",
+            "path": str(candidate_path),
+            "index": int(index),
+            "file_idx": int(file_idx),
+        }
 
         if loaded_hs is None:
             match self.on_missing:
                 case "generate":
                     loaded_hs = self._maybe_generate_hs(index)
+                    hidden_state_source = {
+                        "source": "generated",
+                        "path": None
+                        if loaded_hs is None
+                        else loaded_hs.get("_hidden_state_source", {}).get("path"),
+                        "index": int(index),
+                    }
                 case "skip":
                     return None
                 case "warn":
@@ -374,13 +385,6 @@ class ArrowDataset(BaseDataset):
                     raise RuntimeError(
                         f"Failed to load hidden states for sample {index}."
                     )
-        else:
-            self._last_hidden_state_source = {
-                "source": "cache",
-                "path": str(candidate_path),
-                "index": int(index),
-                "file_idx": int(file_idx),
-            }
 
         if loaded_hs is None:
             return loaded_hs
@@ -407,6 +411,7 @@ class ArrowDataset(BaseDataset):
                 :, -1
             ],  # [seq_len, hidden_size]
             "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "_hidden_state_source": hidden_state_source,
         }
 
 

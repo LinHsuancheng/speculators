@@ -1466,7 +1466,7 @@ def trace_real_step(args: argparse.Namespace) -> None:
     captured_raw_items: list[dict[str, Any]] = []
 
     def capture_raw_item(item: dict[str, Any]) -> dict[str, Any]:
-        source = getattr(train_loader.dataset, "_last_hidden_state_source", None)
+        source = item.pop("_hidden_state_source", None)
         captured_raw_items.append(_clone_trace_item(item, source))
         return item
 
