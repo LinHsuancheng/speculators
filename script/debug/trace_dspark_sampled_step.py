@@ -793,7 +793,11 @@ def _print_raw_doc_regen_compare(
         print("  skipped=no_raw_item")
         return
     try:
+        import time
+        from pathlib import Path
+
         from safetensors.torch import load_file
+        from speculators.data_generation.vllm_client import wait_for_lock
         from speculators.data_generation.vllm_client import generate_hidden_states
 
         token_ids = raw_item["input_ids"].detach().cpu().tolist()
@@ -803,6 +807,16 @@ def _print_raw_doc_regen_compare(
             {"input_ids": token_ids},
             timeout=augmentor.config.request_timeout,
         )
+        path_obj = Path(path)
+        lock_path = Path(path + ".lock")
+        deadline = time.monotonic() + augmentor.config.hidden_states_file_timeout
+        while lock_path.exists() or not path_obj.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for hidden states file: {path}")
+            if lock_path.exists():
+                wait_for_lock(str(lock_path), timeout=max(deadline - time.monotonic(), 0.1))
+                continue
+            time.sleep(0.05)
         loaded = load_file(path)
         fresh = loaded["hidden_states"]
         token_match = loaded["token_ids"].detach().cpu().tolist() == token_ids
