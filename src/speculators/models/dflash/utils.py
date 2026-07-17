@@ -22,6 +22,7 @@ def select_anchors(
     loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
     num_anchors: int,
     block_size: int,
+    document_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Randomly select anchor positions from valid tokens in sequence.
 
@@ -29,6 +30,8 @@ def select_anchors(
         loss_mask: Binary mask indicating valid positions [1, total_seq_len]
         n: Number of anchors to select per batch item
         block_size: Block size (last block_size positions excluded)
+        document_ids: Optional packed-document ids. When provided, all positions
+            in the anchored block must stay inside the anchor document.
 
     Returns:
         tuple: (anchors, anchor_valid)
@@ -42,7 +45,32 @@ def select_anchors(
         raise ValueError(f"Expected block size > 0, got {block_size}")
 
     valid_mask = loss_mask.bool().clone()
-    valid_mask[:, -block_size:] = False
+    if block_size > loss_mask.shape[1]:
+        valid_mask.zero_()
+    else:
+        valid_mask[:, loss_mask.shape[1] - block_size + 1 :] = False
+    if document_ids is not None:
+        if document_ids.shape != loss_mask.shape:
+            raise ValueError(
+                "document_ids shape must match loss_mask, got "
+                f"{document_ids.shape} and {loss_mask.shape}"
+            )
+        offsets = torch.arange(
+            block_size,
+            device=loss_mask.device,
+            dtype=torch.long,
+        )
+        positions = (
+            torch.arange(loss_mask.shape[1], device=loss_mask.device)[:, None]
+            + offsets[None, :]
+        ).clamp(max=loss_mask.shape[1] - 1)
+        doc_ids = document_ids.to(device=loss_mask.device, dtype=torch.long)
+        block_doc_ids = doc_ids[0, positions]
+        anchor_doc_ids = doc_ids[0, :, None]
+        same_document_block = (
+            (anchor_doc_ids[:, 0] != -1) & (block_doc_ids == anchor_doc_ids).all(dim=-1)
+        ).unsqueeze(0)
+        valid_mask &= same_document_block
 
     valid_indices = torch.nonzero(valid_mask.squeeze(0), as_tuple=False).squeeze(
         -1

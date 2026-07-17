@@ -389,7 +389,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         if anchor_positions is None:
             anchor_positions, anchor_valid = select_anchors(
-                loss_mask, self.config.max_anchors, self.block_size
+                loss_mask,
+                self.config.max_anchors,
+                self.block_size,
+                document_ids=document_ids,
             )
         else:
             anchor_positions = anchor_positions.to(

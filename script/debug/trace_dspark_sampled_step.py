@@ -247,6 +247,16 @@ def _doc_start_for_position(document_ids: Any, pos: int) -> int:
     return int(positions[0].item())
 
 
+def _block_stays_in_document(document_ids: Any, pos: int, block_size: int) -> bool:
+    if pos + block_size > int(document_ids.shape[1]):
+        return False
+    anchor_doc = document_ids[0, pos]
+    if int(anchor_doc.detach().cpu().item()) == -1:
+        return False
+    block_docs = document_ids[0, pos : pos + block_size]
+    return bool((block_docs == anchor_doc).all().detach().cpu().item())
+
+
 def _first_packed_anchor_position(
     *,
     loss_mask: Any,
@@ -254,11 +264,17 @@ def _first_packed_anchor_position(
     block_size: int,
 ) -> int | None:
     valid = loss_mask[0].bool().clone()
-    valid[-block_size:] = False
+    if block_size > valid.numel():
+        valid.zero_()
+    else:
+        valid[valid.numel() - block_size + 1 :] = False
     valid_positions = valid.nonzero(as_tuple=False).flatten()
     for pos_tensor in valid_positions.detach().cpu().tolist():
         pos = int(pos_tensor)
-        if _doc_start_for_position(document_ids, pos) > 0:
+        if (
+            _doc_start_for_position(document_ids, pos) > 0
+            and _block_stays_in_document(document_ids, pos, block_size)
+        ):
             return pos
     return None
 
@@ -268,8 +284,13 @@ def _install_anchor_selection_trace(mode: str) -> Any:
 
     original = sampled_acceptance_mod.select_anchors
 
-    def wrapped(loss_mask: Any, num_anchors: int, block_size: int):
-        anchors, anchor_valid = original(loss_mask, num_anchors, block_size)
+    def wrapped(loss_mask: Any, num_anchors: int, block_size: int, **kwargs: Any):
+        anchors, anchor_valid = original(
+            loss_mask,
+            num_anchors,
+            block_size,
+            **kwargs,
+        )
         if mode == "first":
             print("TRACE anchor_selection mode=first")
             return anchors, anchor_valid
@@ -918,6 +939,9 @@ def _compare_gt_verifier_paths(
         token_positions=gt_positions,
     )
     doc_id = int(batch["document_ids"][0, anchor_pos].detach().cpu().item())
+    block_document_ids = batch["document_ids"][
+        0, anchor_pos : anchor_pos + K + 1
+    ].detach().cpu().tolist()
     position_ids = batch.get("position_ids")
     doc_pos_start = None
     doc_pos_anchor = None
@@ -932,6 +956,7 @@ def _compare_gt_verifier_paths(
     print(f"  doc_start={doc_start}")
     print(f"  doc_prefix_len={len(doc_prefix)}")
     print(f"  packed_prefix_covered={doc_start > 0}")
+    print(f"  block_document_ids={block_document_ids}")
     print(f"  position_id_doc_start={doc_pos_start}")
     print(f"  position_id_anchor={doc_pos_anchor}")
     print(f"  gt_positions={gt_positions}")

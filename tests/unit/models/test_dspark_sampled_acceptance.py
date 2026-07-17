@@ -10,6 +10,7 @@ import torch
 import speculators.models.dflash.core as dflash_core
 import speculators.train.sampled_acceptance as sampled_acceptance
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dflash.utils import select_anchors
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.train.sampled_acceptance import (
     SampledAcceptanceAugmentor,
@@ -84,6 +85,23 @@ def test_build_attention_mask_rejects_anchor_count_mismatch():
             torch.device("cpu"),
             anchor_positions=torch.tensor([1, 2]),
         )
+
+
+def test_select_anchors_rejects_blocks_that_cross_document_boundary():
+    loss_mask = torch.tensor(
+        [[False, False, True, True, True, False, False, False]],
+        dtype=torch.bool,
+    )
+    document_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.long)
+
+    anchors, anchor_valid = select_anchors(
+        loss_mask,
+        num_anchors=4,
+        block_size=4,
+        document_ids=document_ids,
+    )
+
+    assert torch.equal(anchors[anchor_valid], torch.tensor([4]))
 
 
 def test_recompute_sampled_qlogp_uses_anchor_index_not_position_division():

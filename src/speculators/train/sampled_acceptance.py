@@ -71,6 +71,7 @@ class SampledAcceptanceAugmentor:
             batch["loss_mask"],
             int(draft_model.config.max_anchors),
             block_size,
+            document_ids=batch["document_ids"],
         )
         has_anchor = torch.tensor(
             [int(bool(anchor_valid.any()))],
@@ -154,9 +155,30 @@ class SampledAcceptanceAugmentor:
         cls,
         loss_mask: torch.Tensor,
         block_size: int,
+        document_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        valid_positions = torch.nonzero(loss_mask[0].bool(), as_tuple=False).flatten()
-        return valid_positions[valid_positions + block_size - 1 < loss_mask.shape[1]]
+        valid_mask = loss_mask[0].bool().clone()
+        if block_size > loss_mask.shape[1]:
+            valid_mask.zero_()
+        else:
+            valid_mask[loss_mask.shape[1] - block_size + 1 :] = False
+        if document_ids is not None:
+            offsets = torch.arange(
+                block_size,
+                device=loss_mask.device,
+                dtype=torch.long,
+            )
+            positions = (
+                torch.arange(loss_mask.shape[1], device=loss_mask.device)[:, None]
+                + offsets[None, :]
+            ).clamp(max=loss_mask.shape[1] - 1)
+            doc_ids = document_ids.to(device=loss_mask.device, dtype=torch.long)
+            block_doc_ids = doc_ids[0, positions]
+            anchor_doc_ids = doc_ids[0, :, None]
+            valid_mask &= (anchor_doc_ids[:, 0] != -1) & (
+                block_doc_ids == anchor_doc_ids
+            ).all(dim=-1)
+        return torch.nonzero(valid_mask, as_tuple=False).flatten()
 
     @classmethod
     def _has_valid_anchor(cls, loss_mask: torch.Tensor, block_size: int) -> bool:
@@ -167,8 +189,13 @@ class SampledAcceptanceAugmentor:
         cls,
         loss_mask: torch.Tensor,
         block_size: int,
+        document_ids: torch.Tensor | None = None,
     ) -> int:
-        valid_positions = cls._valid_anchor_positions(loss_mask, block_size)
+        valid_positions = cls._valid_anchor_positions(
+            loss_mask,
+            block_size,
+            document_ids=document_ids,
+        )
         if valid_positions.numel() == 0:
             raise ValueError("No valid anchor position for sampled acceptance loss")
         return int(valid_positions[0].item())
@@ -200,7 +227,11 @@ class SampledAcceptanceAugmentor:
 
         block_size = int(model.block_size)
         if anchor_pos is None:
-            anchor_pos = self._sample_anchor_position(loss_mask, block_size)
+            anchor_pos = self._sample_anchor_position(
+                loss_mask,
+                block_size,
+                document_ids=document_ids,
+            )
         sampled_len = block_size - 1
         anchor_loss_mask = torch.zeros_like(loss_mask, dtype=torch.bool)
         anchor_loss_mask[:, anchor_pos] = True
