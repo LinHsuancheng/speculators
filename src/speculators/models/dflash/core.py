@@ -407,6 +407,36 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
+    def get_backbone_outputs(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        verifier_last_hidden_states: torch.Tensor,
+        document_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """Public wrapper around _backbone_forward for FSDP compatibility.
+
+        This method should be called instead of _backbone_forward when direct
+        access to backbone outputs is needed (e.g., for sampling). By going
+        through a public method, FSDP hooks are triggered, ensuring DTensor
+        parameters are properly handled in distributed training.
+
+        Returns same as _backbone_forward: (hidden, logits, targets,
+        aligned_loss_mask, anchored_block_indices).
+        """
+        return self._backbone_forward(
+            hidden_states,
+            input_ids,
+            loss_mask,
+            verifier_last_hidden_states,
+            document_ids,
+            position_ids,
+            **kwargs,
+        )
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]

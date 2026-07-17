@@ -62,82 +62,43 @@ class SampledAcceptanceAugmentor:
     ) -> dict[str, Any]:
         """Augment batch with sampled acceptance logprobs.
 
-        In distributed training, only rank 0 samples and calls vLLM.
-        Results are broadcast to all ranks to ensure consistent gradients.
+        Each rank independently samples from its own batch. Using the public
+        get_backbone_outputs method ensures FSDP hooks are triggered, properly
+        handling DTensor parameters in distributed training.
         """
-        import torch.distributed as dist
-
-        is_distributed = dist.is_initialized()
-        is_rank0 = not is_distributed or dist.get_rank() == 0
-
-        # Only rank 0 performs sampling
-        if is_rank0:
-            draft_model = model.module if hasattr(model, "module") else model
-            if not isinstance(draft_model, DSparkDraftModel):
-                raise TypeError(
-                    "SampledAcceptanceAugmentor currently supports DSparkDraftModel only"
-                )
-
-            self._ensure_sdpa_mask(draft_model)
-            if not self._has_valid_anchor(
-                batch["loss_mask"], int(draft_model.block_size)
-            ):
-                self.skipped_no_anchor += 1
-                if self.skipped_no_anchor <= 5:
-                    logger.warning(
-                        "Skipping batch for sampled acceptance loss: no valid anchor "
-                        f"position (skipped {self.skipped_no_anchor} so far)"
-                    )
-                # Broadcast skip signal to other ranks
-                if is_distributed:
-                    skip_flag = torch.tensor([1], dtype=torch.int32, device="cuda")
-                    dist.broadcast(skip_flag, src=0)
-                return batch
-
-            # Signal other ranks that we're proceeding
-            if is_distributed:
-                skip_flag = torch.tensor([0], dtype=torch.int32, device="cuda")
-                dist.broadcast(skip_flag, src=0)
-
-            sample = self._sample_from_draft(draft_model, batch)
-            scored = score_sampled_tokens(
-                client=self.client,
-                model=self.model_id,
-                prefix_token_ids=sample["prefix_token_ids"],
-                sampled_token_ids=sample["sampled_target_token_ids"],
-                prompt_logprobs=self.config.prompt_logprobs,
-                timeout=self.config.request_timeout,
-                cleanup_hidden_states=True,
-                hidden_states_file_timeout=self.config.hidden_states_file_timeout,
+        draft_model = model.module if hasattr(model, "module") else model
+        if not isinstance(draft_model, DSparkDraftModel):
+            raise TypeError(
+                "SampledAcceptanceAugmentor currently supports DSparkDraftModel only"
             )
-            sampled_draft_logprobs = sample["draft_logprobs"].unsqueeze(0)
-            sampled_target_logprobs = torch.tensor(
-                scored["token_logprobs"],
-                device=sample["draft_logprobs"].device,
-                dtype=sample["draft_logprobs"].dtype,
-            ).unsqueeze(0)
-        else:
-            # Other ranks: wait for skip signal
-            skip_flag = torch.tensor([0], dtype=torch.int32, device="cuda")
-            dist.broadcast(skip_flag, src=0)
-            if skip_flag.item() == 1:
-                return batch
 
-            # Receive broadcasted logprobs from rank 0
-            # Create placeholder tensors (shape will be broadcast)
-            device = next(model.parameters()).device
-            # Assume K=7 (block_size - 1), adjust if needed
-            K = 7  # TODO: get from model config
-            sampled_draft_logprobs = torch.zeros((1, K), dtype=torch.float32, device=device)
-            sampled_target_logprobs = torch.zeros((1, K), dtype=torch.float32, device=device)
+        self._ensure_sdpa_mask(draft_model)
+        if not self._has_valid_anchor(batch["loss_mask"], int(draft_model.block_size)):
+            self.skipped_no_anchor += 1
+            if self.skipped_no_anchor <= 5:
+                logger.warning(
+                    "Skipping batch for sampled acceptance loss: no valid anchor "
+                    f"position (skipped {self.skipped_no_anchor} so far)"
+                )
+            return batch
 
-        # Broadcast logprobs from rank 0 to all ranks
-        if is_distributed:
-            dist.broadcast(sampled_draft_logprobs, src=0)
-            dist.broadcast(sampled_target_logprobs, src=0)
-
-        batch["sampled_draft_logprobs"] = sampled_draft_logprobs
-        batch["sampled_target_logprobs"] = sampled_target_logprobs
+        sample = self._sample_from_draft(draft_model, batch)
+        scored = score_sampled_tokens(
+            client=self.client,
+            model=self.model_id,
+            prefix_token_ids=sample["prefix_token_ids"],
+            sampled_token_ids=sample["sampled_target_token_ids"],
+            prompt_logprobs=self.config.prompt_logprobs,
+            timeout=self.config.request_timeout,
+            cleanup_hidden_states=True,
+            hidden_states_file_timeout=self.config.hidden_states_file_timeout,
+        )
+        batch["sampled_draft_logprobs"] = sample["draft_logprobs"].unsqueeze(0)
+        batch["sampled_target_logprobs"] = torch.tensor(
+            scored["token_logprobs"],
+            device=sample["draft_logprobs"].device,
+            dtype=sample["draft_logprobs"].dtype,
+        ).unsqueeze(0)
         batch["anchor_valid"] = sample["anchor_valid"]
         return batch
 
@@ -202,9 +163,12 @@ class SampledAcceptanceAugmentor:
         old_max_anchors = model.config.max_anchors
         model.config.max_anchors = self.config.max_anchors
 
-        # Sample from draft model (only called on rank 0, no DTensor issues)
+        # Use public get_backbone_outputs method instead of _backbone_forward.
+        # This ensures FSDP hooks are triggered in distributed training,
+        # properly handling DTensor parameters. Direct calls to private
+        # _backbone_forward bypass FSDP's __call__ mechanism.
         with torch.no_grad():
-            hidden, logits, _, _, _ = model._backbone_forward(
+            hidden, logits, _, _, _ = model.get_backbone_outputs(
                 hidden_states,
                 input_ids,
                 anchor_loss_mask,
