@@ -540,15 +540,6 @@ def main(args: argparse.Namespace):  # noqa: C901
             raise ValueError(
                 "--enable-sampled-acceptance-loss is only supported for DSpark"
             )
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            raise ValueError(
-                "--enable-sampled-acceptance-loss currently supports single-process "
-                "training only. Distributed broadcast of sampled logprobs is not yet "
-                "implemented."
-            )
         batch_augmentor = SampledAcceptanceAugmentor(
             SampledAcceptanceConfig(
                 vllm_endpoint=args.vllm_endpoint,
