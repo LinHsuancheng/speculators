@@ -275,4 +275,24 @@ def compute_metrics(
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
 
+    # Sampled acceptance loss (auxiliary) - only when sampled logprobs provided
+    if sampled_draft_logprobs is not None and sampled_target_logprobs is not None:
+        sampled_draft_logprobs = sampled_draft_logprobs.to(device=device)
+        sampled_target_logprobs = sampled_target_logprobs.to(device=device)
+
+        # Compute auxiliary loss
+        sampled_exact_loss = exact_acceptance_length_loss(
+            sampled_draft_logprobs,
+            sampled_target_logprobs,
+            mask=None,
+        )
+
+        # Add as auxiliary loss (does not modify original loss computation)
+        loss = loss + sampled_acceptance_loss_alpha * sampled_exact_loss
+
+        # Log the auxiliary loss
+        ones = torch.ones((), device=device)
+        metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
+        metrics["sampled_acceptance_loss_total"] = ones
+
     return loss, metrics
