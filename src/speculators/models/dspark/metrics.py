@@ -317,36 +317,36 @@ def compute_metrics(
             K = sampled_draft_logprobs.shape[-1]
 
             for k in range(K):
-                pos_idx = k + 1  # Position 1-indexed for logging (position 0 is anchor)
+                pos_label = k + 1  # Position 1-indexed for logging (position 0 is anchor)
 
                 # Draft log-prob at position k
-                metrics[f"sampled_pos{pos_idx}_draft_logp_sum"] = sampled_draft_logprobs[:, k].mean()
-                metrics[f"sampled_pos{pos_idx}_draft_logp_total"] = ones
+                metrics[f"sampled_pos{pos_label}_draft_logp_sum"] = sampled_draft_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_draft_logp_total"] = ones
 
                 # Target log-prob at position k
-                metrics[f"sampled_pos{pos_idx}_target_logp_sum"] = sampled_target_logprobs[:, k].mean()
-                metrics[f"sampled_pos{pos_idx}_target_logp_total"] = ones
+                metrics[f"sampled_pos{pos_label}_target_logp_sum"] = sampled_target_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_target_logp_total"] = ones
 
                 # Alpha (acceptance ratio) at position k
-                metrics[f"sampled_pos{pos_idx}_alpha_sum"] = sampled_alpha[:, k].mean()
-                metrics[f"sampled_pos{pos_idx}_alpha_total"] = ones
+                metrics[f"sampled_pos{pos_label}_alpha_sum"] = sampled_alpha[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_alpha_total"] = ones
 
                 # Survival probability S_k
-                metrics[f"sampled_pos{pos_idx}_survival_sum"] = survival[:, k].mean()
-                metrics[f"sampled_pos{pos_idx}_survival_total"] = ones
+                metrics[f"sampled_pos{pos_label}_survival_sum"] = survival[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_survival_total"] = ones
 
                 # Credit at position k
-                metrics[f"sampled_pos{pos_idx}_credit_sum"] = sampled_credit[:, k].mean()
-                metrics[f"sampled_pos{pos_idx}_credit_total"] = ones
+                metrics[f"sampled_pos{pos_label}_credit_sum"] = sampled_credit[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_credit_total"] = ones
 
                 # Undercovered indicator at position k
-                metrics[f"sampled_pos{pos_idx}_undercovered_sum"] = undercovered[:, k].mean()
-                metrics[f"sampled_pos{pos_idx}_undercovered_total"] = ones
+                metrics[f"sampled_pos{pos_label}_undercovered_sum"] = undercovered[:, k].mean()
+                metrics[f"sampled_pos{pos_label}_undercovered_total"] = ones
 
                 # Log ratio: log(p/q)
                 logp_ratio = sampled_target_logprobs[:, k] - sampled_draft_logprobs[:, k]
-                metrics[f"sampled_pos{pos_idx}_logp_ratio_sum"] = logp_ratio.mean()
-                metrics[f"sampled_pos{pos_idx}_logp_ratio_total"] = ones
+                metrics[f"sampled_pos{pos_label}_logp_ratio_sum"] = logp_ratio.mean()
+                metrics[f"sampled_pos{pos_label}_logp_ratio_total"] = ones
 
             # Also keep some aggregate metrics for overview
             estimated_accept_len_per_block = continuation[:, 0]
