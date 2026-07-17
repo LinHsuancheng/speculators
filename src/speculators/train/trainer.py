@@ -13,7 +13,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning
-from tqdm.rich import tqdm
+from tqdm.auto import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
@@ -40,6 +40,17 @@ metric_logger = logging.getLogger("speculators.metrics")
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 MIN_STEP_PCT = 0.25
+
+
+def _progress(iterable, *, desc: str, total: int):
+    return tqdm(
+        iterable,
+        desc=desc,
+        total=total,
+        dynamic_ncols=True,
+        mininterval=1.0,
+        disable=False,
+    )
 
 
 class TrainerConfig(NamedTuple):
@@ -323,7 +334,11 @@ class Trainer:
 
         train_loader = self.train_loader
         if self.rank == 0:
-            train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+            train_loader = _progress(  # type: ignore[assignment]
+                train_loader,
+                desc=f"Epoch {epoch}",
+                total=len(train_loader),
+            )
 
         step_interval = (
             max(1, round(num_steps * self.config.checkpoint_freq))
@@ -398,7 +413,11 @@ class Trainer:
             self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
         val_loader = self.val_loader
         if self.rank == 0:
-            val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+            val_loader = _progress(  # type: ignore[assignment]
+                val_loader,
+                desc=f"Epoch {epoch}",
+                total=len(val_loader),
+            )
 
         val_metrics: dict[str, float] = {}
         num_batches = len(val_loader)
