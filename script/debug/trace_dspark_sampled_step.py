@@ -687,7 +687,7 @@ def _score_with_vllm(
     prefix_token_ids: list[int],
     token_ids: list[int],
     label: str,
-) -> list[float] | None:
+) -> dict[str, Any] | None:
     import speculators.train.sampled_acceptance as sampled_acceptance_mod
 
     try:
@@ -710,7 +710,40 @@ def _score_with_vllm(
     print(f"  token_ids={token_ids}")
     print(f"  score_positions={scored['score_positions']}")
     print(f"  logprobs={out}")
-    return out
+    return scored | {"token_logprobs_float": out}
+
+
+def _score_with_vllm_hidden_states(
+    *,
+    augmentor: Any,
+    prefix_token_ids: list[int],
+    token_ids: list[int],
+    label: str,
+) -> dict[str, Any] | None:
+    import speculators.train.sampled_acceptance as sampled_acceptance_mod
+
+    try:
+        scored = sampled_acceptance_mod.score_sampled_tokens(
+            client=augmentor.client,
+            model=augmentor.model_id,
+            prefix_token_ids=prefix_token_ids,
+            sampled_token_ids=token_ids,
+            prompt_logprobs=augmentor.config.prompt_logprobs,
+            timeout=augmentor.config.request_timeout,
+            cleanup_hidden_states=False,
+            hidden_states_file_timeout=augmentor.config.hidden_states_file_timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"TRACE {label}.vllm_error={type(exc).__name__}: {exc}")
+        return None
+    out = [float(x) for x in scored["token_logprobs"]]
+    print(f"TRACE {label}.vllm_hidden_request")
+    print(f"  prefix_len={len(prefix_token_ids)}")
+    print(f"  token_ids={token_ids}")
+    print(f"  score_positions={scored['score_positions']}")
+    print(f"  logprobs={out}")
+    print(f"  hidden_states_path={scored['hidden_states_path']}")
+    return scored | {"token_logprobs_float": out}
 
 
 def _target_to_draft_gather_ids(model: Any, target_ids: Any, device: Any) -> tuple[Any, Any]:
@@ -768,6 +801,100 @@ def _local_verifier_gt_logprobs(
             torch.full_like(gathered, float("nan")),
         )
     return [float(x) for x in gathered.detach().cpu().tolist()]
+
+
+def _project_hidden_logprobs(
+    *,
+    model: Any,
+    hidden_states: Any,
+    token_ids: list[int],
+    score_positions: list[int],
+    shift: int = -1,
+) -> list[float] | None:
+    import torch
+
+    device = next(model.parameters()).device
+    hidden_states = hidden_states.to(device=device)
+    if hidden_states.ndim == 3:
+        hidden_states = hidden_states[:, -1]
+    target_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+    gather_ids, in_draft_vocab = _target_to_draft_gather_ids(model, target_ids, device)
+    if not bool(in_draft_vocab.all().item()):
+        missing = target_ids[~in_draft_vocab].detach().cpu().tolist()
+        print(f"TRACE vllm_hidden_projection.missing_from_draft_vocab={missing}")
+    positions = torch.tensor(
+        [pos + shift for pos in score_positions],
+        dtype=torch.long,
+        device=device,
+    )
+    if bool(((positions < 0) | (positions >= hidden_states.shape[0])).any().item()):
+        return None
+    with torch.no_grad():
+        verifier_logits = model.verifier_lm_head(
+            model.verifier_norm(hidden_states.unsqueeze(0))
+        )
+        logprobs = torch.log_softmax(verifier_logits[0, positions].float(), dim=-1)
+        gathered = logprobs.gather(
+            -1,
+            gather_ids.clamp_min(0).unsqueeze(-1),
+        ).squeeze(-1)
+        gathered = torch.where(
+            in_draft_vocab.bool(),
+            gathered,
+            torch.full_like(gathered, float("nan")),
+        )
+    return [float(x) for x in gathered.detach().cpu().tolist()]
+
+
+def _delete_trace_hidden_states(path_value: str | None) -> None:
+    if path_value is None:
+        return
+    from pathlib import Path
+
+    path = Path(path_value)
+    path.unlink(missing_ok=True)
+    Path(str(path) + ".lock").unlink(missing_ok=True)
+
+
+def _compare_vllm_hidden_projection(
+    *,
+    model: Any,
+    scored: dict[str, Any] | None,
+    token_ids: list[int],
+    label: str,
+) -> list[float] | None:
+    if scored is None:
+        return None
+    hidden_states_path = scored.get("hidden_states_path")
+    if hidden_states_path is None:
+        print(f"TRACE {label}.hidden_projection skipped: no hidden_states_path")
+        return None
+    try:
+        from safetensors.torch import load_file
+
+        loaded = load_file(hidden_states_path)
+        hidden_states = loaded["hidden_states"]
+        loaded_token_ids = loaded["token_ids"].detach().cpu().tolist()
+        expected_token_ids = scored["prompt_token_ids"]
+        token_ids_match = loaded_token_ids == expected_token_ids
+        vals = _project_hidden_logprobs(
+            model=model,
+            hidden_states=hidden_states,
+            token_ids=token_ids,
+            score_positions=scored["score_positions"],
+            shift=-1,
+        )
+        print(f"TRACE {label}.hidden_projection")
+        print(f"  hidden_states_shape={tuple(hidden_states.shape)}")
+        print("  shift=-1")
+        print(f"  token_ids_match={token_ids_match}")
+        print(f"  logprobs={vals}")
+        return vals
+    except Exception as exc:  # noqa: BLE001
+        print(f"TRACE {label}.hidden_projection_error={type(exc).__name__}: {exc}")
+        return None
+    finally:
+        _delete_trace_hidden_states(hidden_states_path)
 
 
 def _print_local_verifier_slot_diagnostics(
@@ -969,17 +1096,25 @@ def _compare_gt_verifier_paths(
         token_ids=gt_ids,
         label="gt_full_prefix",
     )
+    full_vllm_logprobs = None if full_vllm is None else full_vllm["token_logprobs_float"]
     _print_local_verifier_slot_diagnostics(
         model=model,
         batch=batch,
         anchor_pos=anchor_pos,
         gt_positions=gt_positions,
         gt_ids=gt_ids,
-        vllm_logprobs=full_vllm,
+        vllm_logprobs=full_vllm_logprobs,
     )
-    doc_vllm = _score_with_vllm(
+    doc_vllm = _score_with_vllm_hidden_states(
         augmentor=augmentor,
         prefix_token_ids=doc_prefix,
+        token_ids=gt_ids,
+        label="gt_doc_prefix",
+    )
+    doc_vllm_logprobs = None if doc_vllm is None else doc_vllm["token_logprobs_float"]
+    doc_hidden_logprobs = _compare_vllm_hidden_projection(
+        model=model,
+        scored=doc_vllm,
         token_ids=gt_ids,
         label="gt_doc_prefix",
     )
@@ -987,16 +1122,20 @@ def _compare_gt_verifier_paths(
     print("TRACE gt_verifier_compare.summary")
     if doc_start == 0:
         print("  packed_prefix_status=not_covered_doc_start_is_0")
-    elif full_vllm is not None and doc_vllm is not None:
+    elif full_vllm_logprobs is not None and doc_vllm_logprobs is not None:
         full_doc_max_diff = max(
-            abs(a - b) for a, b in zip(full_vllm, doc_vllm, strict=True)
+            abs(a - b) for a, b in zip(full_vllm_logprobs, doc_vllm_logprobs, strict=True)
         )
         print(f"  packed_prefix_status=covered_doc_start_gt_0")
         print(f"  full_vs_doc_max_abs_diff={_fmt(full_doc_max_diff)}")
-    print("  pos,gt_id,local_pruned,full_prefix_vllm,diff_full,doc_prefix_vllm,diff_doc")
+    print(
+        "  pos,gt_id,local_pruned,full_prefix_vllm,diff_full,"
+        "doc_prefix_vllm,diff_doc,doc_hidden_projection,diff_hidden"
+    )
     for i, local in enumerate(local_logprobs):
-        full = None if full_vllm is None else full_vllm[i]
-        doc = None if doc_vllm is None else doc_vllm[i]
+        full = None if full_vllm_logprobs is None else full_vllm_logprobs[i]
+        doc = None if doc_vllm_logprobs is None else doc_vllm_logprobs[i]
+        doc_hidden = None if doc_hidden_logprobs is None else doc_hidden_logprobs[i]
         print(
             f"  {i + 1},"
             f"{gt_ids[i]},"
@@ -1004,7 +1143,9 @@ def _compare_gt_verifier_paths(
             f"{'<err>' if full is None else _fmt(full)},"
             f"{'<err>' if full is None else _fmt(full - local)},"
             f"{'<err>' if doc is None else _fmt(doc)},"
-            f"{'<err>' if doc is None else _fmt(doc - local)}"
+            f"{'<err>' if doc is None else _fmt(doc - local)},"
+            f"{'<err>' if doc_hidden is None else _fmt(doc_hidden)},"
+            f"{'<err>' if doc_hidden is None else _fmt(doc_hidden - local)}"
         )
 
 
@@ -1044,20 +1185,22 @@ def _compare_sampled_verifier_paths(
         token_ids=sampled_ids,
         label="sampled_doc_prefix",
     )
+    full_vllm_logprobs = None if full_vllm is None else full_vllm["token_logprobs_float"]
+    doc_vllm_logprobs = None if doc_vllm is None else doc_vllm["token_logprobs_float"]
 
     print("TRACE sampled_verifier_prefix_compare.summary")
     if doc_start == 0:
         print("  packed_prefix_status=not_covered_doc_start_is_0")
-    elif full_vllm is not None and doc_vllm is not None:
+    elif full_vllm_logprobs is not None and doc_vllm_logprobs is not None:
         full_doc_max_diff = max(
-            abs(a - b) for a, b in zip(full_vllm, doc_vllm, strict=True)
+            abs(a - b) for a, b in zip(full_vllm_logprobs, doc_vllm_logprobs, strict=True)
         )
         print("  packed_prefix_status=covered_doc_start_gt_0")
         print(f"  full_vs_doc_max_abs_diff={_fmt(full_doc_max_diff)}")
     print("  pos,target_id,actual,full_prefix_vllm,diff_full,doc_prefix_vllm,diff_doc")
     for i, actual in enumerate(actual_logprobs):
-        full = None if full_vllm is None else full_vllm[i]
-        doc = None if doc_vllm is None else doc_vllm[i]
+        full = None if full_vllm_logprobs is None else full_vllm_logprobs[i]
+        doc = None if doc_vllm_logprobs is None else doc_vllm_logprobs[i]
         print(
             f"  {i + 1},"
             f"{sampled_ids[i]},"
