@@ -283,6 +283,25 @@ def test_sample_from_draft_uses_shifted_prev_history_and_explicit_anchor():
     )
 
 
+def test_sample_from_draft_scores_vllm_with_document_local_prefix():
+    model = FakeDraftModel()
+    augmentor = SampledAcceptanceAugmentor.__new__(SampledAcceptanceAugmentor)
+    augmentor.config = SampledAcceptanceConfig("http://unused", temperature=0.0)
+
+    batch = {
+        "input_ids": torch.tensor([[101, 102, 103, 201, 202, 203, 204]]),
+        "loss_mask": torch.tensor([[False, False, False, True, True, True, False]]),
+        "hidden_states": torch.zeros(1, 7, 2),
+        "verifier_last_hidden_states": torch.zeros(1, 7, 2),
+        "document_ids": torch.tensor([[0, 0, 0, 1, 1, 1, 1]]),
+        "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2, 3]]),
+    }
+
+    sample = augmentor._sample_from_draft(model, batch, anchor_pos=4)
+
+    assert sample["prefix_token_ids"] == [201, 202]
+
+
 def test_sampled_acceptance_default_temperature_is_on_policy():
     assert SampledAcceptanceConfig("http://unused").temperature == 1.0
 

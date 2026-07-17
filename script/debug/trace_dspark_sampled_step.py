@@ -581,7 +581,8 @@ def _install_sampling_trace(augmentor: Any, *, topk: int) -> dict[str, Any]:
                 f"top_logprobs={[float(x) for x in slot_info['top_logprobs']]}"
             )
 
-        prefix_token_ids = input_ids[0, : anchor_pos + 1].tolist()
+        prefix_start = self._document_prefix_start(document_ids, anchor_pos)
+        prefix_token_ids = input_ids[0, prefix_start : anchor_pos + 1].tolist()
         result = {
             "prefix_token_ids": prefix_token_ids,
             "sampled_target_token_ids": sampled_target_ids,
@@ -594,6 +595,7 @@ def _install_sampling_trace(augmentor: Any, *, topk: int) -> dict[str, Any]:
             {
                 "anchor_pos": anchor_pos,
                 "anchor_token": anchor_token_id,
+                "prefix_start": prefix_start,
                 "prefix_len": len(prefix_token_ids),
                 "sampled_target_ids": list(sampled_target_ids),
                 "sampled_draft_ids": list(sampled_draft_ids),
@@ -602,6 +604,8 @@ def _install_sampling_trace(augmentor: Any, *, topk: int) -> dict[str, Any]:
             }
         )
         print("TRACE draft_sampling.end")
+        print(f"  prefix_start={prefix_start}")
+        print(f"  prefix_len={len(prefix_token_ids)}")
         print(f"  sampled_draft_ids={sampled_draft_ids}")
         print(f"  sampled_target_ids={sampled_target_ids}")
         print(f"  sampling_qlogps={[float(x) for x in trace['draft_logprobs'].tolist()]}")
@@ -979,6 +983,67 @@ def _compare_gt_verifier_paths(
         )
 
 
+def _compare_sampled_verifier_paths(
+    *,
+    batch: dict[str, Any],
+    augmentor: Any,
+) -> None:
+    if "sampled_anchor_pos" not in batch or "sampled_target_ids" not in batch:
+        return
+
+    anchor_pos = int(batch["sampled_anchor_pos"][0].detach().cpu().item())
+    sampled_ids = batch["sampled_target_ids"][0].detach().cpu().tolist()
+    actual_logprobs = batch["sampled_target_logprobs"][0].detach().cpu().tolist()
+    full_prefix = batch["input_ids"][0, : anchor_pos + 1].detach().cpu().tolist()
+    doc_start, doc_end = _document_prefix_bounds(batch, anchor_pos)
+    doc_prefix = batch["input_ids"][0, doc_start:doc_end].detach().cpu().tolist()
+
+    print("TRACE sampled_verifier_prefix_compare.setup")
+    print(f"  anchor_pos={anchor_pos}")
+    print(f"  full_prefix_len={len(full_prefix)}")
+    print(f"  doc_start={doc_start}")
+    print(f"  doc_prefix_len={len(doc_prefix)}")
+    print(f"  packed_prefix_covered={doc_start > 0}")
+    print(f"  sampled_target_ids={sampled_ids}")
+    print(f"  actual_sampled_target_logprobs={actual_logprobs}")
+
+    full_vllm = _score_with_vllm(
+        augmentor=augmentor,
+        prefix_token_ids=full_prefix,
+        token_ids=sampled_ids,
+        label="sampled_full_prefix",
+    )
+    doc_vllm = _score_with_vllm(
+        augmentor=augmentor,
+        prefix_token_ids=doc_prefix,
+        token_ids=sampled_ids,
+        label="sampled_doc_prefix",
+    )
+
+    print("TRACE sampled_verifier_prefix_compare.summary")
+    if doc_start == 0:
+        print("  packed_prefix_status=not_covered_doc_start_is_0")
+    elif full_vllm is not None and doc_vllm is not None:
+        full_doc_max_diff = max(
+            abs(a - b) for a, b in zip(full_vllm, doc_vllm, strict=True)
+        )
+        print("  packed_prefix_status=covered_doc_start_gt_0")
+        print(f"  full_vs_doc_max_abs_diff={_fmt(full_doc_max_diff)}")
+    print("  pos,target_id,actual,full_prefix_vllm,diff_full,doc_prefix_vllm,diff_doc")
+    for i, actual in enumerate(actual_logprobs):
+        full = None if full_vllm is None else full_vllm[i]
+        doc = None if doc_vllm is None else doc_vllm[i]
+        print(
+            f"  {i + 1},"
+            f"{sampled_ids[i]},"
+            f"{_fmt(float(actual))},"
+            f"{'<err>' if full is None else _fmt(full)},"
+            f"{'<err>' if full is None else _fmt(full - float(actual))},"
+            f"{'<err>' if doc is None else _fmt(doc)},"
+            f"{'<err>' if doc is None else _fmt(doc - float(actual))}"
+        )
+
+
 def _print_metrics(raw: dict[str, float], normalized: dict[str, float], block_size: int) -> None:
     print("TRACE metrics.raw")
     for key in sorted(raw):
@@ -1200,6 +1265,10 @@ def trace_real_step(args: argparse.Namespace) -> None:
         _compare_gt_verifier_paths(
             args=args,
             model=model,
+            batch=gpu_batch,
+            augmentor=augmentor,
+        )
+        _compare_sampled_verifier_paths(
             batch=gpu_batch,
             augmentor=augmentor,
         )

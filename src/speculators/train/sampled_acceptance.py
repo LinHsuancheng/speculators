@@ -173,6 +173,15 @@ class SampledAcceptanceAugmentor:
             raise ValueError("No valid anchor position for sampled acceptance loss")
         return int(valid_positions[0].item())
 
+    @staticmethod
+    def _document_prefix_start(document_ids: torch.Tensor, anchor_pos: int) -> int:
+        anchor_doc = document_ids[0, anchor_pos]
+        same_doc = document_ids[0, : anchor_pos + 1] == anchor_doc
+        positions = torch.nonzero(same_doc, as_tuple=False).flatten()
+        if positions.numel() == 0:
+            return 0
+        return int(positions[0].item())
+
     def _sample_from_draft(
         self,
         model: DSparkDraftModel,
@@ -260,7 +269,8 @@ class SampledAcceptanceAugmentor:
             sampled_target_ids.append(target_token_id)
             draft_logprobs.append(log_probs[draft_token_id].to(logits.dtype))
 
-        prefix_token_ids = input_ids[0, : anchor_pos + 1].tolist()
+        doc_start = self._document_prefix_start(document_ids, anchor_pos)
+        prefix_token_ids = input_ids[0, doc_start : anchor_pos + 1].tolist()
         return {
             "prefix_token_ids": prefix_token_ids,
             "sampled_target_token_ids": sampled_target_ids,
