@@ -203,6 +203,23 @@ def compute_metrics(
     device = logits.device
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
+    # Always use the original loss (gamma decay + compound loss)
+    decay_fn = partial(dflash_loss_decay, gamma=gamma)
+    cat_weights = _resolve_cat_weights(
+        cat_mode, logits, targets, loss_mask, block_size
+    )
+    position_weights = cat_weights
+    loss, term_losses = compound_loss(
+        logits,
+        targets,
+        loss_mask,
+        pos_idx,
+        loss_config=loss_config,
+        decay_fn=decay_fn,
+        position_weights=position_weights,
+    )
+
+    # Compute sampled exact loss as auxiliary loss if sampled logprobs provided
     sampled_credit = None
     sampled_exact_loss = None
     if sampled_draft_logprobs is not None or sampled_target_logprobs is not None:
@@ -221,37 +238,7 @@ def compute_metrics(
             sampled_target_logprobs,
             credit=sampled_credit,
         )
-        position_weights = _sampled_credit_position_weights(
-            sampled_credit, loss_mask, block_size
-        )
-        decay_fn = None
-        cat_weights = None
-        loss = loss_function(
-            logits,
-            targets,
-            loss_mask,
-            pos_idx,
-            loss_fn=ce_loss,
-            decay_fn=None,
-            position_weights=position_weights,
-        )
-        term_losses = {"ce_loss": loss.detach()}
-    else:
-        decay_fn = partial(dflash_loss_decay, gamma=gamma)
-        cat_weights = _resolve_cat_weights(
-            cat_mode, logits, targets, loss_mask, block_size
-        )
-        position_weights = cat_weights
-        loss, term_losses = compound_loss(
-            logits,
-            targets,
-            loss_mask,
-            pos_idx,
-            loss_config=loss_config,
-            decay_fn=decay_fn,
-            position_weights=position_weights,
-        )
-    if sampled_exact_loss is not None:
+        # Add as auxiliary loss
         loss = loss + sampled_acceptance_loss_alpha * sampled_exact_loss
 
     # Analytical per-position acceptance rate = distributional overlap.
@@ -311,106 +298,64 @@ def compute_metrics(
         metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
         metrics["sampled_acceptance_loss_total"] = ones
         with torch.no_grad():
-            # Credit statistics
-            metrics["sampled_credit_mean_sum"] = sampled_credit.detach().sum()
-            metrics["sampled_credit_mean_total"] = torch.tensor(
-                sampled_credit.numel(), device=device, dtype=sampled_credit.dtype
-            )
-            metrics["sampled_credit_min_sum"] = sampled_credit.detach().min()
-            metrics["sampled_credit_min_total"] = ones
-            metrics["sampled_credit_max_sum"] = sampled_credit.detach().max()
-            metrics["sampled_credit_max_total"] = ones
-            metrics["sampled_credit_std_sum"] = sampled_credit.detach().std()
-            metrics["sampled_credit_std_total"] = ones
-
-            # Alpha (acceptance ratio) statistics
+            # Compute per-position statistics
             log_alpha = torch.minimum(
                 torch.zeros_like(sampled_draft_logprobs.detach()),
                 sampled_target_logprobs.detach() - sampled_draft_logprobs.detach(),
             )
             sampled_alpha = torch.exp(log_alpha)
-            metrics["sampled_alpha_mean_sum"] = sampled_alpha.sum()
-            metrics["sampled_alpha_mean_total"] = torch.tensor(
-                sampled_alpha.numel(), device=device, dtype=sampled_alpha.dtype
-            )
-            metrics["sampled_alpha_min_sum"] = sampled_alpha.min()
-            metrics["sampled_alpha_min_total"] = ones
-            metrics["sampled_alpha_max_sum"] = sampled_alpha.max()
-            metrics["sampled_alpha_max_total"] = ones
-
-            # Draft log-probabilities (log q_t(Y_t))
-            draft_logp_detached = sampled_draft_logprobs.detach()
-            metrics["sampled_draft_logp_mean_sum"] = draft_logp_detached.sum()
-            metrics["sampled_draft_logp_mean_total"] = torch.tensor(
-                draft_logp_detached.numel(), device=device, dtype=draft_logp_detached.dtype
-            )
-            metrics["sampled_draft_logp_min_sum"] = draft_logp_detached.min()
-            metrics["sampled_draft_logp_min_total"] = ones
-            metrics["sampled_draft_logp_max_sum"] = draft_logp_detached.max()
-            metrics["sampled_draft_logp_max_total"] = ones
-
-            # Target log-probabilities (log p_t(Y_t))
-            target_logp_detached = sampled_target_logprobs.detach()
-            metrics["sampled_target_logp_mean_sum"] = target_logp_detached.sum()
-            metrics["sampled_target_logp_mean_total"] = torch.tensor(
-                target_logp_detached.numel(), device=device, dtype=target_logp_detached.dtype
-            )
-            metrics["sampled_target_logp_min_sum"] = target_logp_detached.min()
-            metrics["sampled_target_logp_min_total"] = ones
-            metrics["sampled_target_logp_max_sum"] = target_logp_detached.max()
-            metrics["sampled_target_logp_max_total"] = ones
-
-            # Log probability ratio: log(p/q) = log_p - log_q
-            logp_ratio = target_logp_detached - draft_logp_detached
-            metrics["sampled_logp_ratio_mean_sum"] = logp_ratio.sum()
-            metrics["sampled_logp_ratio_mean_total"] = torch.tensor(
-                logp_ratio.numel(), device=device, dtype=logp_ratio.dtype
-            )
-            metrics["sampled_logp_ratio_min_sum"] = logp_ratio.min()
-            metrics["sampled_logp_ratio_min_total"] = ones
-            metrics["sampled_logp_ratio_max_sum"] = logp_ratio.max()
-            metrics["sampled_logp_ratio_max_total"] = ones
-
-            # Undercovered tokens (q < p, should get credit)
-            undercovered = (draft_logp_detached < target_logp_detached).float()
-            metrics["sampled_undercovered_ratio_sum"] = undercovered.sum()
-            metrics["sampled_undercovered_ratio_total"] = torch.tensor(
-                undercovered.numel(), device=device, dtype=undercovered.dtype
-            )
-
-            # Overcovered tokens (q >= p, should not get credit)
-            overcovered = (draft_logp_detached >= target_logp_detached).float()
-            metrics["sampled_overcovered_ratio_sum"] = overcovered.sum()
-            metrics["sampled_overcovered_ratio_total"] = torch.tensor(
-                overcovered.numel(), device=device, dtype=overcovered.dtype
-            )
-
-            # Survival probability statistics (per-block cumulative acceptance)
             log_survival = torch.cumsum(log_alpha, dim=-1)
             survival = torch.exp(log_survival)
-            metrics["sampled_survival_mean_sum"] = survival.sum()
-            metrics["sampled_survival_mean_total"] = torch.tensor(
-                survival.numel(), device=device, dtype=survival.dtype
-            )
-            # Final survival probability per block (last position)
-            final_survival = survival[:, -1]
-            metrics["sampled_final_survival_mean_sum"] = final_survival.sum()
-            metrics["sampled_final_survival_mean_total"] = torch.tensor(
-                final_survival.numel(), device=device, dtype=final_survival.dtype
-            )
-
-            # Estimated acceptance length per block: sum_k S_k
             continuation = torch.flip(
                 torch.cumsum(torch.flip(survival, dims=[-1]), dim=-1),
                 dims=[-1],
             )
-            estimated_accept_len_per_block = continuation[:, 0]  # sum over all k
-            metrics["sampled_estimated_accept_len_sum"] = estimated_accept_len_per_block.sum()
-            metrics["sampled_estimated_accept_len_total"] = torch.tensor(
-                estimated_accept_len_per_block.numel(),
-                device=device,
-                dtype=estimated_accept_len_per_block.dtype
-            )
+            undercovered = (sampled_draft_logprobs.detach() < sampled_target_logprobs.detach()).float()
+
+            # Average across all blocks, per position k
+            # Shape: [num_blocks, K] -> [K] via mean over blocks
+            K = sampled_draft_logprobs.shape[-1]
+
+            for k in range(K):
+                pos_idx = k + 1  # Position 1-indexed for logging (position 0 is anchor)
+
+                # Draft log-prob at position k
+                metrics[f"sampled_pos{pos_idx}_draft_logp_sum"] = sampled_draft_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_idx}_draft_logp_total"] = ones
+
+                # Target log-prob at position k
+                metrics[f"sampled_pos{pos_idx}_target_logp_sum"] = sampled_target_logprobs[:, k].mean()
+                metrics[f"sampled_pos{pos_idx}_target_logp_total"] = ones
+
+                # Alpha (acceptance ratio) at position k
+                metrics[f"sampled_pos{pos_idx}_alpha_sum"] = sampled_alpha[:, k].mean()
+                metrics[f"sampled_pos{pos_idx}_alpha_total"] = ones
+
+                # Survival probability S_k
+                metrics[f"sampled_pos{pos_idx}_survival_sum"] = survival[:, k].mean()
+                metrics[f"sampled_pos{pos_idx}_survival_total"] = ones
+
+                # Credit at position k
+                metrics[f"sampled_pos{pos_idx}_credit_sum"] = sampled_credit[:, k].mean()
+                metrics[f"sampled_pos{pos_idx}_credit_total"] = ones
+
+                # Undercovered indicator at position k
+                metrics[f"sampled_pos{pos_idx}_undercovered_sum"] = undercovered[:, k].mean()
+                metrics[f"sampled_pos{pos_idx}_undercovered_total"] = ones
+
+                # Log ratio: log(p/q)
+                logp_ratio = sampled_target_logprobs[:, k] - sampled_draft_logprobs[:, k]
+                metrics[f"sampled_pos{pos_idx}_logp_ratio_sum"] = logp_ratio.mean()
+                metrics[f"sampled_pos{pos_idx}_logp_ratio_total"] = ones
+
+            # Also keep some aggregate metrics for overview
+            estimated_accept_len_per_block = continuation[:, 0]
+            metrics["sampled_estimated_accept_len_sum"] = estimated_accept_len_per_block.mean()
+            metrics["sampled_estimated_accept_len_total"] = ones
+
+            # First position is most critical for diagnosis
+            metrics["sampled_first_alpha_sum"] = sampled_alpha[:, 0].mean()
+            metrics["sampled_first_alpha_total"] = ones
 
     if cat_weights is not None:
         with torch.no_grad():
