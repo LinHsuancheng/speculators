@@ -84,11 +84,15 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
         cat_mode = kwargs.get("cat_mode", "none")
+        sampled_acceptance_loss_alpha = kwargs.get(
+            "sampled_acceptance_loss_alpha", 1.0
+        )
         shared = {
             "loss_config": loss_config,
             "gamma": gamma,
             "confidence_head_alpha": confidence_head_alpha,
             "cat_mode": cat_mode,
+            "sampled_acceptance_loss_alpha": sampled_acceptance_loss_alpha,
         }
         return dict(shared), dict(shared)
 
@@ -105,6 +109,9 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         confidence_head_alpha: float = 1.0,
         cat_mode: str = "none",
+        sampled_draft_logprobs: torch.Tensor | None = None,
+        sampled_target_logprobs: torch.Tensor | None = None,
+        sampled_acceptance_loss_alpha: float = 1.0,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -167,6 +174,9 @@ class DSparkDraftModel(DFlashDraftModel):
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
             cat_mode=cat_mode,  # type: ignore[arg-type]
+            sampled_draft_logprobs=sampled_draft_logprobs,
+            sampled_target_logprobs=sampled_target_logprobs,
+            sampled_acceptance_loss_alpha=sampled_acceptance_loss_alpha,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
         return draft_tokens, loss, metrics
