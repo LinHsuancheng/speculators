@@ -294,6 +294,8 @@ def compute_metrics(
         ones = torch.ones((), device=device)
         metrics["sampled_acceptance_loss_sum"] = sampled_exact_loss.detach().clone()
         metrics["sampled_acceptance_loss_total"] = ones
+        metrics["total_loss_sum"] = loss.detach().clone()
+        metrics["total_loss_total"] = ones
 
         # Log per-position metrics (for debugging and monitoring)
         with torch.no_grad():

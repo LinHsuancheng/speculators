@@ -590,18 +590,33 @@ def _score_with_vllm(
     return out
 
 
+def _target_to_draft_gather_ids(model: Any, target_ids: Any, device: Any) -> tuple[Any, Any]:
+    import torch
+
+    if model.t2d is None:
+        return target_ids, torch.ones_like(target_ids, dtype=torch.bool)
+
+    in_draft_vocab = model.t2d[target_ids.to(model.t2d.device)].to(device)
+    target_to_draft_index = (
+        torch.cumsum(model.t2d.to(device=device, dtype=torch.long), dim=0) - 1
+    )
+    return target_to_draft_index[target_ids], in_draft_vocab.bool()
+
+
 def _local_verifier_gt_logprobs(
     *,
     model: Any,
     batch: dict[str, Any],
     token_positions: list[int],
+    shift: int = -1,
 ) -> list[float]:
     import torch
 
     device = batch["input_ids"].device
-    # verifier_logits[:, t] predicts input_ids[:, t + 1].
+    # For normal causal hidden states, shift=-1 means logits[:, pos-1] predict
+    # input_ids[:, pos]. Other shifts are printed as a debugging sweep.
     logit_positions = torch.tensor(
-        [pos - 1 for pos in token_positions],
+        [pos + shift for pos in token_positions],
         dtype=torch.long,
         device=device,
     )
@@ -612,20 +627,12 @@ def _local_verifier_gt_logprobs(
         target_ids = batch["input_ids"][0, token_positions].to(
             device=device, dtype=torch.long
         )
-        if model.t2d is not None:
-            in_draft_vocab = model.t2d[target_ids.to(model.t2d.device)].to(device)
-            if not bool(in_draft_vocab.all().item()):
-                missing = target_ids[~in_draft_vocab.bool()].detach().cpu().tolist()
-                print(f"TRACE gt_verifier_compare.local_missing_from_draft_vocab={missing}")
-            # t2d is a boolean mask. Convert target ids to their ordinal in the
-            # pruned draft vocab by cumulative rank among selected target ids.
-            target_to_draft_index = (
-                torch.cumsum(model.t2d.to(device=device, dtype=torch.long), dim=0) - 1
-            )
-            gather_ids = target_to_draft_index[target_ids]
-        else:
-            in_draft_vocab = torch.ones_like(target_ids, dtype=torch.bool)
-            gather_ids = target_ids
+        gather_ids, in_draft_vocab = _target_to_draft_gather_ids(
+            model, target_ids, device
+        )
+        if not bool(in_draft_vocab.all().item()):
+            missing = target_ids[~in_draft_vocab].detach().cpu().tolist()
+            print(f"TRACE gt_verifier_compare.local_missing_from_draft_vocab={missing}")
         logprobs = torch.log_softmax(
             verifier_logits[0, logit_positions].float(),
             dim=-1,
@@ -638,6 +645,55 @@ def _local_verifier_gt_logprobs(
             torch.full_like(gathered, float("nan")),
         )
     return [float(x) for x in gathered.detach().cpu().tolist()]
+
+
+def _print_local_verifier_slot_diagnostics(
+    *,
+    model: Any,
+    batch: dict[str, Any],
+    anchor_pos: int,
+    gt_positions: list[int],
+    gt_ids: list[int],
+    vllm_logprobs: list[float] | None,
+) -> None:
+    import torch
+
+    device = batch["input_ids"].device
+    with torch.no_grad():
+        verifier_logits = model.verifier_lm_head(
+            model.verifier_norm(batch["verifier_last_hidden_states"])
+        ).float()
+        logits = verifier_logits[0, anchor_pos : anchor_pos + len(gt_positions)]
+        diff_from_slot0 = (logits - logits[:1]).abs().amax(dim=-1)
+
+    print("TRACE gt_verifier_compare.local_slot_diffs")
+    print("  slot,logit_pos,max_abs_diff_from_slot1")
+    for i, diff in enumerate(diff_from_slot0.detach().cpu().tolist()):
+        print(f"  {i + 1},{anchor_pos + i},{_fmt(float(diff))}")
+
+    print("TRACE gt_verifier_compare.local_shift_sweep")
+    print("  shift,mean_abs_diff_to_full_vllm,logprobs")
+    for shift in (-2, -1, 0, 1):
+        valid = all(0 <= pos + shift < batch["input_ids"].shape[1] for pos in gt_positions)
+        if not valid:
+            print(f"  {shift},<invalid>,[]")
+            continue
+        vals = _local_verifier_gt_logprobs(
+            model=model,
+            batch=batch,
+            token_positions=gt_positions,
+            shift=shift,
+        )
+        if vllm_logprobs is None:
+            mean_diff = "<no-vllm>"
+        else:
+            finite = [
+                abs(a - b)
+                for a, b in zip(vals, vllm_logprobs, strict=True)
+                if not math.isnan(a)
+            ]
+            mean_diff = _fmt(sum(finite) / len(finite)) if finite else "nan"
+        print(f"  {shift},{mean_diff},{[_fmt(x) for x in vals]}")
 
 
 def _print_vocab_mapping_invariants(model: Any, sampled_draft_ids: list[int]) -> None:
@@ -784,6 +840,14 @@ def _compare_gt_verifier_paths(
         prefix_token_ids=full_prefix,
         token_ids=gt_ids,
         label="gt_full_prefix",
+    )
+    _print_local_verifier_slot_diagnostics(
+        model=model,
+        batch=batch,
+        anchor_pos=anchor_pos,
+        gt_positions=gt_positions,
+        gt_ids=gt_ids,
+        vllm_logprobs=full_vllm,
     )
     doc_vllm = _score_with_vllm(
         augmentor=augmentor,
@@ -1039,6 +1103,20 @@ def trace_real_step(args: argparse.Namespace) -> None:
         raw = {k: _scalar(v) for k, v in metrics.items()}
         normalized = normalize_counted_metrics(dict(raw), world_size=1)
         _print_metrics(raw, normalized, int(args.block_size))
+        if "loss" in normalized:
+            sampled_loss = normalized.get("sampled_acceptance_loss", 0.0)
+            total_logged = normalized.get("total_loss")
+            print("TRACE loss_decomposition")
+            print(f"  base_train_loss={_fmt(normalized['loss'])}")
+            print(f"  sampled_acceptance_loss={_fmt(sampled_loss)}")
+            print(f"  sampled_alpha={_fmt(args.sampled_acceptance_loss_alpha)}")
+            print(
+                "  base_plus_weighted_sampled="
+                f"{_fmt(normalized['loss'] + args.sampled_acceptance_loss_alpha * sampled_loss)}"
+            )
+            print(f"  loss_for_backward={_fmt(_scalar(loss))}")
+            if total_logged is not None:
+                print(f"  train/total_loss={_fmt(total_logged)}")
         _compare_sampling_and_replay(sample_trace, model_trace)
 
         if not args.skip_backward:

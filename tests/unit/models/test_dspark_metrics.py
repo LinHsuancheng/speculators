@@ -183,6 +183,31 @@ class TestComputeMetrics:
         )
         assert normalized["sampled_pos2_alpha"] == pytest.approx(0.787, rel=1e-2)
 
+    def test_total_loss_logs_sampled_auxiliary_addition(self):
+        logits = _ids_to_logits(torch.tensor([[0, 1, 2]]), 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[0, 1, 1]], dtype=torch.float32)
+        sampled_draft_logprobs = torch.tensor([[-0.5, -2.0]])
+        sampled_target_logprobs = torch.tensor([[-0.25, -4.0]])
+
+        loss, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=3,
+            loss_config=_DEFAULT_LOSS,
+            sampled_draft_logprobs=sampled_draft_logprobs,
+            sampled_target_logprobs=sampled_target_logprobs,
+        )
+
+        assert "total_loss_sum" in metrics
+        assert torch.isclose(loss.detach(), metrics["total_loss_sum"])
+        assert torch.isclose(
+            metrics["total_loss_sum"],
+            metrics["loss_sum"] + metrics["sampled_acceptance_loss_sum"],
+        )
+
     def test_metric_keys_present(self):
         ids = torch.tensor([[0, 1, 0, 2]])
         logits = _ids_to_logits(ids, 8)
