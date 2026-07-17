@@ -377,12 +377,38 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         return [mask] * self.num_draft_layers
 
     @torch.compiler.disable
-    def _build_attention_mask(self, loss_mask, document_ids, device):
+    def _build_attention_mask(
+        self,
+        loss_mask,
+        document_ids,
+        device,
+        anchor_positions: torch.Tensor | None = None,
+        anchor_valid: torch.Tensor | None = None,
+    ):
         total_seq_len = loss_mask.shape[1]
 
-        anchor_positions, anchor_valid = select_anchors(
-            loss_mask, self.config.max_anchors, self.block_size
-        )
+        if anchor_positions is None:
+            anchor_positions, anchor_valid = select_anchors(
+                loss_mask, self.config.max_anchors, self.block_size
+            )
+        else:
+            anchor_positions = anchor_positions.to(
+                device=device, dtype=torch.long
+            ).view(-1)
+            if anchor_positions.numel() != self.config.max_anchors:
+                raise ValueError(
+                    "anchor_positions must match config.max_anchors, got "
+                    f"{anchor_positions.numel()} vs {self.config.max_anchors}"
+                )
+            if anchor_valid is None:
+                anchor_valid = torch.ones_like(anchor_positions, dtype=torch.bool)
+            else:
+                anchor_valid = anchor_valid.to(device=device, dtype=torch.bool).view(-1)
+                if anchor_valid.shape != anchor_positions.shape:
+                    raise ValueError(
+                        f"anchor_valid shape {anchor_valid.shape} does not match "
+                        f"anchor_positions shape {anchor_positions.shape}"
+                    )
 
         full_attn_mask = None
         if self.uses_full_attn:
@@ -417,12 +443,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         position_ids: torch.Tensor | None = None,
         **kwargs,
     ):
-        """Public wrapper around _backbone_forward for FSDP compatibility.
+        """Public wrapper around _backbone_forward for FSDP registration.
 
-        This method should be called instead of _backbone_forward when direct
-        access to backbone outputs is needed (e.g., for sampling). By going
-        through a public method, FSDP hooks are triggered, ensuring DTensor
-        parameters are properly handled in distributed training.
+        This method is registered via ``register_fsdp_forward_method`` after
+        ``fully_shard(model)``. Call it instead of ``_backbone_forward`` when
+        direct access to backbone outputs is needed, e.g. sampled replay.
 
         Returns same as _backbone_forward: (hidden, logits, targets,
         aligned_loss_mask, anchored_block_indices).
@@ -445,6 +470,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        anchor_positions: torch.Tensor | None = None,
+        anchor_valid: torch.Tensor | None = None,
         **kwargs,
     ):
         """Run the anchored-block draft transformer up to the draft logits.
@@ -463,7 +490,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ).unsqueeze(0)
 
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, document_ids, device)
+            self._build_attention_mask(
+                loss_mask,
+                document_ids,
+                device,
+                anchor_positions=anchor_positions,
+                anchor_valid=anchor_valid,
+            )
         )
 
         mask_tokens_size = num_anchors * self.block_size

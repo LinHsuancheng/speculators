@@ -14,21 +14,10 @@ from speculators.data_generation.vllm_client import (
     score_sampled_tokens,
 )
 from speculators.models.attention import create_float_mask
+from speculators.models.dflash.utils import select_anchors
 from speculators.models.dspark.core import DSparkDraftModel
 
 logger = logging.getLogger("speculators")
-
-
-def _has_dtensor_params(model: torch.nn.Module) -> bool:
-    """Detect whether the model is wrapped with FSDP2 (fully_shard).
-
-    FSDP2 converts parameters to DTensor but does NOT change the model type,
-    so isinstance(model, FSDP) fails. Detect by checking for DTensor params.
-    """
-    for param in model.parameters():
-        if isinstance(param, DTensor):
-            return True
-    return False
 
 
 @dataclass(frozen=True)
@@ -38,7 +27,7 @@ class SampledAcceptanceConfig:
     prompt_logprobs: int = 1
     request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT
     hidden_states_file_timeout: float = 30.0
-    temperature: float = 0.0
+    temperature: float = 1.0
     max_anchors: int = 1
 
 
@@ -76,7 +65,13 @@ class SampledAcceptanceAugmentor:
             )
 
         self._ensure_sdpa_mask(draft_model)
-        if not self._has_valid_anchor(batch["loss_mask"], int(draft_model.block_size)):
+        block_size = int(draft_model.block_size)
+        anchor_positions, anchor_valid = select_anchors(
+            batch["loss_mask"],
+            int(draft_model.config.max_anchors),
+            block_size,
+        )
+        if not bool(anchor_valid.any()):
             self.skipped_no_anchor += 1
             if self.skipped_no_anchor <= 5:
                 logger.warning(
@@ -84,10 +79,15 @@ class SampledAcceptanceAugmentor:
                     f"position (skipped {self.skipped_no_anchor} so far)"
                 )
             return batch
+        batch["anchor_positions"] = anchor_positions
+        batch["anchor_valid"] = anchor_valid
+        valid_anchor_indices = torch.nonzero(anchor_valid, as_tuple=False).flatten()
+        sampled_anchor_index = int(valid_anchor_indices[0].item())
+        anchor_pos = int(anchor_positions[sampled_anchor_index].item())
 
         # Phase 1: No-grad sampling (only discrete token IDs)
         with torch.no_grad():
-            sample = self._sample_from_draft(draft_model, batch)
+            sample = self._sample_from_draft(draft_model, batch, anchor_pos=anchor_pos)
 
         # Extract and detach discrete results
         sampled_target_ids = [int(x) for x in sample["sampled_target_token_ids"]]
@@ -111,16 +111,19 @@ class SampledAcceptanceAugmentor:
         # sampled_target_ids are in TARGET vocab (used for vLLM verify).
         device = batch["input_ids"].device
         batch["sampled_draft_ids"] = torch.tensor(
-            sampled_draft_ids, dtype=torch.long, device=device
+            [sampled_draft_ids], dtype=torch.long, device=device
         )
         batch["sampled_target_ids"] = torch.tensor(
-            sampled_target_ids, dtype=torch.long, device=device
+            [sampled_target_ids], dtype=torch.long, device=device
         )
         batch["sampled_target_logprobs"] = torch.tensor(
-            scored["token_logprobs"], dtype=torch.float32, device=device
+            [scored["token_logprobs"]], dtype=torch.float32, device=device
         )
         batch["sampled_anchor_pos"] = torch.tensor(
             [anchor_pos], dtype=torch.long, device=device
+        )
+        batch["sampled_anchor_index"] = torch.tensor(
+            [sampled_anchor_index], dtype=torch.long, device=device
         )
         return batch
 
@@ -163,6 +166,7 @@ class SampledAcceptanceAugmentor:
         self,
         model: DSparkDraftModel,
         batch: dict[str, Any],
+        anchor_pos: int | None = None,
     ) -> dict[str, Any]:
         device = next(model.parameters()).device
         input_ids = batch["input_ids"].to(device)
@@ -175,7 +179,8 @@ class SampledAcceptanceAugmentor:
             position_ids = position_ids.to(device)
 
         block_size = int(model.block_size)
-        anchor_pos = self._sample_anchor_position(loss_mask, block_size)
+        if anchor_pos is None:
+            anchor_pos = self._sample_anchor_position(loss_mask, block_size)
         sampled_len = block_size - 1
         anchor_loss_mask = torch.zeros_like(loss_mask, dtype=torch.bool)
         anchor_loss_mask[:, anchor_pos] = True
@@ -184,12 +189,9 @@ class SampledAcceptanceAugmentor:
 
         old_max_anchors = model.config.max_anchors
         model.config.max_anchors = self.config.max_anchors
-
-        # Use public get_backbone_outputs method instead of _backbone_forward.
-        # This ensures FSDP hooks are triggered in distributed training,
-        # properly handling DTensor parameters. Direct calls to private
-        # _backbone_forward bypass FSDP's __call__ mechanism.
-        with torch.no_grad():
+        # Registered as an FSDP forward method after fully_shard(); direct
+        # _backbone_forward calls bypass FSDP unshard/reshard hooks.
+        try:
             hidden, logits, _, _, _ = model.get_backbone_outputs(
                 hidden_states,
                 input_ids,
@@ -200,26 +202,26 @@ class SampledAcceptanceAugmentor:
                 anchor_positions=anchor_positions,
                 anchor_valid=anchor_valid,
             )
-
-        model.config.max_anchors = old_max_anchors
+        finally:
+            model.config.max_anchors = old_max_anchors
 
         hidden_blocks = hidden.view(1, block_size, -1)
         logits_blocks = logits.view(1, block_size, -1)
-        base_prev_token_ids = torch.full(
-            (1, block_size),
-            int(input_ids[0, anchor_pos].item()),
-            dtype=torch.long,
-            device=device,
-        )
+        anchor_token_id = int(input_ids[0, anchor_pos].item())
 
         sampled_target_ids: list[int] = []
         sampled_draft_ids: list[int] = []
         draft_logprobs: list[torch.Tensor] = []
         for slot in range(1, sampled_len + 1):
-            prev_token_ids = base_prev_token_ids.clone()
+            prev_token_ids = torch.full(
+                (1, block_size),
+                anchor_token_id,
+                dtype=torch.long,
+                device=device,
+            )
             if sampled_target_ids:
-                prev_token_ids[0, 1 : 1 + len(sampled_target_ids)] = torch.tensor(
-                    sampled_target_ids,
+                prev_token_ids[0, 2 : 2 + len(sampled_target_ids)] = torch.tensor(
+                    sampled_target_ids[: block_size - 2],
                     dtype=torch.long,
                     device=device,
                 )
