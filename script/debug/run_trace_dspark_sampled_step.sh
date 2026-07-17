@@ -13,6 +13,8 @@ DATA_PATH="${DATA_PATH:-/data/open_perfectblend_qwen3_4b_100k}"
 HIDDEN_STATES_PATH="${HIDDEN_STATES_PATH:-}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:8000/v1}"
 DEVICE="${DEVICE:-npu:0}"
+FROM_PRETRAINED="${FROM_PRETRAINED:-}"
+DRAFT_CONFIG="${DRAFT_CONFIG:-}"
 
 TOTAL_SEQ_LEN="${TOTAL_SEQ_LEN:-3072}"
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
@@ -85,6 +87,14 @@ args=(
   --print-anchor-limit "${PRINT_ANCHOR_LIMIT}"
   --lr "${LR}"
 )
+
+if [[ -n "${FROM_PRETRAINED}" ]]; then
+  args+=(--from-pretrained "${FROM_PRETRAINED}")
+fi
+
+if [[ -n "${DRAFT_CONFIG}" ]]; then
+  args+=(--draft-config "${DRAFT_CONFIG}")
+fi
 
 if [[ -n "${HIDDEN_STATES_PATH}" ]]; then
   args+=(--hidden-states-path "${HIDDEN_STATES_PATH}")

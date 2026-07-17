@@ -63,6 +63,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-states-path", default=None)
     parser.add_argument("--vllm-endpoint", default="http://localhost:8000/v1")
     parser.add_argument("--save-path", default="/tmp/dspark_trace_checkpoints")
+    parser.add_argument(
+        "--from-pretrained",
+        default="",
+        help="Load a saved Speculators checkpoint instead of random draft weights.",
+    )
+    parser.add_argument(
+        "--draft-config",
+        default="",
+        help="Optional decoder config path, matching scripts/train.py.",
+    )
     parser.add_argument("--total-seq-len", type=int, default=3072)
     parser.add_argument("--block-size", type=int, default=8)
     parser.add_argument("--max-anchors", type=int, default=512)
@@ -99,8 +109,6 @@ def _parser() -> argparse.ArgumentParser:
 def _make_train_args(args: argparse.Namespace) -> argparse.Namespace:
     defaults = {
         "speculator_type": "dspark",
-        "from_pretrained": "",
-        "draft_config": "",
         "draft_arch": "qwen3",
         "draft_hidden_act": None,
         "sliding_window": 2048,
@@ -606,6 +614,8 @@ def trace_real_step(args: argparse.Namespace) -> None:
     print(f"  hidden_states_dtype={hidden_states_dtype}")
     print(f"  vllm_endpoint={args.vllm_endpoint}")
     print(f"  verifier_name_or_path={args.verifier_name_or_path}")
+    print(f"  from_pretrained={args.from_pretrained or '<random/init from args>'}")
+    print(f"  draft_config={args.draft_config or '<none>'}")
 
     registry = SpeculatorModel.registry
     if registry is None:
