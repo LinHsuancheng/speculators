@@ -8,7 +8,7 @@ from typing import Any
 
 import openai
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed._tensor import DTensor
 
 from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
@@ -18,6 +18,18 @@ from speculators.models.attention import create_float_mask
 from speculators.models.dspark.core import DSparkDraftModel
 
 logger = logging.getLogger("speculators")
+
+
+def _has_dtensor_params(model: torch.nn.Module) -> bool:
+    """Detect whether the model is wrapped with FSDP2 (fully_shard).
+
+    FSDP2 converts parameters to DTensor but does NOT change the model type,
+    so isinstance(model, FSDP) fails. Detect by checking for DTensor params.
+    """
+    for param in model.parameters():
+        if isinstance(param, DTensor):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -146,18 +158,23 @@ class SampledAcceptanceAugmentor:
         old_max_anchors = model.config.max_anchors
         model.config.max_anchors = self.config.max_anchors
 
-        # FSDP-safe backbone forward call
-        # In distributed training with FSDP, parameters are sharded as DTensor.
-        # Direct calls to _backbone_forward bypass FSDP hooks, causing DTensor errors.
-        # Use summon_full_params to temporarily all-gather parameters.
+        # FSDP2-safe backbone forward call
+        # In distributed training with FSDP2 (fully_shard), parameters are sharded
+        # as DTensor. Direct calls to _backbone_forward bypass the FSDP hooks that
+        # normally all-gather params, causing "mixed Tensor and DTensor" errors.
+        # Note: fully_shard does NOT change model type, so isinstance(model, FSDP)
+        # fails — detect DTensor params instead and use _use_unsharded_views.
         with torch.no_grad():
-            # Check if model is wrapped with FSDP
-            # Note: model might be the raw model or FSDP-wrapped
-            is_fsdp = isinstance(model, FSDP)
+            is_fsdp2 = _has_dtensor_params(model)
 
-            if is_fsdp:
-                # Temporarily all-gather FSDP parameters
-                with FSDP.summon_full_params(model):
+            if is_fsdp2:
+                if not hasattr(model, "_use_unsharded_views"):
+                    raise RuntimeError(
+                        "Model has FSDP2 DTensor parameters but "
+                        "'_use_unsharded_views' is unavailable. Upgrade PyTorch, "
+                        "or disable with --sampled-acceptance-loss-alpha=0."
+                    )
+                with model._use_unsharded_views(recurse=True):  # noqa: SLF001
                     hidden, logits, _, _, _ = model._backbone_forward(
                         hidden_states,
                         input_ids,
