@@ -235,7 +235,7 @@ class TestTfEalLoss:
 
     def test_perfect_overlap_tau_equals_block(self):
         # block_size=4 -> 3 draft slots. Perfect overlap => every a_i=1 =>
-        # R_TF=3, tau=4, and the TF-EAL loss term equals -3.
+        # R_TF=3, tau=4, and the normalized loss 1 - R_TF/K = 1 - 3/3 = 0.
         ids = torch.tensor([[0, 1, 2, 3]])
         logits = _ids_to_logits(ids, 8)
         targets = logits.clone()
@@ -251,7 +251,8 @@ class TestTfEalLoss:
         )
         tau = metrics["tf_eal_tau_sum"] / metrics["tf_eal_tau_total"]
         assert abs(float(tau) - 4.0) < 1e-3
-        assert abs(float(metrics["tf_eal_loss_sum"]) - (-3.0)) < 1e-3
+        # Normalized loss is in [0, 1]; perfect overlap -> 0.
+        assert abs(float(metrics["tf_eal_loss_sum"]) - 0.0) < 1e-3
 
     def test_credit_decreases_with_position(self):
         # Continuation credit C_t = sum_{k>=t} S_k gates later positions, so it

@@ -164,7 +164,11 @@ def tf_eal_loss(
     = 1 - d_TV(p_i, q_i)`` (the same quantity as ``tv_loss``). Chaining these
     over a speculative block gives the cumulative survival ``S_k = Π_{i=1}^k a_i``
     and the expected accepted length surrogate ``R_TF = Σ_{k=1}^K S_k``. We
-    maximize ``R_TF`` directly, i.e. minimize ``L = -R_TF``.
+    maximize ``R_TF`` directly. To keep the loss on the same ``[0, 1]`` scale as
+    ``tv_loss`` (so it composes with TV/CE without dwarfing them), we normalize
+    by the per-block draft-slot count and minimize ``L = 1 - R_TF / K``. Both
+    endpoints mirror TV: ``R_TF = K`` (perfect acceptance) → ``L = 0``, and
+    ``R_TF = 0`` → ``L = 1``.
 
     Unlike the on-policy sampled exact loss, this needs no draft-sampled tokens
     and no per-position sampled-token indicator: it is computed directly on the
@@ -189,7 +193,8 @@ def tf_eal_loss(
 
     Returns:
         Tuple of ``(loss, aux)``:
-        * ``loss``: scalar ``-R_TF`` averaged over valid blocks.
+        * ``loss``: scalar ``1 - R_TF / K`` averaged over valid blocks, in
+          ``[0, 1]`` (same scale as ``tv_loss``).
         * ``aux``: dict of detached logging tensors — ``survival`` and
           ``continuation`` (per-position credit ``Σ_{k≥t} S_k``), both shaped
           ``[num_blocks, block_size - 1]``, plus per-block ``tau`` (``R_TF + 1``)
@@ -219,9 +224,17 @@ def tf_eal_loss(
     survival_masked = survival * draft_mask
     r_tf = survival_masked.sum(dim=-1)  # [num_blocks]
 
-    block_valid = (draft_mask.sum(dim=-1) > 0).to(accept.dtype)  # [num_blocks]
+    # Normalize R_TF by the per-block draft-slot count into [0, 1] and map to a
+    # minimization loss ``1 - R_TF/K_b`` — the same [0, 1] scale and "1 - accept"
+    # form as tv_loss, so it composes with TV/CE at a comparable magnitude. The
+    # 1/K_b factor is a fixed constant (not a random per-sample denominator), so
+    # this only rescales the gradient without introducing bias (trials.md §18.4).
+    slots_per_block = draft_mask.sum(dim=-1)  # K_b, [num_blocks]
+    block_valid = (slots_per_block > 0).to(accept.dtype)  # [num_blocks]
+    r_tf_norm = r_tf / slots_per_block.clamp_min(1.0)  # R_TF / K_b in [0, 1]
+    per_block_loss = 1.0 - r_tf_norm  # [num_blocks], in [0, 1]
     denom = block_valid.sum().clamp_min(1.0)
-    loss = -(r_tf * block_valid).sum() / denom
+    loss = (per_block_loss * block_valid).sum() / denom
 
     with torch.no_grad():
         # Continuation credit C_t = Σ_{k≥t} S_k (reverse cumsum along draft slots).

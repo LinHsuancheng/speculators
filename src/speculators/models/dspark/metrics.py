@@ -121,8 +121,9 @@ def compute_metrics(
     metrics: dict[str, Any] = {}
 
     # Teacher-forced sequence-level expected-acceptance-length (TF-EAL) loss.
-    # L = -Σ_k Π_{i≤k} a_i on the teacher-forced path. No position decay: the
-    # survival product already gates later positions (see tf_eal_loss docstring).
+    # L = 1 - R_TF/K where R_TF = Σ_k Π_{i≤k} a_i, normalized to [0, 1] so it
+    # sits at the same magnitude as tv_loss. No position decay: the survival
+    # product already gates later positions (see tf_eal_loss docstring).
     if tf_eal_alpha > 0.0:
         tf_loss, tf_aux = tf_eal_loss(logits, targets, loss_mask, block_size)
         loss = loss + tf_eal_alpha * tf_loss
