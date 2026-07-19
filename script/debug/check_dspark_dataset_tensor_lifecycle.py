@@ -328,7 +328,7 @@ def request_direct_vllm(
     model_id: str,
     token_ids: list[int],
     score_positions: list[int],
-    prompt_logprobs: int,
+    prompt_logprobs: int | None,
     request_timeout: float,
     hidden_file_timeout: float,
 ) -> dict[str, Any]:
@@ -342,14 +342,15 @@ def request_direct_vllm(
     )
 
     client = openai.OpenAI(base_url=endpoint, api_key="EMPTY", max_retries=0)
+    extra_body: dict[str, Any] = {"return_token_ids": True}
+    if prompt_logprobs is not None:
+        extra_body["prompt_logprobs"] = prompt_logprobs
+
     response = client.completions.create(
         model=model_id,
         prompt=token_ids,
         max_tokens=1,
-        extra_body={
-            "return_token_ids": True,
-            "prompt_logprobs": prompt_logprobs,
-        },
+        extra_body=extra_body,
         timeout=request_timeout,
     )
     response_ids = _prompt_token_ids(response)
@@ -357,17 +358,19 @@ def request_direct_vllm(
     hidden_path = _kv_hidden_states_path(response)
     if response_ids is None:
         raise RuntimeError("direct vLLM response missing prompt_token_ids")
-    if prompt_logprob_obj is None:
+    if prompt_logprobs is not None and prompt_logprob_obj is None:
         raise RuntimeError("direct vLLM response missing prompt_logprobs")
     if hidden_path is None:
         raise RuntimeError("direct vLLM response missing hidden_states_path")
 
     wait_for_hidden_file(hidden_path, hidden_file_timeout)
     loaded = load_file(hidden_path)
-    reported = [
-        _extract_token_logprob(prompt_logprob_obj, pos, token_ids[pos])
-        for pos in score_positions
-    ]
+    reported = None
+    if prompt_logprobs is not None:
+        reported = [
+            _extract_token_logprob(prompt_logprob_obj, pos, token_ids[pos])
+            for pos in score_positions
+        ]
     return {
         "prompt_token_ids": [int(x) for x in response_ids],
         "hidden_path": hidden_path,
@@ -476,6 +479,9 @@ def main() -> None:
             f"{batch_indices}"
         )
     doc_id = batch_indices.index(args.dataset_index)
+    prior_batches = batches[: batch_index + 1]
+    request_order_to_batch = [int(index) for group in prior_batches for index in group]
+    target_request_ordinal = request_order_to_batch.index(args.dataset_index)
 
     dataset = TracingArrowDataset(
         max_len=args.total_seq_len,
@@ -589,6 +595,12 @@ def main() -> None:
     print(f"  target_ids={target_ids}")
     print(f"  hidden_state_source={snap.get('getitem_source')}")
 
+    print("TRACE request_sequence")
+    print(f"  batches_0_to_target_batch={prior_batches}")
+    print(f"  flattened_indices_0_to_target_batch={request_order_to_batch}")
+    print(f"  target_request_ordinal_0_based={target_request_ordinal}")
+    print(f"  target_request_ordinal_1_based={target_request_ordinal + 1}")
+
     print("TRACE token_alignment")
     print(f"  raw_tokens_{local_start}_{local_end + 1}={raw_tokens}")
     print(f"  packed_tokens_{packed_start}_{packed_end + 1}={packed_tokens}")
@@ -603,13 +615,23 @@ def main() -> None:
     for key, value in batch.items():
         print(f"  {key}: shape={tuple(value.shape)} dtype={value.dtype}")
 
-    direct = None
+    direct_hidden_only = None
+    direct_scored = None
     if not args.skip_direct_vllm:
         import openai
 
         client = openai.OpenAI(base_url=args.vllm_endpoint, api_key="EMPTY", max_retries=0)
         model_id = client.models.list().data[0].id
-        direct = request_direct_vllm(
+        direct_hidden_only = request_direct_vllm(
+            endpoint=args.vllm_endpoint,
+            model_id=model_id,
+            token_ids=raw_ids,
+            score_positions=score_positions,
+            prompt_logprobs=None,
+            request_timeout=args.request_timeout,
+            hidden_file_timeout=args.hidden_file_timeout,
+        )
+        direct_scored = request_direct_vllm(
             endpoint=args.vllm_endpoint,
             model_id=model_id,
             token_ids=raw_ids,
@@ -618,50 +640,80 @@ def main() -> None:
             request_timeout=args.request_timeout,
             hidden_file_timeout=args.hidden_file_timeout,
         )
-        direct_last = direct["hidden"][:, -1]
-        direct_aux = direct["hidden"][:, :-1].flatten(1)
-        print("TRACE direct_vllm")
+        hidden_only_last = direct_hidden_only["hidden"][:, -1]
+        hidden_only_aux = direct_hidden_only["hidden"][:, :-1].flatten(1)
+        scored_last = direct_scored["hidden"][:, -1]
+        scored_aux = direct_scored["hidden"][:, :-1].flatten(1)
+        print("TRACE direct_hidden_only")
         print(f"  model_id={model_id}")
-        print(f"  hidden_path={direct['hidden_path']}")
-        print(f"  prompt_ids_match={direct['prompt_token_ids'] == raw_ids}")
-        print(f"  file_token_ids_match={bool(torch.equal(direct['file_token_ids'], snap['getitem_input_ids']))}")
-        print(f"  hidden_shape={tuple(direct['hidden'].shape)}")
-        print(f"  prompt_logprobs={[fmt(x) for x in direct['prompt_logprobs']]}")
+        print(f"  hidden_path={direct_hidden_only['hidden_path']}")
+        print(f"  prompt_ids_match={direct_hidden_only['prompt_token_ids'] == raw_ids}")
+        print(f"  file_token_ids_match={bool(torch.equal(direct_hidden_only['file_token_ids'], snap['getitem_input_ids']))}")
+        print(f"  hidden_shape={tuple(direct_hidden_only['hidden'].shape)}")
+
+        print("TRACE direct_scored")
+        print(f"  model_id={model_id}")
+        print(f"  hidden_path={direct_scored['hidden_path']}")
+        print(f"  prompt_ids_match={direct_scored['prompt_token_ids'] == raw_ids}")
+        print(f"  file_token_ids_match={bool(torch.equal(direct_scored['file_token_ids'], snap['getitem_input_ids']))}")
+        print(f"  hidden_shape={tuple(direct_scored['hidden'].shape)}")
+        print(f"  prompt_logprobs={[fmt(x) for x in direct_scored['prompt_logprobs']]}")
 
         print("TRACE direct_window_diff")
         print_diff(
-            "file_last_vs_direct_last",
+            "file_last_vs_hidden_only_last",
             tensor_window(snap.get("file_last"), local_start, local_end),
-            tensor_window(direct_last, local_start, local_end),
+            tensor_window(hidden_only_last, local_start, local_end),
         )
         print_diff(
-            "getitem_last_vs_direct_last",
+            "hidden_only_last_vs_scored_last",
+            tensor_window(hidden_only_last, local_start, local_end),
+            tensor_window(scored_last, local_start, local_end),
+        )
+        print_diff(
+            "file_last_vs_scored_last",
+            tensor_window(snap.get("file_last"), local_start, local_end),
+            tensor_window(scored_last, local_start, local_end),
+        )
+        print_diff(
+            "getitem_last_vs_scored_last",
             tensor_window(snap.get("getitem_last"), local_start, local_end),
-            tensor_window(direct_last, local_start, local_end),
+            tensor_window(scored_last, local_start, local_end),
         )
         print_diff(
-            "batch_last_vs_direct_last",
+            "batch_last_vs_scored_last",
             tensor_window(snap.get("batch_last"), local_start, local_end),
-            tensor_window(direct_last, local_start, local_end),
+            tensor_window(scored_last, local_start, local_end),
         )
         print_diff(
-            "file_aux_vs_direct_aux",
+            "file_aux_vs_hidden_only_aux",
             tensor_window(snap.get("file_aux"), local_start, local_end),
-            tensor_window(direct_aux, local_start, local_end),
+            tensor_window(hidden_only_aux, local_start, local_end),
         )
         print_diff(
-            "getitem_aux_vs_direct_aux",
+            "hidden_only_aux_vs_scored_aux",
+            tensor_window(hidden_only_aux, local_start, local_end),
+            tensor_window(scored_aux, local_start, local_end),
+        )
+        print_diff(
+            "file_aux_vs_scored_aux",
+            tensor_window(snap.get("file_aux"), local_start, local_end),
+            tensor_window(scored_aux, local_start, local_end),
+        )
+        print_diff(
+            "getitem_aux_vs_scored_aux",
             tensor_window(snap.get("getitem_aux"), local_start, local_end),
-            tensor_window(direct_aux, local_start, local_end),
+            tensor_window(scored_aux, local_start, local_end),
         )
         print_diff(
-            "batch_aux_vs_direct_aux",
+            "batch_aux_vs_scored_aux",
             tensor_window(snap.get("batch_aux"), local_start, local_end),
-            tensor_window(direct_aux, local_start, local_end),
+            tensor_window(scored_aux, local_start, local_end),
         )
 
         if not args.keep_direct_hidden_file:
-            unlink_hidden_file(direct["hidden_path"])
+            unlink_hidden_file(direct_hidden_only["hidden_path"])
+            unlink_hidden_file(direct_scored["hidden_path"])
 
     print("TRACE interpretation")
     post_dtype_vs_getitem_last, _ = diff_stats(
@@ -685,7 +737,7 @@ def main() -> None:
     else:
         conclusion = "lifecycle_preserves_traced_window"
     print(f"  conclusion={conclusion}")
-    if direct is not None:
+    if direct_scored is not None:
         print("  note=direct_vllm_is_a_later_request; lifecycle diffs identify client-side mutation separately")
 
 
