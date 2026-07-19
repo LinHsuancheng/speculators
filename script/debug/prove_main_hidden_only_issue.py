@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Prove the main branch hidden-only generation path is inconsistent.
+"""Check main-branch hidden-only generation against scored vLLM hidden states.
 
 This script does not modify training code. It uses the same helper that main
 training calls for on-missing generation, then compares that hidden file with:
 
-1. a direct hidden-only vLLM request
-2. a direct prompt_logprobs-scored vLLM request
+1. optional warmup/replay requests
+2. a direct hidden-only vLLM request
+3. a direct prompt_logprobs-scored vLLM request
 
-The goal is to show that the main branch's hidden-only generation path can
-produce hidden states that do not match the scored request for the same prompt.
+The goal is to distinguish a real main-branch hidden-only issue from a
+sequence-dependent server/debug-script issue.
 """
 
 from __future__ import annotations
@@ -27,9 +28,26 @@ for path in (ROOT, SRC):
         sys.path.insert(0, str(path))
 
 
+OLD_LIFECYCLE_SEQUENCE = [
+    30766,
+    36074,
+    24118,
+    29381,
+    19097,
+    33079,
+    68929,
+    79086,
+    45760,
+    72152,
+    43932,
+    62011,
+    44033,
+]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prove main branch hidden-only generation is inconsistent."
+        description="Check main branch hidden-only generation against scored hidden states."
     )
     parser.add_argument("--verifier-name-or-path", default="/models/Qwen3-4B")
     parser.add_argument("--data-path", default="/data/open_perfectblend_qwen3_4b_100k")
@@ -47,6 +65,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--position-diff-print", choices=["none", "summary", "all"], default="summary")
     parser.add_argument("--position-equal-tol", type=float, default=1e-6)
     parser.add_argument("--position-diff-chunk-size", type=int, default=128)
+    parser.add_argument(
+        "--replay-old-lifecycle-sequence",
+        action="store_true",
+        help="Replay the 13-request sequence observed in the old lifecycle trace before the target checks.",
+    )
+    parser.add_argument(
+        "--warmup-indices",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Optional dataset indices to request before the target checks.",
+    )
+    parser.add_argument(
+        "--warmup-prompt-logprobs",
+        type=int,
+        default=1,
+        help="Use prompt_logprobs for warmup requests. Set -1 for hidden-only warmup.",
+    )
+    parser.add_argument("--keep-warmup-hidden-files", action="store_true")
     return parser.parse_args()
 
 
@@ -101,6 +138,12 @@ def delete_hidden_file(path_value: str | None) -> None:
     path = Path(path_value)
     path.unlink(missing_ok=True)
     Path(str(path) + ".lock").unlink(missing_ok=True)
+
+
+def warmup_score_positions(seq_len: int, target_positions: list[int] | None) -> list[int]:
+    if target_positions is not None:
+        return [pos for pos in target_positions if 0 <= pos < seq_len]
+    return list(range(1, min(seq_len, 8)))
 
 
 def _prompt_token_ids(response: Any) -> list[int] | None:
@@ -386,6 +429,78 @@ def main() -> None:
         base_url=args.vllm_endpoint, api_key="EMPTY", max_retries=0
     )
     model_id = client.models.list().data[0].id
+
+    warmup_indices: list[int] = []
+    if args.replay_old_lifecycle_sequence:
+        warmup_indices.extend(OLD_LIFECYCLE_SEQUENCE)
+    if args.warmup_indices is not None:
+        warmup_indices.extend(int(x) for x in args.warmup_indices)
+
+    warmup_target = None
+    if warmup_indices:
+        print("TRACE warmup_sequence")
+        print(f"  indices={warmup_indices}")
+        print(
+            "  mode="
+            + (
+                f"prompt_logprobs={args.warmup_prompt_logprobs}"
+                if args.warmup_prompt_logprobs >= 0
+                else "hidden_only"
+            )
+        )
+        print("  ordinal,index,seq_len,hidden_path,hidden_shape,prompt_ids_match,file_token_ids_match")
+        for ordinal, warmup_index in enumerate(warmup_indices, start=1):
+            warmup_ids = token_ids_for(dataset, warmup_index)
+            target_positions = score_positions if warmup_index == args.dataset_index else None
+            if args.warmup_prompt_logprobs >= 0:
+                warmup_result = request_scored(
+                    endpoint=args.vllm_endpoint,
+                    model_id=model_id,
+                    token_ids=warmup_ids,
+                    score_positions=warmup_score_positions(
+                        len(warmup_ids),
+                        target_positions,
+                    ),
+                    prompt_logprobs=args.warmup_prompt_logprobs,
+                    request_timeout=args.request_timeout,
+                    hidden_file_timeout=args.hidden_file_timeout,
+                )
+            else:
+                warmup_result = request_hidden_only(
+                    endpoint=args.vllm_endpoint,
+                    model_id=model_id,
+                    token_ids=warmup_ids,
+                    request_timeout=args.request_timeout,
+                    hidden_file_timeout=args.hidden_file_timeout,
+                )
+            warmup_file_match = bool(
+                torch.equal(
+                    warmup_result["file_token_ids"],
+                    torch.tensor(warmup_ids, dtype=torch.long),
+                )
+            )
+            print(
+                "  "
+                f"{ordinal},{warmup_index},{len(warmup_ids)},"
+                f"{warmup_result['hidden_path']},"
+                f"{tuple(warmup_result['hidden'].shape)},"
+                f"{warmup_result['prompt_token_ids'] == warmup_ids},"
+                f"{warmup_file_match}"
+            )
+            if warmup_index == args.dataset_index:
+                warmup_target = {
+                    key: (
+                        value.detach().cpu().clone()
+                        if hasattr(value, "detach")
+                        else list(value)
+                        if isinstance(value, list)
+                        else value
+                    )
+                    for key, value in warmup_result.items()
+                }
+            if not args.keep_warmup_hidden_files:
+                delete_hidden_file(warmup_result["hidden_path"])
+
     client_item = build_client_item(dataset_item)
     hidden_path = generate_hidden_states(
         client,
@@ -429,6 +544,7 @@ def main() -> None:
     hidden_only_proj = None
     scored_proj = None
     post_scored_hidden_only_proj = None
+    warmup_target_proj = None
     if True:
         head = FullVerifierHead(args.verifier_name_or_path, args.device, hidden_dtype)
         generated_proj = head.project(generated_hidden[:, -1], token_ids, score_positions)
@@ -439,6 +555,12 @@ def main() -> None:
             token_ids,
             score_positions,
         )
+        if warmup_target is not None:
+            warmup_target_proj = head.project(
+                warmup_target["hidden"][:, -1],
+                token_ids,
+                score_positions,
+            )
 
         print("TRACE full_verifier_head")
         print(f"  device={args.device}")
@@ -457,6 +579,8 @@ def main() -> None:
     print(f"  request_timeout={args.request_timeout}")
     print(f"  hidden_file_timeout={args.hidden_file_timeout}")
     print(f"  prompt_logprobs={args.prompt_logprobs}")
+    print(f"  warmup_indices={warmup_indices}")
+    print(f"  warmup_prompt_logprobs={args.warmup_prompt_logprobs}")
     print(f"  local_hidden_window={args.local_start}:{args.local_start + args.gt_len}")
     print(f"  score_positions={score_positions}")
     print(f"  target_ids={[token_ids[pos] for pos in score_positions]}")
@@ -487,6 +611,13 @@ def main() -> None:
     print(f"  hidden_shape={tuple(post_scored_hidden_only['hidden'].shape)}")
 
     print("TRACE hidden_compare")
+    if warmup_target is not None:
+        print(f"  warmup_target_vs_generated_max_abs={fmt(float((warmup_target['hidden'] - generated_hidden).abs().max().item()))}")
+        print(f"  warmup_target_vs_generated_mean_abs={fmt(float((warmup_target['hidden'] - generated_hidden).abs().mean().item()))}")
+        print(f"  warmup_target_vs_hidden_only_max_abs={fmt(float((warmup_target['hidden'] - hidden_only['hidden']).abs().max().item()))}")
+        print(f"  warmup_target_vs_hidden_only_mean_abs={fmt(float((warmup_target['hidden'] - hidden_only['hidden']).abs().mean().item()))}")
+        print(f"  warmup_target_vs_scored_max_abs={fmt(float((warmup_target['hidden'] - scored['hidden']).abs().max().item()))}")
+        print(f"  warmup_target_vs_scored_mean_abs={fmt(float((warmup_target['hidden'] - scored['hidden']).abs().mean().item()))}")
     print(f"  generated_vs_hidden_only_max_abs={fmt(float((generated_hidden - hidden_only['hidden']).abs().max().item()))}")
     print(f"  generated_vs_hidden_only_mean_abs={fmt(float((generated_hidden - hidden_only['hidden']).abs().mean().item()))}")
     print(f"  generated_vs_scored_max_abs={fmt(float((generated_hidden - scored['hidden']).abs().max().item()))}")
@@ -507,16 +638,22 @@ def main() -> None:
     )
 
     print("TRACE projection_compare")
-    print("  pos,target_id,generated,hidden_only,scored,post_scored_hidden_only")
+    print("  pos,target_id,warmup_target,generated,hidden_only,scored,post_scored_hidden_only")
     for i, pos in enumerate(score_positions):
         target_id = token_ids[pos]
         print(
             "  "
             f"{pos},{target_id},"
+            f"{fmt(float(warmup_target_proj[i])) if warmup_target_proj is not None else '<none>'},"
             f"{fmt(float(generated_proj[i]))},"
             f"{fmt(float(hidden_only_proj[i]))},"
             f"{fmt(float(scored_proj[i]))},"
             f"{fmt(float(post_scored_hidden_only_proj[i]))}"
+        )
+    if warmup_target_proj is not None:
+        print(
+            "  warmup_target_vs_scored_projection_max_abs="
+            f"{fmt(max_abs_delta(warmup_target_proj, scored['prompt_logprobs']))}"
         )
     print(
         "  generated_vs_scored_projection_max_abs="
@@ -537,6 +674,10 @@ def main() -> None:
     print(
         "  conclusion="
         + (
+            "main_warmup_target_path_is_inconsistent"
+            if warmup_target_proj is not None
+            and max_abs_delta(warmup_target_proj, scored["prompt_logprobs"]) > 0.5
+            else
             "main_post_scored_hidden_only_path_is_inconsistent"
             if max_abs_delta(post_scored_hidden_only_proj, scored["prompt_logprobs"]) > 0.5
             else "main_hidden_only_path_is_inconsistent"
