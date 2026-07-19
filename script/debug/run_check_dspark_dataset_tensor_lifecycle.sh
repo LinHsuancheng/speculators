@@ -11,6 +11,7 @@ VERIFIER_NAME_OR_PATH="${VERIFIER_NAME_OR_PATH:-/models/Qwen3-4B}"
 DATA_PATH="${DATA_PATH:-/data/open_perfectblend_qwen3_4b_100k}"
 HIDDEN_STATES_PATH="${HIDDEN_STATES_PATH:-}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://localhost:8000/v1}"
+DEVICE="${DEVICE:-npu:15}"
 DATASET_INDEX="${DATASET_INDEX:-45760}"
 BATCH_INDEX="${BATCH_INDEX:-}"
 
@@ -31,7 +32,9 @@ SEED="${SEED:-0}"
 LOCAL_START="${LOCAL_START:-67}"
 GT_LEN="${GT_LEN:-7}"
 PROMPT_LOGPROBS="${PROMPT_LOGPROBS:-1}"
+GENERATED_PROMPT_LOGPROBS="${GENERATED_PROMPT_LOGPROBS:-1}"
 SKIP_DIRECT_VLLM="${SKIP_DIRECT_VLLM:-0}"
+SKIP_PROJECTION="${SKIP_PROJECTION:-0}"
 KEEP_DIRECT_HIDDEN_FILE="${KEEP_DIRECT_HIDDEN_FILE:-0}"
 
 LOG_DIR="${LOG_DIR:-/tmp/dspark_trace_logs}"
@@ -45,6 +48,7 @@ args=(
   --verifier-name-or-path "${VERIFIER_NAME_OR_PATH}"
   --data-path "${DATA_PATH}"
   --vllm-endpoint "${VLLM_ENDPOINT}"
+  --device "${DEVICE}"
   --dataset-index "${DATASET_INDEX}"
   --total-seq-len "${TOTAL_SEQ_LEN}"
   --hidden-size "${HIDDEN_SIZE}"
@@ -63,6 +67,7 @@ args=(
   --local-start "${LOCAL_START}"
   --gt-len "${GT_LEN}"
   --prompt-logprobs "${PROMPT_LOGPROBS}"
+  --generated-prompt-logprobs "${GENERATED_PROMPT_LOGPROBS}"
 )
 
 if [[ -n "${HIDDEN_STATES_PATH}" ]]; then
@@ -75,6 +80,10 @@ fi
 
 if [[ "${SKIP_DIRECT_VLLM}" == "1" ]]; then
   args+=(--skip-direct-vllm)
+fi
+
+if [[ "${SKIP_PROJECTION}" == "1" ]]; then
+  args+=(--skip-projection)
 fi
 
 if [[ "${KEEP_DIRECT_HIDDEN_FILE}" == "1" ]]; then

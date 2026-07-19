@@ -62,7 +62,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-start", type=int, default=67)
     parser.add_argument("--gt-len", type=int, default=7)
     parser.add_argument("--prompt-logprobs", type=int, default=1)
+    parser.add_argument(
+        "--generated-prompt-logprobs",
+        type=int,
+        default=1,
+        help=(
+            "Attach prompt_logprobs to on-missing generate requests in this "
+            "debug script and record the same response's logprobs. Use -1 to "
+            "disable and match production request body exactly."
+        ),
+    )
+    parser.add_argument("--device", default="npu:15")
     parser.add_argument("--skip-direct-vllm", action="store_true")
+    parser.add_argument("--skip-projection", action="store_true")
     parser.add_argument("--keep-direct-hidden-file", action="store_true")
     return parser.parse_args()
 
@@ -155,13 +167,29 @@ def unlink_hidden_file(path_value: str | None) -> None:
 class TracingArrowDataset:
     """Small wrapper around ArrowDataset with explicit lifecycle snapshots."""
 
-    def __init__(self, *args: Any, trace_indices: set[int], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        trace_indices: set[int],
+        generated_prompt_logprobs: int | None,
+        hidden_file_timeout: float,
+        **kwargs: Any,
+    ) -> None:
         from speculators.train.data import ArrowDataset
 
         class _Dataset(ArrowDataset):
-            def __init__(self, *inner_args: Any, trace_indices: set[int], **inner_kwargs: Any) -> None:
+            def __init__(
+                self,
+                *inner_args: Any,
+                trace_indices: set[int],
+                generated_prompt_logprobs: int | None,
+                hidden_file_timeout: float,
+                **inner_kwargs: Any,
+            ) -> None:
                 self.trace_indices = set(trace_indices)
                 self.snapshots: dict[int, dict[str, Any]] = {}
+                self.generated_prompt_logprobs = generated_prompt_logprobs
+                self.hidden_file_timeout = hidden_file_timeout
                 super().__init__(*inner_args, **inner_kwargs)
 
             def _snap(self, index: int) -> dict[str, Any] | None:
@@ -180,6 +208,120 @@ class TracingArrowDataset:
                 snap["file_last"] = hidden[:, -1].clone()
                 snap["file_token_ids"] = token_ids
                 snap["file_source"] = dict(source)
+
+            def _maybe_generate_hs(self, index: int) -> dict[str, Any] | None:
+                if self.generated_prompt_logprobs is None:
+                    return super()._maybe_generate_hs(index)
+
+                import shutil
+                import torch
+                from speculators.data_generation.offline import check_hidden_states
+                from speculators.data_generation.vllm_client import (
+                    _extract_token_logprob,
+                    _kv_hidden_states_path,
+                    _prompt_logprobs,
+                    _prompt_token_ids,
+                )
+                from speculators.train.data import build_client_item, _maybe_load_hs_file
+
+                if not self.client:
+                    self._setup_client()
+
+                dataset_item = self.data[index]
+                client_item = build_client_item(dataset_item)
+                token_ids = [int(x) for x in client_item["input_ids"]]
+                snap = self._snap(index)
+
+                try:
+                    messages = client_item.get("messages")
+                    extra_body: dict[str, Any]
+                    if messages is None:
+                        extra_body = {
+                            "return_token_ids": True,
+                            "prompt_logprobs": self.generated_prompt_logprobs,
+                        }
+                        response = self.client.completions.create(
+                            model=self.model,
+                            prompt=token_ids,
+                            max_tokens=1,
+                            extra_body=extra_body,
+                            timeout=self.request_timeout,
+                        )
+                    else:
+                        extra_body = {
+                            "add_generation_prompt": False,
+                            "return_token_ids": True,
+                            "prompt_logprobs": self.generated_prompt_logprobs,
+                        }
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            max_tokens=1,
+                            extra_body=extra_body,
+                            timeout=self.request_timeout,
+                        )
+
+                    response_ids = _prompt_token_ids(response)
+                    hidden_path = _kv_hidden_states_path(response)
+                    prompt_logprob_obj = _prompt_logprobs(response)
+                    if response_ids is None:
+                        raise RuntimeError("generated response missing prompt_token_ids")
+                    if response_ids != token_ids:
+                        raise RuntimeError(
+                            "generated response prompt token IDs mismatch: "
+                            f"expected len={len(token_ids)}, got len={len(response_ids)}"
+                        )
+                    if hidden_path is None:
+                        raise RuntimeError("generated response missing hidden_states_path")
+                    if prompt_logprob_obj is None:
+                        raise RuntimeError("generated response missing prompt_logprobs")
+
+                    wait_for_hidden_file(hidden_path, self.hidden_file_timeout)
+                    loaded_hs = _maybe_load_hs_file(Path(hidden_path))
+                    if loaded_hs is None:
+                        raise ValueError(f"Failed to load hidden states from {hidden_path}")
+                    loaded_hs["_hidden_state_source"] = {
+                        "source": "generated",
+                        "path": str(hidden_path),
+                        "index": int(index),
+                        "debug_prompt_logprobs": int(self.generated_prompt_logprobs),
+                    }
+
+                    check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+
+                    if snap is not None:
+                        seq_len = len(token_ids)
+                        score_positions = snap.get("requested_score_positions")
+                        if score_positions is None:
+                            score_positions = list(range(1, min(seq_len, 8)))
+                        score_positions = [int(pos) for pos in score_positions if 0 <= int(pos) < seq_len]
+                        snap["generated_request_prompt_ids"] = torch.tensor(response_ids, dtype=torch.long)
+                        snap["generated_request_hidden_path"] = str(hidden_path)
+                        snap["generated_request_prompt_logprobs"] = [
+                            _extract_token_logprob(prompt_logprob_obj, pos, token_ids[pos])
+                            for pos in score_positions
+                        ]
+                        snap["generated_request_score_positions"] = list(score_positions)
+                        snap["generated_request_target_ids"] = [token_ids[pos] for pos in score_positions]
+                        snap["generated_request_extra_body"] = dict(extra_body)
+
+                    match self.on_generate:
+                        case "cache":
+                            file_idx = self._map_to_file_idx(index)
+                            target_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+                            shutil.move(hidden_path, target_path)
+                        case "delete":
+                            Path(hidden_path).unlink()
+                except Exception as e:
+                    if isinstance(e, ValueError) and "NaN" in str(e):
+                        raise
+                    warnings.warn(
+                        f"Failed to load/cache hidden states for sample {index}: {e}",
+                        stacklevel=1,
+                    )
+                    return None
+
+                return loaded_hs
 
             def _get_raw_data(self, index: int) -> dict[str, Any] | None:
                 import torch
@@ -289,7 +431,13 @@ class TracingArrowDataset:
 
                 return data
 
-        self.dataset = _Dataset(*args, trace_indices=trace_indices, **kwargs)
+        self.dataset = _Dataset(
+            *args,
+            trace_indices=trace_indices,
+            generated_prompt_logprobs=generated_prompt_logprobs,
+            hidden_file_timeout=hidden_file_timeout,
+            **kwargs,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.dataset, name)
@@ -380,6 +528,76 @@ def request_direct_vllm(
     }
 
 
+class FullVerifierHead:
+    def __init__(self, model_path: str, device: Any, dtype: Any) -> None:
+        import torch
+        from transformers import AutoConfig
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+        from speculators.utils.loading import load_model_layers
+
+        config = AutoConfig.from_pretrained(model_path)
+        if hasattr(config, "text_config"):
+            config = config.text_config
+        weights = load_model_layers(
+            ["embed_tokens.weight", "lm_head.weight", "model.norm.weight"],
+            model_path,
+        )
+        lm_head_source = (
+            "lm_head.weight" if "lm_head.weight" in weights else "embed_tokens.weight"
+        )
+        self.lm_head_weight = weights[lm_head_source].to(device=device, dtype=dtype)
+        self.lm_head_source = lm_head_source
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(
+            device=device,
+            dtype=dtype,
+        )
+        self.norm.load_state_dict(
+            {"weight": weights["model.norm.weight"].to(device=device, dtype=dtype)}
+        )
+        self.device = device
+        self.dtype = dtype
+        self.torch = torch
+
+    def project(
+        self,
+        hidden_last: Any,
+        prompt: list[int],
+        score_positions: list[int],
+    ) -> list[float]:
+        torch = self.torch
+        hidden_positions = torch.tensor(
+            [pos - 1 for pos in score_positions],
+            dtype=torch.long,
+            device=self.device,
+        )
+        target_ids = torch.tensor(
+            [prompt[pos] for pos in score_positions],
+            dtype=torch.long,
+            device=self.device,
+        )
+        with torch.no_grad():
+            selected = hidden_last.to(device=self.device, dtype=self.dtype).index_select(
+                0,
+                hidden_positions,
+            )
+            normed = self.norm(selected)
+            logits = torch.nn.functional.linear(normed, self.lm_head_weight).float()
+            logprobs = torch.log_softmax(logits, dim=-1)
+            values = logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+        return [float(x) for x in values.detach().cpu().tolist()]
+
+
+def max_abs_delta(left: list[float] | None, right: list[float] | None) -> float:
+    if left is None or right is None:
+        return math.nan
+    if len(left) != len(right):
+        return math.nan
+    if not left:
+        return 0.0
+    return max(abs(a - b) for a, b in zip(left, right, strict=True))
+
+
 def print_stage_shapes(snap: dict[str, Any]) -> None:
     print("TRACE stage_shapes")
     for key in (
@@ -458,6 +676,8 @@ def main() -> None:
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
         trace_indices=set(),
+        generated_prompt_logprobs=None,
+        hidden_file_timeout=args.hidden_file_timeout,
     )
     batches = sampler_batches(probe_dataset, args.total_seq_len)
     if args.batch_index is None:
@@ -482,6 +702,12 @@ def main() -> None:
     prior_batches = batches[: batch_index + 1]
     request_order_to_batch = [int(index) for group in prior_batches for index in group]
     target_request_ordinal = request_order_to_batch.index(args.dataset_index)
+    requested_score_positions = list(
+        range(args.local_start + 1, args.local_start + args.gt_len + 1)
+    )
+    generated_prompt_logprobs = (
+        None if args.generated_prompt_logprobs < 0 else int(args.generated_prompt_logprobs)
+    )
 
     dataset = TracingArrowDataset(
         max_len=args.total_seq_len,
@@ -497,7 +723,12 @@ def main() -> None:
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
         trace_indices=set(batch_indices),
+        generated_prompt_logprobs=generated_prompt_logprobs,
+        hidden_file_timeout=args.hidden_file_timeout,
     )
+    dataset.snapshots[args.dataset_index] = {
+        "requested_score_positions": list(requested_score_positions)
+    }
 
     def sanitize_hidden_state_source(item: dict[str, Any]) -> dict[str, Any]:
         item.pop("_hidden_state_source", None)
@@ -539,7 +770,7 @@ def main() -> None:
     doc_end = int(doc_positions[-1].item()) + 1
     local_start = args.local_start
     local_end = args.local_start + args.gt_len
-    score_positions = list(range(args.local_start + 1, args.local_start + args.gt_len + 1))
+    score_positions = list(requested_score_positions)
     packed_start = doc_start + local_start
     packed_end = doc_start + local_end
 
@@ -571,6 +802,9 @@ def main() -> None:
     print(f"  num_workers={args.num_workers}")
     print(f"  on_missing={args.on_missing}")
     print(f"  on_generate={args.on_generate}")
+    print(f"  prompt_logprobs={args.prompt_logprobs}")
+    print(f"  generated_prompt_logprobs={generated_prompt_logprobs}")
+    print(f"  projection_device={args.device}")
     print("  speculator_type=dspark")
     print("  train_preprocess=None")
     print("  collate_sanitize_hidden_state_source=True")
@@ -607,6 +841,22 @@ def main() -> None:
     print(f"  packed_matches_raw={packed_tokens == raw_tokens}")
     print(f"  file_token_ids_match_getitem={bool(torch.equal(snap['file_token_ids'], snap['getitem_input_ids']))}")
     print(f"  getraw_token_ids_match_getitem={bool(torch.equal(snap['getraw_input_ids'], snap['getitem_input_ids']))}")
+
+    generated_prompt_ids = snap.get("generated_request_prompt_ids")
+    generated_plog = snap.get("generated_request_prompt_logprobs")
+    print("TRACE generated_request")
+    print(f"  hidden_path={snap.get('generated_request_hidden_path')}")
+    print(f"  extra_body={snap.get('generated_request_extra_body')}")
+    print(
+        "  prompt_ids_match="
+        f"{bool(torch.equal(generated_prompt_ids, snap['getitem_input_ids'])) if generated_prompt_ids is not None else None}"
+    )
+    print(f"  score_positions={snap.get('generated_request_score_positions')}")
+    print(f"  target_ids={snap.get('generated_request_target_ids')}")
+    print(
+        "  prompt_logprobs="
+        f"{[fmt(float(x)) for x in generated_plog] if generated_plog is not None else None}"
+    )
 
     print_stage_shapes(snap)
     print_lifecycle_diffs(snap, local_start, local_end)
@@ -715,6 +965,76 @@ def main() -> None:
             unlink_hidden_file(direct_hidden_only["hidden_path"])
             unlink_hidden_file(direct_scored["hidden_path"])
 
+    generated_projection = None
+    direct_scored_projection = None
+    if not args.skip_projection:
+        full_head = FullVerifierHead(args.verifier_name_or_path, args.device, hidden_dtype)
+        generated_projection = full_head.project(
+            snap["file_last"],
+            raw_ids,
+            score_positions,
+        )
+        if direct_scored is not None:
+            direct_scored_projection = full_head.project(
+                direct_scored["hidden"][:, -1],
+                raw_ids,
+                score_positions,
+            )
+
+        print("TRACE full_verifier_head")
+        print(f"  device={args.device}")
+        print(f"  dtype={hidden_dtype}")
+        print(f"  lm_head_source={full_head.lm_head_source}")
+        print(f"  lm_head_shape={tuple(full_head.lm_head_weight.shape)}")
+
+        print("TRACE generated_self_projection")
+        print(
+            "  local_score_pos,target_id,generated_hidden_projection,"
+            "generated_request_prompt_logprob,later_direct_hidden_projection,"
+            "later_direct_prompt_logprob"
+        )
+        for row_idx, (score_pos, target_id) in enumerate(
+            zip(score_positions, target_ids, strict=True)
+        ):
+            generated_plog_value = (
+                None if generated_plog is None else float(generated_plog[row_idx])
+            )
+            direct_projection_value = (
+                None
+                if direct_scored_projection is None
+                else float(direct_scored_projection[row_idx])
+            )
+            direct_plog_value = (
+                None
+                if direct_scored is None or direct_scored["prompt_logprobs"] is None
+                else float(direct_scored["prompt_logprobs"][row_idx])
+            )
+            print(
+                "  "
+                f"{score_pos},{target_id},"
+                f"{fmt(float(generated_projection[row_idx]))},"
+                f"{fmt(generated_plog_value) if generated_plog_value is not None else '<none>'},"
+                f"{fmt(direct_projection_value) if direct_projection_value is not None else '<none>'},"
+                f"{fmt(direct_plog_value) if direct_plog_value is not None else '<none>'}"
+            )
+        print(
+            "  generated_projection_vs_generated_prompt_max_abs="
+            f"{fmt(max_abs_delta(generated_projection, generated_plog))}"
+        )
+        if direct_scored is not None:
+            print(
+                "  generated_prompt_vs_later_direct_prompt_max_abs="
+                f"{fmt(max_abs_delta(generated_plog, direct_scored['prompt_logprobs']))}"
+            )
+            print(
+                "  later_direct_projection_vs_later_direct_prompt_max_abs="
+                f"{fmt(max_abs_delta(direct_scored_projection, direct_scored['prompt_logprobs']))}"
+            )
+            print(
+                "  generated_projection_vs_later_direct_prompt_max_abs="
+                f"{fmt(max_abs_delta(generated_projection, direct_scored['prompt_logprobs']))}"
+            )
+
     print("TRACE interpretation")
     post_dtype_vs_getitem_last, _ = diff_stats(
         tensor_window(snap.get("post_dtype_last"), local_start, local_end),
@@ -737,6 +1057,30 @@ def main() -> None:
     else:
         conclusion = "lifecycle_preserves_traced_window"
     print(f"  conclusion={conclusion}")
+    if generated_projection is not None and generated_plog is not None:
+        gen_self = max_abs_delta(generated_projection, generated_plog)
+        gen_vs_direct = (
+            math.nan
+            if direct_scored is None
+            else max_abs_delta(generated_plog, direct_scored["prompt_logprobs"])
+        )
+        proj_vs_direct = (
+            math.nan
+            if direct_scored is None
+            else max_abs_delta(generated_projection, direct_scored["prompt_logprobs"])
+        )
+        if gen_self <= 0.5 and gen_vs_direct > 0.5:
+            generated_conclusion = "generated_forward_context_differs_from_later_direct"
+        elif gen_self > 0.5 and gen_vs_direct <= 0.5:
+            generated_conclusion = "generated_connector_export_differs_from_forward_logits"
+        elif gen_self <= 0.5 and gen_vs_direct <= 0.5:
+            generated_conclusion = "generated_hidden_self_consistent_and_matches_later_direct"
+        else:
+            generated_conclusion = "generated_projection_prompt_and_later_direct_all_differ"
+        print(f"  generated_self_projection_max_abs={fmt(gen_self)}")
+        print(f"  generated_prompt_vs_later_direct_prompt_max_abs={fmt(gen_vs_direct)}")
+        print(f"  generated_projection_vs_later_direct_prompt_max_abs={fmt(proj_vs_direct)}")
+        print(f"  generated_request_conclusion={generated_conclusion}")
     if direct_scored is not None:
         print("  note=direct_vllm_is_a_later_request; lifecycle diffs identify client-side mutation separately")
 
