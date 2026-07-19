@@ -179,3 +179,8 @@ cython_debug/
 # outputs
 output/*
 logs/*
+
+# ai
+CLAUDE.md
+AGENT.md
+.codex/*
