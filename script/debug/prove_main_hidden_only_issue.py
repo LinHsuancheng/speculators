@@ -396,6 +396,7 @@ def main() -> None:
     )
     from safetensors.torch import load_file
 
+    wait_for_hidden_file(hidden_path, args.hidden_file_timeout)
     generated = load_file(hidden_path)
     generated_hidden = generated["hidden_states"].detach().cpu().clone()
     generated_token_ids = generated["token_ids"].detach().cpu().clone()
