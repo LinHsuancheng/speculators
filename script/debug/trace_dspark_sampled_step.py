@@ -107,6 +107,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-anchor-limit", type=int, default=24)
     parser.add_argument("--gt-compare-len", type=int, default=7)
     parser.add_argument(
+        "--hf-hidden-compare",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compare gt_doc_prefix vLLM connector hidden states against direct HF.",
+    )
+    parser.add_argument(
+        "--vllm-hidden-repeat",
+        type=int,
+        default=1,
+        help="Extra identical gt_doc_prefix hidden requests for repeat-diff checks.",
+    )
+    parser.add_argument(
         "--anchor-selection",
         choices=["first", "prefer-packed", "require-packed"],
         default="prefer-packed",
@@ -1041,6 +1053,7 @@ def _compare_vllm_hidden_projection(
     scored: dict[str, Any] | None,
     token_ids: list[int],
     label: str,
+    cleanup: bool = True,
 ) -> list[float] | None:
     if scored is None:
         return None
@@ -1073,7 +1086,362 @@ def _compare_vllm_hidden_projection(
         print(f"TRACE {label}.hidden_projection_error={type(exc).__name__}: {exc}")
         return None
     finally:
-        _delete_trace_hidden_states(hidden_states_path)
+        if cleanup:
+            _delete_trace_hidden_states(hidden_states_path)
+
+
+def _cleanup_hidden_alignment(alignment: dict[str, Any] | None) -> None:
+    if alignment is None:
+        return
+    _delete_trace_hidden_states(alignment.get("path"))
+
+
+_HF_VERIFIER_CACHE: dict[tuple[str, str, str, bool], Any] = {}
+
+
+def _load_hf_verifier(
+    *,
+    args: argparse.Namespace,
+    device: Any,
+    dtype: Any,
+) -> Any:
+    cache_key = (
+        args.verifier_name_or_path,
+        str(device),
+        str(dtype),
+        bool(args.trust_remote_code),
+    )
+    if cache_key not in _HF_VERIFIER_CACHE:
+        from transformers import AutoModelForCausalLM
+
+        print("TRACE hf_direct.load")
+        print(f"  model_path={args.verifier_name_or_path}")
+        print(f"  device={device}")
+        print(f"  dtype={dtype}")
+        verifier = AutoModelForCausalLM.from_pretrained(
+            args.verifier_name_or_path,
+            torch_dtype=dtype,
+            trust_remote_code=args.trust_remote_code,
+        )
+        verifier.to(device)
+        verifier.eval()
+        _HF_VERIFIER_CACHE[cache_key] = verifier
+    return _HF_VERIFIER_CACHE[cache_key]
+
+
+def _run_hf_hidden_for_prompt(
+    *,
+    args: argparse.Namespace,
+    prompt_token_ids: list[int],
+    device: Any,
+    dtype: Any,
+) -> Any:
+    import torch
+
+    verifier = _load_hf_verifier(args=args, device=device, dtype=dtype)
+    input_ids = torch.tensor([prompt_token_ids], dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        return verifier(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+
+def _score_hf_logprobs_with_dspark_head(
+    *,
+    model: Any,
+    hf_hidden_states: Any,
+    token_ids: list[int],
+    score_positions: list[int],
+) -> list[float] | None:
+    import torch
+
+    device = next(model.parameters()).device
+    final_hidden = hf_hidden_states[-1][0].to(device=device)
+    target_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+    positions = torch.tensor(
+        [pos - 1 for pos in score_positions],
+        dtype=torch.long,
+        device=device,
+    )
+    if bool(((positions < 0) | (positions >= final_hidden.shape[0])).any().item()):
+        return None
+    gather_ids, in_draft_vocab = _target_to_draft_gather_ids(model, target_ids, device)
+    with torch.no_grad():
+        logits = model.verifier_lm_head(model.verifier_norm(final_hidden.unsqueeze(0)))
+        logprobs = torch.log_softmax(logits[0, positions].float(), dim=-1)
+        gathered = logprobs.gather(
+            -1,
+            gather_ids.clamp_min(0).unsqueeze(-1),
+        ).squeeze(-1)
+        gathered = torch.where(
+            in_draft_vocab.bool(),
+            gathered,
+            torch.full_like(gathered, float("nan")),
+        )
+    return [float(x) for x in gathered.detach().cpu().tolist()]
+
+
+def _score_hf_output_logprobs(
+    *,
+    hf_logits: Any,
+    token_ids: list[int],
+    score_positions: list[int],
+) -> list[float] | None:
+    import torch
+
+    logits = hf_logits[0].detach().float()
+    positions = torch.tensor(
+        [pos - 1 for pos in score_positions],
+        dtype=torch.long,
+        device=logits.device,
+    )
+    if bool(((positions < 0) | (positions >= logits.shape[0])).any().item()):
+        return None
+    target_ids = torch.tensor(token_ids, dtype=torch.long, device=logits.device)
+    with torch.no_grad():
+        logprobs = torch.log_softmax(logits[positions], dim=-1)
+        gathered = logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    return [float(x) for x in gathered.detach().cpu().tolist()]
+
+
+def _compare_vllm_hf_hidden_alignment(
+    *,
+    args: argparse.Namespace,
+    model: Any,
+    batch: dict[str, Any],
+    scored: dict[str, Any] | None,
+    prefix_token_ids: list[int],
+    gt_ids: list[int],
+    gt_positions: list[int],
+    label: str,
+) -> dict[str, Any] | None:
+    print(f"TRACE {label}.hf_vllm_hidden_alignment")
+    if not args.hf_hidden_compare:
+        print("  skipped=disabled")
+        return None
+    if scored is None or scored.get("hidden_states_path") is None:
+        print("  skipped=no_vllm_hidden_states_path")
+        return None
+
+    try:
+        from safetensors.torch import load_file
+
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+        prompt = [*prefix_token_ids, *gt_ids]
+        score_positions = scored["score_positions"]
+        hf_outputs = _run_hf_hidden_for_prompt(
+            args=args,
+            prompt_token_ids=prompt,
+            device=device,
+            dtype=dtype,
+        )
+        loaded = load_file(scored["hidden_states_path"])
+        vllm_hidden = loaded["hidden_states"]
+        vllm_token_ids = loaded["token_ids"].detach().cpu().tolist()
+        expected_layers = list(model.target_layer_ids)
+        final_layer_id = int(model.config.transformer_layer_config.num_hidden_layers)
+        if final_layer_id not in expected_layers:
+            expected_layers.append(final_layer_id)
+
+        print(f"  prompt_len={len(prompt)}")
+        print(f"  prefix_len={len(prefix_token_ids)}")
+        print(f"  gt_ids={gt_ids}")
+        print(f"  score_positions={score_positions}")
+        print(f"  hidden_positions={[pos - 1 for pos in score_positions]}")
+        print(f"  vllm_token_ids_match_prompt={vllm_token_ids == prompt}")
+        print(
+            "  scored_prompt_ids_match_prompt="
+            f"{scored['prompt_token_ids'] == prompt}"
+        )
+        print(f"  vllm_hidden_shape={tuple(vllm_hidden.shape)}")
+        print(f"  hf_logits_shape={tuple(hf_outputs.logits.shape)}")
+        print(f"  hf_hidden_count={len(hf_outputs.hidden_states)}")
+        print(
+            "  hf_hidden_shapes="
+            f"{[tuple(h.shape) for h in hf_outputs.hidden_states]}"
+        )
+        print(f"  expected_layer_ids={expected_layers}")
+
+        shape_ok = (
+            vllm_hidden.ndim == 3
+            and int(vllm_hidden.shape[0]) == len(prompt)
+            and int(vllm_hidden.shape[1]) == len(expected_layers)
+            and int(vllm_hidden.shape[2])
+            == int(hf_outputs.hidden_states[-1].shape[-1])
+        )
+        print(f"  vllm_shape_matches_expected={shape_ok}")
+
+        hf_logprobs = _score_hf_logprobs_with_dspark_head(
+            model=model,
+            hf_hidden_states=hf_outputs.hidden_states,
+            token_ids=gt_ids,
+            score_positions=score_positions,
+        )
+        hf_output_logprobs = _score_hf_output_logprobs(
+            hf_logits=hf_outputs.logits,
+            token_ids=gt_ids,
+            score_positions=score_positions,
+        )
+        print(f"  hf_output_logits_logprobs={hf_output_logprobs}")
+        print(f"  hf_with_dspark_norm_logprobs={hf_logprobs}")
+        print(f"  vllm_prompt_logprobs={scored['token_logprobs']}")
+        if hf_output_logprobs is not None:
+            diffs = [
+                abs(float(a) - float(b))
+                for a, b in zip(
+                    hf_output_logprobs,
+                    scored["token_logprobs"],
+                    strict=True,
+                )
+            ]
+            print(f"  hf_logits_vs_vllm_prompt_logprob_max_abs_diff={_fmt(max(diffs))}")
+        if hf_logprobs is not None:
+            diffs = [
+                abs(float(a) - float(b))
+                for a, b in zip(hf_logprobs, scored["token_logprobs"], strict=True)
+            ]
+            print(
+                "  hf_dspark_norm_vs_vllm_prompt_logprob_max_abs_diff="
+                f"{_fmt(max(diffs))}"
+            )
+
+        print("  layer,slot,gt_index,packed_pos,prompt_hidden_pos,cached_diff,hf_diff")
+        for slot, layer_id in enumerate(expected_layers):
+            if layer_id >= len(hf_outputs.hidden_states):
+                print(f"  {layer_id},{slot},<skip_layer_out_of_range>")
+                continue
+            hf_layer = hf_outputs.hidden_states[layer_id][0].detach().float().cpu()
+            for gt_index, packed_pos in enumerate(gt_positions, start=1):
+                prompt_hidden_pos = score_positions[gt_index - 1] - 1
+                if prompt_hidden_pos < 0 or prompt_hidden_pos >= vllm_hidden.shape[0]:
+                    print(
+                        f"  {layer_id},{slot},{gt_index},{packed_pos},"
+                        f"{prompt_hidden_pos},<invalid>,<invalid>"
+                    )
+                    continue
+                vllm_vec = vllm_hidden[
+                    prompt_hidden_pos,
+                    slot,
+                ].detach().float().cpu()
+                hf_vec = hf_layer[prompt_hidden_pos]
+                hf_diff = float((vllm_vec - hf_vec).abs().max().item())
+                cached_diff_value = "<na>"
+                cached_pos = packed_pos - 1
+                if layer_id == expected_layers[-1]:
+                    cached = batch["verifier_last_hidden_states"][
+                        0,
+                        cached_pos,
+                    ].detach().float().cpu()
+                    cached_diff_value = _fmt(
+                        float((vllm_vec - cached).abs().max().item())
+                    )
+                else:
+                    hidden_slots = (
+                        batch["hidden_states"].shape[-1] // vllm_hidden.shape[-1]
+                    )
+                    if slot < hidden_slots:
+                        start = slot * vllm_hidden.shape[-1]
+                        end = start + vllm_hidden.shape[-1]
+                        cached = batch["hidden_states"][
+                            0,
+                            cached_pos,
+                            start:end,
+                        ].detach().float().cpu()
+                        cached_diff_value = _fmt(
+                            float((vllm_vec - cached).abs().max().item())
+                        )
+                print(
+                    f"  {layer_id},{slot},{gt_index},{packed_pos},"
+                    f"{prompt_hidden_pos},{cached_diff_value},{_fmt(hf_diff)}"
+                )
+
+        return {
+            "path": scored["hidden_states_path"],
+            "prompt": prompt,
+            "hidden": vllm_hidden,
+            "score_positions": list(score_positions),
+            "expected_layers": expected_layers,
+            "hf_outputs": hf_outputs,
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"  error={type(exc).__name__}: {exc}")
+        return None
+
+
+def _repeat_vllm_hidden_alignment(
+    *,
+    args: argparse.Namespace,
+    augmentor: Any,
+    first: dict[str, Any] | None,
+    prefix_token_ids: list[int],
+    gt_ids: list[int],
+    label: str,
+) -> None:
+    print(f"TRACE {label}.vllm_hidden_repeat")
+    if first is None:
+        print("  skipped=no_first_hidden")
+        return
+    repeat = max(int(args.vllm_hidden_repeat), 0)
+    if repeat <= 0:
+        print("  skipped=repeat_0")
+        _cleanup_hidden_alignment(first)
+        return
+
+    hidden_runs = [first["hidden"]]
+    path_runs = [first["path"]]
+    for run_idx in range(1, repeat + 1):
+        scored = _score_with_vllm_hidden_states(
+            augmentor=augmentor,
+            prefix_token_ids=prefix_token_ids,
+            token_ids=gt_ids,
+            label=f"{label}_repeat{run_idx}",
+        )
+        if scored is None or scored.get("hidden_states_path") is None:
+            print(f"  repeat={run_idx} skipped=no_hidden_path")
+            continue
+        try:
+            from safetensors.torch import load_file
+
+            loaded = load_file(scored["hidden_states_path"])
+            hidden_runs.append(loaded["hidden_states"])
+            path_runs.append(scored["hidden_states_path"])
+            print(
+                f"  repeat={run_idx} token_ids_match="
+                f"{loaded['token_ids'].detach().cpu().tolist() == first['prompt']} "
+                f"hidden_shape={tuple(loaded['hidden_states'].shape)}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  repeat={run_idx} error={type(exc).__name__}: {exc}")
+
+    print("  compare_to_run0,layer,slot,prompt_hidden_pos,max_abs_diff,mean_abs_diff")
+    for run_idx, hidden in enumerate(hidden_runs[1:], start=1):
+        if tuple(hidden.shape) != tuple(hidden_runs[0].shape):
+            print(
+                f"  {run_idx},<shape_mismatch>,"
+                f"{tuple(hidden_runs[0].shape)}!={tuple(hidden.shape)}"
+            )
+            continue
+        for slot, layer_id in enumerate(first["expected_layers"]):
+            for score_pos in first["score_positions"]:
+                hidden_pos = score_pos - 1
+                diff = (
+                    hidden_runs[0][hidden_pos, slot].detach().float().cpu()
+                    - hidden[hidden_pos, slot].detach().float().cpu()
+                ).abs()
+                print(
+                    f"  {run_idx},{layer_id},{slot},{hidden_pos},"
+                    f"{_fmt(float(diff.max().item()))},"
+                    f"{_fmt(float(diff.mean().item()))}"
+                )
+
+    for path in path_runs:
+        _delete_trace_hidden_states(path)
 
 
 def _compare_cached_and_fresh_doc_hidden(
@@ -1331,12 +1699,33 @@ def _compare_gt_verifier_paths(
         gt_positions=gt_positions,
         label="gt_doc_prefix",
     )
+    hf_vllm_hidden = _compare_vllm_hf_hidden_alignment(
+        args=args,
+        model=model,
+        batch=batch,
+        scored=doc_vllm,
+        prefix_token_ids=doc_prefix,
+        gt_ids=gt_ids,
+        gt_positions=gt_positions,
+        label="gt_doc_prefix",
+    )
     doc_hidden_logprobs = _compare_vllm_hidden_projection(
         model=model,
         scored=doc_vllm,
         token_ids=gt_ids,
         label="gt_doc_prefix",
+        cleanup=False,
     )
+    _repeat_vllm_hidden_alignment(
+        args=args,
+        augmentor=augmentor,
+        first=hf_vllm_hidden,
+        prefix_token_ids=doc_prefix,
+        gt_ids=gt_ids,
+        label="gt_doc_prefix",
+    )
+    if hf_vllm_hidden is None and doc_vllm is not None:
+        _delete_trace_hidden_states(doc_vllm.get("hidden_states_path"))
 
     print("TRACE gt_verifier_compare.summary")
     if doc_start == 0:

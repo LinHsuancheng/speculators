@@ -43,6 +43,8 @@ BATCH_INDEX="${BATCH_INDEX:-0}"
 TOPK="${TOPK:-5}"
 PRINT_ANCHOR_LIMIT="${PRINT_ANCHOR_LIMIT:-24}"
 GT_COMPARE_LEN="${GT_COMPARE_LEN:-7}"
+HF_HIDDEN_COMPARE="${HF_HIDDEN_COMPARE:-1}"
+VLLM_HIDDEN_REPEAT="${VLLM_HIDDEN_REPEAT:-1}"
 ANCHOR_SELECTION="${ANCHOR_SELECTION:-prefer-packed}"
 LR="${LR:-6e-4}"
 
@@ -88,6 +90,7 @@ args=(
   --topk "${TOPK}"
   --print-anchor-limit "${PRINT_ANCHOR_LIMIT}"
   --gt-compare-len "${GT_COMPARE_LEN}"
+  --vllm-hidden-repeat "${VLLM_HIDDEN_REPEAT}"
   --anchor-selection "${ANCHOR_SELECTION}"
   --lr "${LR}"
 )
@@ -114,6 +117,10 @@ fi
 
 if [[ "${TRUST_REMOTE_CODE}" == "1" ]]; then
   args+=(--trust-remote-code)
+fi
+
+if [[ "${HF_HIDDEN_COMPARE}" != "1" ]]; then
+  args+=(--no-hf-hidden-compare)
 fi
 
 echo "Writing trace to ${LOG_FILE}"
