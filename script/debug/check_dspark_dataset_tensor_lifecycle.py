@@ -75,6 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="npu:15")
     parser.add_argument("--skip-direct-vllm", action="store_true")
     parser.add_argument("--skip-projection", action="store_true")
+    parser.add_argument(
+        "--position-diff-print",
+        choices=["none", "summary", "all"],
+        default="all",
+    )
+    parser.add_argument("--position-equal-tol", type=float, default=1e-6)
+    parser.add_argument("--position-diff-chunk-size", type=int, default=128)
     parser.add_argument("--keep-direct-hidden-file", action="store_true")
     return parser.parse_args()
 
@@ -644,6 +651,116 @@ def print_lifecycle_diffs(snap: dict[str, Any], start: int, end: int) -> None:
     print_diff("file_vs_batch", file_last, batch_last)
 
 
+def print_hidden_only_scored_position_scan(
+    *,
+    hidden_only: Any,
+    scored: Any,
+    local_start: int,
+    local_end: int,
+    equal_tol: float,
+    chunk_size: int,
+    print_mode: str,
+) -> None:
+    import torch
+    import torch.nn.functional as F
+
+    if tuple(hidden_only.shape) != tuple(scored.shape):
+        print("TRACE hidden_only_vs_scored_position_scan")
+        print(f"  shape_mismatch hidden_only={tuple(hidden_only.shape)} scored={tuple(scored.shape)}")
+        return
+
+    final_slot = hidden_only.shape[1] - 1
+    h0_final = hidden_only[:, final_slot].float()
+    h1_final = scored[:, final_slot].float()
+    delta = (h0_final - h1_final).abs()
+    mean_by_pos = delta.mean(dim=-1)
+    max_by_pos = delta.max(dim=-1).values
+    equal_positions = (mean_by_pos <= equal_tol).nonzero(as_tuple=False).flatten()
+    seq_len = int(hidden_only.shape[0])
+
+    print("TRACE hidden_only_vs_scored_position_scan")
+    print(f"  seq_len={seq_len}")
+    print(f"  final_slot={final_slot}")
+    print(f"  equal_tol={equal_tol}")
+    print(f"  mean_diff_min={fmt(float(mean_by_pos.min().item()))}")
+    print(f"  mean_diff_max={fmt(float(mean_by_pos.max().item()))}")
+    print(f"  mean_diff_mean={fmt(float(mean_by_pos.mean().item()))}")
+    print(f"  max_diff_max={fmt(float(max_by_pos.max().item()))}")
+    print(f"  equal_position_count={int(equal_positions.numel())}")
+    if equal_positions.numel() <= 64:
+        print(f"  equal_positions={equal_positions.detach().cpu().tolist()}")
+    else:
+        head = equal_positions[:32].detach().cpu().tolist()
+        tail = equal_positions[-32:].detach().cpu().tolist()
+        print(f"  equal_positions_head={head}")
+        print(f"  equal_positions_tail={tail}")
+
+    print("TRACE hidden_only_vs_scored_chunk_summary")
+    print("  start,end,mean_diff_mean,mean_diff_min,mean_diff_max,max_diff_max,equal_count")
+    chunk_size = max(int(chunk_size), 1)
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        chunk_mean = mean_by_pos[start:end]
+        chunk_max = max_by_pos[start:end]
+        chunk_equal = int((chunk_mean <= equal_tol).sum().item())
+        print(
+            "  "
+            f"{start},{end},"
+            f"{fmt(float(chunk_mean.mean().item()))},"
+            f"{fmt(float(chunk_mean.min().item()))},"
+            f"{fmt(float(chunk_mean.max().item()))},"
+            f"{fmt(float(chunk_max.max().item()))},"
+            f"{chunk_equal}"
+        )
+
+    if print_mode != "none":
+        print("TRACE hidden_only_vs_scored_position_diff")
+        print("  pos,mean_abs,max_abs")
+        positions = range(seq_len) if print_mode == "all" else range(local_start, local_end)
+        for pos in positions:
+            print(
+                "  "
+                f"{pos},{fmt(float(mean_by_pos[pos].item()))},"
+                f"{fmt(float(max_by_pos[pos].item()))}"
+            )
+
+    last_pos = seq_len - 1
+    print("TRACE hidden_only_vs_scored_last_position_slots")
+    print("  slot,max_abs,mean_abs")
+    for slot in range(int(hidden_only.shape[1])):
+        slot_delta = (hidden_only[last_pos, slot].float() - scored[last_pos, slot].float()).abs()
+        print(
+            "  "
+            f"{slot},{fmt(float(slot_delta.max().item()))},"
+            f"{fmt(float(slot_delta.mean().item()))}"
+        )
+
+    probe_positions = []
+    for pos in [0, 1, local_start, *range(local_start, local_end), last_pos]:
+        if 0 <= int(pos) < seq_len and int(pos) not in probe_positions:
+            probe_positions.append(int(pos))
+
+    print("TRACE hidden_only_vs_scored_nearest_position")
+    print("  hidden_only_pos,best_scored_pos,cosine,best_mean_abs,best_max_abs,self_cosine,self_mean_abs,self_max_abs")
+    scored_norm = F.normalize(h1_final, dim=-1)
+    for pos in probe_positions:
+        query = F.normalize(h0_final[pos : pos + 1], dim=-1)
+        similarity = (query @ scored_norm.T).squeeze(0)
+        best_value, best_pos = similarity.max(dim=0)
+        best_pos_int = int(best_pos.item())
+        best_delta = (h0_final[pos] - h1_final[best_pos_int]).abs()
+        self_delta = (h0_final[pos] - h1_final[pos]).abs()
+        print(
+            "  "
+            f"{pos},{best_pos_int},{fmt(float(best_value.item()))},"
+            f"{fmt(float(best_delta.mean().item()))},"
+            f"{fmt(float(best_delta.max().item()))},"
+            f"{fmt(float(similarity[pos].item()))},"
+            f"{fmt(float(self_delta.mean().item()))},"
+            f"{fmt(float(self_delta.max().item()))}"
+        )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -959,6 +1076,16 @@ def main() -> None:
             "batch_aux_vs_scored_aux",
             tensor_window(snap.get("batch_aux"), local_start, local_end),
             tensor_window(scored_aux, local_start, local_end),
+        )
+
+        print_hidden_only_scored_position_scan(
+            hidden_only=direct_hidden_only["hidden"],
+            scored=direct_scored["hidden"],
+            local_start=local_start,
+            local_end=local_end,
+            equal_tol=args.position_equal_tol,
+            chunk_size=args.position_diff_chunk_size,
+            print_mode=args.position_diff_print,
         )
 
         if not args.keep_direct_hidden_file:
