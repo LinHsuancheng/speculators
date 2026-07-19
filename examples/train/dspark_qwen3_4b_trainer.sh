@@ -39,6 +39,7 @@ MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
+TF_EAL_ALPHA=0.1  # Teacher-forced sequence-level expected-acceptance-length loss
 
 # Ascend NPU assignments
 VLLM_NPUS="8,9,10,11"
@@ -116,6 +117,7 @@ env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --tf-eal-alpha "$TF_EAL_ALPHA" \
     --logger tensorboard \
     --on-missing generate \
     --on-generate delete > "$LOG_FILE" 2>&1 &
