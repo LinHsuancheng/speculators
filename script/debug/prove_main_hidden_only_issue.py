@@ -417,15 +417,28 @@ def main() -> None:
         request_timeout=args.request_timeout,
         hidden_file_timeout=args.hidden_file_timeout,
     )
+    post_scored_hidden_only = request_hidden_only(
+        endpoint=args.vllm_endpoint,
+        model_id=model_id,
+        token_ids=token_ids,
+        request_timeout=args.request_timeout,
+        hidden_file_timeout=args.hidden_file_timeout,
+    )
 
     generated_proj = None
     hidden_only_proj = None
     scored_proj = None
+    post_scored_hidden_only_proj = None
     if True:
         head = FullVerifierHead(args.verifier_name_or_path, args.device, hidden_dtype)
         generated_proj = head.project(generated_hidden[:, -1], token_ids, score_positions)
         hidden_only_proj = head.project(hidden_only["hidden"][:, -1], token_ids, score_positions)
         scored_proj = head.project(scored["hidden"][:, -1], token_ids, score_positions)
+        post_scored_hidden_only_proj = head.project(
+            post_scored_hidden_only["hidden"][:, -1],
+            token_ids,
+            score_positions,
+        )
 
         print("TRACE full_verifier_head")
         print(f"  device={args.device}")
@@ -467,6 +480,12 @@ def main() -> None:
     print(f"  hidden_shape={tuple(scored['hidden'].shape)}")
     print(f"  prompt_logprobs={[fmt(x) for x in scored['prompt_logprobs']]}")
 
+    print("TRACE post_scored_hidden_only")
+    print(f"  hidden_path={post_scored_hidden_only['hidden_path']}")
+    print(f"  prompt_ids_match={post_scored_hidden_only['prompt_token_ids'] == token_ids}")
+    print(f"  file_token_ids_match={bool(torch.equal(post_scored_hidden_only['file_token_ids'], torch.tensor(token_ids, dtype=torch.long)))}")
+    print(f"  hidden_shape={tuple(post_scored_hidden_only['hidden'].shape)}")
+
     print("TRACE hidden_compare")
     print(f"  generated_vs_hidden_only_max_abs={fmt(float((generated_hidden - hidden_only['hidden']).abs().max().item()))}")
     print(f"  generated_vs_hidden_only_mean_abs={fmt(float((generated_hidden - hidden_only['hidden']).abs().mean().item()))}")
@@ -474,9 +493,11 @@ def main() -> None:
     print(f"  generated_vs_scored_mean_abs={fmt(float((generated_hidden - scored['hidden']).abs().mean().item()))}")
     print(f"  hidden_only_vs_scored_max_abs={fmt(float((hidden_only['hidden'] - scored['hidden']).abs().max().item()))}")
     print(f"  hidden_only_vs_scored_mean_abs={fmt(float((hidden_only['hidden'] - scored['hidden']).abs().mean().item()))}")
+    print(f"  post_scored_hidden_only_vs_scored_max_abs={fmt(float((post_scored_hidden_only['hidden'] - scored['hidden']).abs().max().item()))}")
+    print(f"  post_scored_hidden_only_vs_scored_mean_abs={fmt(float((post_scored_hidden_only['hidden'] - scored['hidden']).abs().mean().item()))}")
 
     position_scan(
-        left=hidden_only["hidden"],
+        left=post_scored_hidden_only["hidden"],
         right=scored["hidden"],
         local_start=args.local_start,
         local_end=args.local_start + args.gt_len,
@@ -486,7 +507,7 @@ def main() -> None:
     )
 
     print("TRACE projection_compare")
-    print("  pos,target_id,generated,hidden_only,scored")
+    print("  pos,target_id,generated,hidden_only,scored,post_scored_hidden_only")
     for i, pos in enumerate(score_positions):
         target_id = token_ids[pos]
         print(
@@ -494,7 +515,8 @@ def main() -> None:
             f"{pos},{target_id},"
             f"{fmt(float(generated_proj[i]))},"
             f"{fmt(float(hidden_only_proj[i]))},"
-            f"{fmt(float(scored_proj[i]))}"
+            f"{fmt(float(scored_proj[i]))},"
+            f"{fmt(float(post_scored_hidden_only_proj[i]))}"
         )
     print(
         "  generated_vs_scored_projection_max_abs="
@@ -505,13 +527,19 @@ def main() -> None:
         f"{fmt(max_abs_delta(hidden_only_proj, scored['prompt_logprobs']))}"
     )
     print(
+        "  post_scored_hidden_only_vs_scored_projection_max_abs="
+        f"{fmt(max_abs_delta(post_scored_hidden_only_proj, scored['prompt_logprobs']))}"
+    )
+    print(
         "  scored_projection_vs_prompt_max_abs="
         f"{fmt(max_abs_delta(scored_proj, scored['prompt_logprobs']))}"
     )
     print(
         "  conclusion="
         + (
-            "main_hidden_only_path_is_inconsistent"
+            "main_post_scored_hidden_only_path_is_inconsistent"
+            if max_abs_delta(post_scored_hidden_only_proj, scored["prompt_logprobs"]) > 0.5
+            else "main_hidden_only_path_is_inconsistent"
             if max_abs_delta(hidden_only_proj, scored["prompt_logprobs"]) > 0.5
             else "no_inconsistency_detected"
         )
@@ -520,6 +548,7 @@ def main() -> None:
     delete_hidden_file(hidden_path)
     delete_hidden_file(hidden_only["hidden_path"])
     delete_hidden_file(scored["hidden_path"])
+    delete_hidden_file(post_scored_hidden_only["hidden_path"])
 
 
 if __name__ == "__main__":
