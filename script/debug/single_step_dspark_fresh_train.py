@@ -289,9 +289,18 @@ class FullVerifierHead:
         config = AutoConfig.from_pretrained(model_path)
         if hasattr(config, "text_config"):
             config = config.text_config
-        weights = load_model_layers(["lm_head.weight", "model.norm.weight"], model_path)
-        lm_head_weight = weights["lm_head.weight"].to(device=device, dtype=dtype)
+        weights = load_model_layers(
+            ["embed_tokens.weight", "lm_head.weight", "model.norm.weight"],
+            model_path,
+        )
+        # Match DraftVocabMixin.load_verifier_weights(): Qwen-style tied heads may
+        # not have a separate lm_head.weight key.
+        lm_head_source = (
+            "lm_head.weight" if "lm_head.weight" in weights else "embed_tokens.weight"
+        )
+        lm_head_weight = weights[lm_head_source].to(device=device, dtype=dtype)
         self.lm_head_weight = lm_head_weight
+        self.lm_head_source = lm_head_source
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps).to(
             device=device,
             dtype=dtype,
@@ -328,6 +337,64 @@ class FullVerifierHead:
             logprobs = torch.log_softmax(logits, dim=-1)
             values = logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
         return [float(x) for x in values.detach().cpu().tolist()]
+
+
+def target_to_training_gather_ids(model: Any, target_ids: Any, device: Any) -> tuple[Any, Any]:
+    import torch
+
+    if model.t2d is None:
+        return target_ids.to(device=device), torch.ones_like(
+            target_ids,
+            dtype=torch.bool,
+            device=device,
+        )
+    t2d = model.t2d.to(device=device)
+    target_ids = target_ids.to(device=device)
+    in_vocab = t2d[target_ids].bool()
+    target_to_rank = torch.cumsum(t2d.to(dtype=torch.long), dim=0) - 1
+    gather_ids = target_to_rank[target_ids].clamp_min(0)
+    return gather_ids, in_vocab
+
+
+def project_training_verifier_head(
+    *,
+    model: Any,
+    hidden: Any,
+    prompt: list[int],
+    score_positions: list[int],
+) -> tuple[list[float], list[bool], list[int]]:
+    import torch
+
+    device = next(model.parameters()).device
+    hidden_positions = torch.tensor(
+        [pos - 1 for pos in score_positions],
+        dtype=torch.long,
+        device=device,
+    )
+    target_ids = torch.tensor(
+        [prompt[pos] for pos in score_positions],
+        dtype=torch.long,
+        device=device,
+    )
+    gather_ids, in_vocab = target_to_training_gather_ids(model, target_ids, device)
+    with torch.no_grad():
+        selected = hidden.to(device=device, dtype=next(model.parameters()).dtype).index_select(
+            0,
+            hidden_positions,
+        )
+        logits = model.verifier_lm_head(model.verifier_norm(selected)).float()
+        logprobs = torch.log_softmax(logits, dim=-1)
+        gathered = logprobs.gather(-1, gather_ids.unsqueeze(-1)).squeeze(-1)
+        gathered = torch.where(
+            in_vocab,
+            gathered,
+            torch.full_like(gathered, float("nan")),
+        )
+    return (
+        [float(x) for x in gathered.detach().cpu().tolist()],
+        [bool(x) for x in in_vocab.detach().cpu().tolist()],
+        [int(x) for x in gather_ids.detach().cpu().tolist()],
+    )
 
 
 def main() -> None:
@@ -393,6 +460,17 @@ def main() -> None:
     print(f"  draft_vocab_size={draft_vocab_size}")
     print(f"  target_layer_ids={list(model.target_layer_ids)}")
     print(f"  attn_impl={getattr(model, '_attn_impl', None)}")
+    print(f"  mask_token_id={getattr(model.config, 'mask_token_id', None)}")
+    print(f"  verifier_vocab_size={getattr(model, 'verifier_vocab_size', None)}")
+    print(f"  use_draft_vocab={getattr(model, 'use_draft_vocab', None)}")
+    if model.t2d is not None:
+        print(f"  t2d_shape={tuple(model.t2d.shape)}")
+        print(f"  t2d_selected_count={int(model.t2d.sum(dtype=torch.long).item())}")
+    if model.d2t is not None:
+        print(f"  d2t_shape={tuple(model.d2t.shape)}")
+        print(f"  d2t_head={model.d2t[:16].detach().cpu().tolist()}")
+    print(f"  verifier_lm_head_shape={tuple(model.verifier_lm_head.weight.shape)}")
+    print(f"  verifier_norm_shape={tuple(model.verifier_norm.weight.shape)}")
 
     captured_items: list[dict[str, Any]] = []
 
@@ -470,6 +548,8 @@ def main() -> None:
     print(f"  local_score_positions={score_positions}")
     print(f"  packed_score_positions={packed_score_positions}")
     print(f"  hidden_state_source={raw_item.get('_hidden_state_source')}")
+    print(f"  captured_items_count={len(captured_items)}")
+    print(f"  raw_capture_index={raw_capture_index}")
     packed_tokens = batch["input_ids"][0, packed_hidden_start : packed_hidden_end + 1].detach().cpu().tolist()
     raw_tokens = raw_ids[local_hidden_start : local_hidden_end + 1]
     print("TRACE token_alignment")
@@ -498,7 +578,6 @@ def main() -> None:
     print(f"  hidden_shape={tuple(direct['hidden'].shape)}")
     print(f"  prompt_logprobs={[fmt(x) for x in direct['token_logprobs']]}")
 
-    full_head = FullVerifierHead(args.verifier_name_or_path, device, hidden_dtype)
     batch_last = batch["verifier_last_hidden_states"][0]
     raw_last = raw_item["verifier_last_hidden_states"]
     direct_final = direct["hidden"][:, -1]
@@ -517,11 +596,54 @@ def main() -> None:
     print(f"  raw_vs_direct_mean_abs={fmt(raw_direct_mean)}")
 
     batch_prompt = batch["input_ids"][0].detach().cpu().tolist()
+    (
+        train_batch_plog,
+        train_in_vocab,
+        train_gather_ids,
+    ) = project_training_verifier_head(
+        model=model,
+        hidden=batch_last,
+        prompt=batch_prompt,
+        score_positions=packed_score_positions,
+    )
+    train_raw_plog, _, _ = project_training_verifier_head(
+        model=model,
+        hidden=raw_last,
+        prompt=raw_ids,
+        score_positions=score_positions,
+    )
+    train_direct_plog, _, _ = project_training_verifier_head(
+        model=model,
+        hidden=direct_final,
+        prompt=raw_ids,
+        score_positions=score_positions,
+    )
+    print("TRACE training_verifier_projection_before_step")
+    print(
+        "  local_score_pos,target_id,in_draft_vocab,gather_id,"
+        "batch_pruned,raw_pruned,direct_pruned"
+    )
+    for i, pos in enumerate(score_positions):
+        print(
+            "  "
+            f"{pos},"
+            f"{raw_ids[pos]},"
+            f"{train_in_vocab[i]},"
+            f"{train_gather_ids[i]},"
+            f"{fmt(train_batch_plog[i])},"
+            f"{fmt(train_raw_plog[i])},"
+            f"{fmt(train_direct_plog[i])}"
+        )
+
+    full_head = FullVerifierHead(args.verifier_name_or_path, device, hidden_dtype)
+    print("TRACE full_verifier_head")
+    print(f"  lm_head_source={full_head.lm_head_source}")
+    print(f"  lm_head_shape={tuple(full_head.lm_head_weight.shape)}")
     raw_plog = full_head.project(raw_last, raw_ids, score_positions)
     batch_plog = full_head.project(batch_last, batch_prompt, packed_score_positions)
     direct_plog = full_head.project(direct_final, raw_ids, score_positions)
-    print("TRACE verifier_projection_before_step")
-    print("  local_score_pos,target_id,batch,raw,direct_hidden,direct_prompt,batch_minus_prompt")
+    print("TRACE full_verifier_projection_before_step")
+    print("  local_score_pos,target_id,batch_full,raw_full,direct_hidden_full,direct_prompt,batch_minus_prompt")
     for i, pos in enumerate(score_positions):
         print(
             "  "
@@ -540,6 +662,10 @@ def main() -> None:
         key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
         for key, value in batch.items()
     }
+    print("TRACE gpu_batch")
+    for key, value in gpu_batch.items():
+        if hasattr(value, "shape"):
+            print(f"  {key}: shape={tuple(value.shape)} dtype={value.dtype} device={value.device}")
     augmentor = SampledAcceptanceAugmentor(
         SampledAcceptanceConfig(
             vllm_endpoint=args.vllm_endpoint,
@@ -554,11 +680,32 @@ def main() -> None:
     gpu_batch = augmentor(model, gpu_batch)
     print("TRACE augmentor")
     print(f"  added_keys={sorted(set(gpu_batch) - before_keys)}")
+    for key in sorted(set(gpu_batch) - before_keys):
+        value = gpu_batch[key]
+        if hasattr(value, "shape"):
+            preview = value.detach().cpu().flatten()[:16].tolist()
+            print(
+                f"  {key}: shape={tuple(value.shape)} dtype={value.dtype} "
+                f"device={value.device} head={preview}"
+            )
+        else:
+            print(f"  {key}: {value}")
     if "sampled_anchor_pos" in gpu_batch:
         anchor_pos = int(gpu_batch["sampled_anchor_pos"][0].detach().cpu().item())
         anchor_doc = int(gpu_batch["document_ids"][0, anchor_pos].detach().cpu().item())
+        anchor_doc_positions = (
+            gpu_batch["document_ids"][0, : anchor_pos + 1] == anchor_doc
+        ).nonzero(as_tuple=False).flatten()
+        anchor_doc_start = int(anchor_doc_positions[0].detach().cpu().item())
+        anchor_local_pos = anchor_pos - anchor_doc_start
         print(f"  sampled_anchor_pos={anchor_pos}")
         print(f"  sampled_anchor_doc_id={anchor_doc}")
+        print(f"  sampled_anchor_doc_start={anchor_doc_start}")
+        print(f"  sampled_anchor_local_pos={anchor_local_pos}")
+        print(
+            "  sampled_anchor_token="
+            f"{int(gpu_batch['input_ids'][0, anchor_pos].detach().cpu().item())}"
+        )
         print(f"  sampled_target_ids={gpu_batch['sampled_target_ids'][0].detach().cpu().tolist()}")
         print(f"  sampled_target_logprobs={[fmt(float(x)) for x in gpu_batch['sampled_target_logprobs'][0].detach().cpu().tolist()]}")
 
@@ -580,6 +727,20 @@ def main() -> None:
         batch_augmentor=augmentor,
     )
     optimizers = build_optimizers(model, optim_config)
+    print("TRACE optimizer")
+    for idx, optimizer in enumerate(optimizers):
+        param_count = sum(
+            param.numel()
+            for group in optimizer.param_groups
+            for param in group["params"]
+            if getattr(param, "requires_grad", False)
+        )
+        print(
+            f"  optimizer_{idx}={type(optimizer).__name__} "
+            f"lr={optimizer.param_groups[0]['lr']} "
+            f"weight_decay={optimizer.param_groups[0].get('weight_decay')} "
+            f"trainable_param_count={param_count}"
+        )
     for optimizer in optimizers:
         optimizer.zero_grad()
     _draft_tokens, loss, metrics = model(**gpu_batch, **train_call_kwargs)
