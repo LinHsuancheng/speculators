@@ -75,22 +75,65 @@ python scripts/train.py \
   --loss-fn '{"ce": 0.1, "tv": 0.9}' \
   --dflash-decay-gamma 4.0 \
   --confidence-head-alpha 1.0 \
-  --tf-eal-alpha 0.5 \
+  --tf-eal-alpha 0.1 \
   ...
 ```
 
-### Recommended Curriculum
+### Recommended Training Strategy
+
+**Single-Stage Continuous Training (Recommended)**
+
+Enable TF-EAL from the start with a small weight (e.g., 0.1):
+
+```bash
+python scripts/train.py \
+  --loss-fn '{"ce": 0.1, "tv": 0.9}' \
+  --confidence-head-alpha 1.0 \
+  --tf-eal-alpha 0.1 \
+  --epochs 30
+```
+
+**Total Loss Composition:**
+```
+Loss = 0.1 * CE + 0.9 * TV + 1.0 * Confidence + 0.1 * TF-EAL
+```
+
+**Why this works:**
+- **Early training (low accept_rate)**: TF-EAL approximation error is large, but weight is small (0.1) → minimal negative impact. CE+TV dominate and perform normal warm-up.
+- **Late training (high accept_rate)**: TF-EAL approximation becomes accurate → starts providing useful sequence-level gradient signal.
+- **No manual stage switching required**: Single training command from start to finish.
+
+**Alternative weights:**
+- Conservative: `--tf-eal-alpha 0.05` (very small, for safety)
+- Balanced: `--tf-eal-alpha 0.1` (recommended)
+- Aggressive: `--tf-eal-alpha 0.3` (if you trust early approximation)
+
+---
+
+**Alternative: Two-Stage Training (Manual Control)**
+
+If you prefer explicit curriculum stages:
 
 **Stage 1 (warm-up)**: Use `--tf-eal-alpha 0.0` (disabled) for the first ~10-20% of training. Let CE+TV+confidence bring the draft into a reasonable acceptance region.
 
-**Stage 2 (sequence-level)**: Enable `--tf-eal-alpha 0.5` (or gradually ramp it up) once:
-- `position_1_acc ≳ 0.6`
-- `accept_rate ≳ 0.6`
-- `accept_len (τ_old) ≳ 1.5`
+```bash
+python scripts/train.py \
+  --loss-fn '{"ce": 0.1, "tv": 0.9}' \
+  --tf-eal-alpha 0.0 \
+  --epochs 10
+```
+
+**Stage 2 (sequence-level)**: Enable `--tf-eal-alpha 0.5` once `accept_len > 3.0`:
+
+```bash
+python scripts/train.py \
+  --loss-fn '{"ce": 0.05, "tv": 0.45}' \
+  --tf-eal-alpha 0.5 \
+  --epochs 20 \
+  --resume-from-checkpoint ./output/checkpoints/10
+```
 
 Monitor `tf_eal_tau` in the logs—it should start near your current `accept_len` and gradually increase as the draft learns to optimize the full sequence-level objective.
-
-**Stage 3 (optional fine-tune)**: If you later implement non-teacher-forcing draft sampling, the on-policy sampled exact loss can refine away the teacher-forced prefix bias.
 
 ### What Gets Logged
 
