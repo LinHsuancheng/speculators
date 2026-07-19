@@ -26,6 +26,7 @@ from speculators.models.metrics import (
     dflash_loss_decay,
     draft_cat_weights,
     target_cat_weights,
+    tf_eal_loss,
 )
 
 __all__ = [
@@ -83,6 +84,7 @@ def compute_metrics(
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
     cat_mode: CatMode = "none",
+    tf_eal_alpha: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -117,6 +119,37 @@ def compute_metrics(
         accept_prefix = (accept_blocks[:, 1:] * draft_mask).cumprod(dim=-1)
 
     metrics: dict[str, Any] = {}
+
+    # Teacher-forced sequence-level expected-acceptance-length (TF-EAL) loss.
+    # L = -Σ_k Π_{i≤k} a_i on the teacher-forced path. No position decay: the
+    # survival product already gates later positions (see tf_eal_loss docstring).
+    if tf_eal_alpha > 0.0:
+        tf_loss, tf_aux = tf_eal_loss(logits, targets, loss_mask, block_size)
+        loss = loss + tf_eal_alpha * tf_loss
+
+        with torch.no_grad():
+            metrics["tf_eal_loss_sum"] = tf_loss.detach().clone()
+            metrics["tf_eal_loss_total"] = torch.ones((), device=device)
+            # Teacher-forced expected accept length tau_TF = R_TF + 1 (anchor).
+            block_valid = tf_aux["block_valid"]
+            valid_total = block_valid.sum().clamp_min(1.0)
+            metrics["tf_eal_tau_sum"] = (tf_aux["tau"] * block_valid).sum()
+            metrics["tf_eal_tau_total"] = valid_total
+            # Per draft-position survival S_k and continuation credit C_t=Σ_{k≥t}S_k,
+            # so each step's contribution is visible in the logs (pos 1..K).
+            surv = tf_aux["survival"]  # [num_blocks, K]
+            cont = tf_aux["continuation"]  # [num_blocks, K]
+            dmask = tf_aux["draft_mask"]  # [num_blocks, K]
+            per_pos_total = dmask.sum(dim=0).clamp_min(1.0)  # [K]
+            surv_pos = (surv * dmask).sum(dim=0)  # [K]
+            cont_pos = (cont * dmask).sum(dim=0)  # [K]
+            for k in range(surv.shape[1]):
+                pos = k + 1  # draft slot 0 is the anchor
+                metrics[f"tf_eal_survival_pos_{pos}_sum"] = surv_pos[k]
+                metrics[f"tf_eal_survival_pos_{pos}_total"] = per_pos_total[k]
+                metrics[f"tf_eal_credit_pos_{pos}_sum"] = cont_pos[k]
+                metrics[f"tf_eal_credit_pos_{pos}_total"] = per_pos_total[k]
+
     if confidence_logits is not None:
         c_star = accept_rate.detach().to(confidence_logits.dtype)
         bce = binary_cross_entropy_with_logits(

@@ -220,3 +220,81 @@ class TestComputeMetrics:
         # so draft-CAT loss should be <= unweighted loss for the same terms.
         assert float(loss_draft) <= float(loss_none) + 1e-5
         assert "cat_weight_mean_sum" in metrics
+
+
+class TestTfEalLoss:
+    def test_disabled_by_default(self):
+        ids = torch.tensor([[0, 1, 0, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+        _, metrics = compute_metrics(
+            logits, targets, None, loss_mask, 2, loss_config=_DEFAULT_LOSS
+        )
+        assert "tf_eal_loss_sum" not in metrics
+
+    def test_perfect_overlap_tau_equals_block(self):
+        # block_size=4 -> 3 draft slots. Perfect overlap => every a_i=1 =>
+        # R_TF=3, tau=4, and the TF-EAL loss term equals -3.
+        ids = torch.tensor([[0, 1, 2, 3]])
+        logits = _ids_to_logits(ids, 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.float32)
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            tf_eal_alpha=1.0,
+        )
+        tau = metrics["tf_eal_tau_sum"] / metrics["tf_eal_tau_total"]
+        assert abs(float(tau) - 4.0) < 1e-3
+        assert abs(float(metrics["tf_eal_loss_sum"]) - (-3.0)) < 1e-3
+
+    def test_credit_decreases_with_position(self):
+        # Continuation credit C_t = sum_{k>=t} S_k gates later positions, so it
+        # must be non-increasing across draft positions (natural, no decay term).
+        ids = torch.tensor([[0, 1, 2, 3]])
+        logits = _ids_to_logits(ids, 8)
+        # Slight mismatch so survivals shrink and credit strictly decreases.
+        targets = _ids_to_logits(torch.tensor([[0, 1, 5, 6]]), 8)
+        loss_mask = torch.tensor([[0, 1, 1, 1]], dtype=torch.float32)
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            tf_eal_alpha=1.0,
+        )
+        c1 = metrics["tf_eal_credit_pos_1_sum"] / metrics["tf_eal_credit_pos_1_total"]
+        c2 = metrics["tf_eal_credit_pos_2_sum"] / metrics["tf_eal_credit_pos_2_total"]
+        c3 = metrics["tf_eal_credit_pos_3_sum"] / metrics["tf_eal_credit_pos_3_total"]
+        assert float(c1) >= float(c2) >= float(c3)
+        # Per-position survival/credit keys are logged for every draft slot.
+        for pos in (1, 2, 3):
+            assert f"tf_eal_survival_pos_{pos}_sum" in metrics
+            assert f"tf_eal_credit_pos_{pos}_sum" in metrics
+
+    def test_changes_total_loss(self):
+        ids = torch.tensor([[0, 1, 0, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = _ids_to_logits(torch.tensor([[0, 3, 0, 4]]), 8)
+        loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+        loss_off, _ = compute_metrics(
+            logits, targets, None, loss_mask, 2, loss_config=_DEFAULT_LOSS
+        )
+        loss_on, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            2,
+            loss_config=_DEFAULT_LOSS,
+            tf_eal_alpha=0.5,
+        )
+        assert torch.isfinite(loss_on)
+        assert float(loss_on) != float(loss_off)

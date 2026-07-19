@@ -151,6 +151,93 @@ def tv_loss(
     return elementwise_loss  # noqa: RET504
 
 
+def tf_eal_loss(
+    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    loss_mask: torch.Tensor,  # shape: [1, seq_len]
+    block_size: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Teacher-forced sequence-level expected-acceptance-length (TF-EAL) loss.
+
+    On the teacher-forced (target/data) path, the per-position acceptance
+    probability is the distributional overlap ``a_i = Σ_v min(q_i(v), p_i(v))
+    = 1 - d_TV(p_i, q_i)`` (the same quantity as ``tv_loss``). Chaining these
+    over a speculative block gives the cumulative survival ``S_k = Π_{i=1}^k a_i``
+    and the expected accepted length surrogate ``R_TF = Σ_{k=1}^K S_k``. We
+    maximize ``R_TF`` directly, i.e. minimize ``L = -R_TF``.
+
+    Unlike the on-policy sampled exact loss, this needs no draft-sampled tokens
+    and no per-position sampled-token indicator: it is computed directly on the
+    existing target logits. It is a teacher-forced *approximation* of the true
+    on-policy expected acceptance length, tight when ``p ≈ q`` on the relevant
+    prefixes (error ``O(K^2 ε)`` for per-step ``TV ≤ ε``).
+
+    The survival product ``S_k`` supplies a natural position weighting (early
+    positions gate all later ones), so this loss deliberately carries **no**
+    exponential position decay; the ``∂R_TF/∂a_t = S_{t-1} Σ_{k≥t} S_k / a_t``
+    continuation credit is intrinsic.
+
+    Anchor slot 0 (always emitted) is excluded from the draft slots. Masked
+    slots act as acceptance ``1`` inside the prefix product so padding does not
+    shrink later survivals, and are zeroed out of the ``R_TF`` sum.
+
+    Args:
+        logits: Draft model logits (softmax applied internally to form q).
+        targets: Target model logits (softmax applied internally to form p).
+        loss_mask: Boolean mask selecting valid positions.
+        block_size: Speculative block size (including the anchor slot).
+
+    Returns:
+        Tuple of ``(loss, aux)``:
+        * ``loss``: scalar ``-R_TF`` averaged over valid blocks.
+        * ``aux``: dict of detached logging tensors — ``survival`` and
+          ``continuation`` (per-position credit ``Σ_{k≥t} S_k``), both shaped
+          ``[num_blocks, block_size - 1]``, plus per-block ``tau`` (``R_TF + 1``)
+          and ``block_valid`` masks.
+    """
+    seq_len = logits.shape[1]
+    if seq_len % block_size != 0:
+        raise ValueError(
+            f"Sequence length {seq_len} is not divisible by block_size {block_size}."
+        )
+    num_blocks = seq_len // block_size
+
+    draft_p = torch.nn.functional.softmax(logits.float(), dim=-1)
+    target_p = torch.nn.functional.softmax(targets.float(), dim=-1)
+    accept = torch.minimum(draft_p, target_p).sum(dim=-1)  # a_i, [1, seq_len]
+
+    accept_blocks = accept.view(num_blocks, block_size)
+    mask_blocks = loss_mask.to(accept.dtype).view(num_blocks, block_size)
+    # Draft slots only (slot 0 is the always-emitted anchor).
+    draft_a = accept_blocks[:, 1:]  # [num_blocks, K], K = block_size - 1
+    draft_mask = mask_blocks[:, 1:]
+
+    # Masked slots act as acceptance 1 so they do not shrink later survivals.
+    a_for_prod = draft_a * draft_mask + (1.0 - draft_mask)
+    survival = torch.cumprod(a_for_prod, dim=-1)  # S_k, [num_blocks, K]
+    # Only valid draft slots contribute to R_TF = Σ_k S_k.
+    survival_masked = survival * draft_mask
+    r_tf = survival_masked.sum(dim=-1)  # [num_blocks]
+
+    block_valid = (draft_mask.sum(dim=-1) > 0).to(accept.dtype)  # [num_blocks]
+    denom = block_valid.sum().clamp_min(1.0)
+    loss = -(r_tf * block_valid).sum() / denom
+
+    with torch.no_grad():
+        # Continuation credit C_t = Σ_{k≥t} S_k (reverse cumsum along draft slots).
+        continuation = torch.flip(
+            torch.cumsum(torch.flip(survival_masked, dims=[-1]), dim=-1), dims=[-1]
+        )
+        aux = {
+            "survival": survival_masked.detach(),  # [num_blocks, K]
+            "continuation": continuation.detach(),  # [num_blocks, K]
+            "draft_mask": draft_mask.detach(),  # [num_blocks, K]
+            "tau": (r_tf + 1.0).detach(),  # [num_blocks]
+            "block_valid": block_valid.detach(),  # [num_blocks]
+        }
+    return loss, aux
+
+
 def neg_log_acceptance_loss(
     logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]

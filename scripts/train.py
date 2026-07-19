@@ -1049,6 +1049,18 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--tf-eal-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "DSpark: weight of the teacher-forced sequence-level expected-"
+            "acceptance-length (TF-EAL) loss L = -Σ_k Π_{i≤k}(1 - TV(p_i, q_i)). "
+            "0 disables it (default). Enable in a second curriculum stage once "
+            "the draft has a reasonable acceptance rate. Carries no position "
+            "decay by design (survival product already gates later positions)."
+        ),
+    )
+    parser.add_argument(
         "--draft-attn-impl",
         type=str,
         default="simple_flex_attention",
