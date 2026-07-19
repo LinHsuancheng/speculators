@@ -49,6 +49,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-index", type=int, default=45760)
     parser.add_argument("--batch-indices", type=int, nargs="*", default=None)
     parser.add_argument("--vllm-endpoint", default="http://localhost:8000/v1")
+    parser.add_argument("--device", default="npu:15")
+    parser.add_argument(
+        "--dtype",
+        default="bfloat16",
+        choices=["auto", "float32", "float16", "bfloat16"],
+    )
     parser.add_argument("--total-seq-len", type=int, default=3072)
     parser.add_argument("--local-start", type=int, default=67)
     parser.add_argument("--gt-len", type=int, default=7)
@@ -75,6 +81,13 @@ def _parser() -> argparse.ArgumentParser:
         default=False,
         help="Also compute full-tensor hidden diffs, not only the local window.",
     )
+    parser.add_argument(
+        "--self-project",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Project each request's own connector hidden and compare with its own prompt_logprobs.",
+    )
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--keep-hidden-files", action="store_true")
     return parser
 
@@ -94,6 +107,16 @@ def _diff_stats(a: Any, b: Any) -> tuple[float, float]:
 
 def _max_abs_delta(a: list[float], b: list[float]) -> float:
     return max(abs(x - y) for x, y in zip(a, b, strict=True)) if a else float("nan")
+
+
+def _resolve_dtype(torch: Any, value: str) -> Any:
+    if value == "auto":
+        return "auto"
+    return {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[value]
 
 
 def _wait_for_hidden_file(path_value: str, timeout: float) -> None:
@@ -125,6 +148,57 @@ def _make_openai_client(endpoint: str) -> tuple[Any, str]:
     client = openai.OpenAI(base_url=endpoint, api_key="EMPTY", max_retries=0)
     model_id = client.models.list().data[0].id
     return client, model_id
+
+
+def _load_hf_model(args: argparse.Namespace) -> Any:
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    dtype = _resolve_dtype(torch, args.dtype)
+    kwargs: dict[str, Any] = {"trust_remote_code": args.trust_remote_code}
+    if dtype != "auto":
+        kwargs["dtype"] = dtype
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model_path, **kwargs)
+    except TypeError:
+        if dtype != "auto":
+            kwargs.pop("dtype", None)
+            kwargs["torch_dtype"] = dtype
+        model = AutoModelForCausalLM.from_pretrained(args.model_path, **kwargs)
+    model.to(torch.device(args.device))
+    model.eval()
+    return model
+
+
+def _project_hidden_to_prompt_logprobs(
+    *,
+    hf_model: Any,
+    hidden_states: Any,
+    prompt: list[int],
+    score_positions: list[int],
+) -> list[float]:
+    import torch
+
+    device = next(hf_model.parameters()).device
+    final_slot = hidden_states.shape[1] - 1
+    hidden_positions = torch.tensor(
+        [pos - 1 for pos in score_positions],
+        dtype=torch.long,
+        device=device,
+    )
+    target_ids = torch.tensor(
+        [prompt[pos] for pos in score_positions],
+        dtype=torch.long,
+        device=device,
+    )
+    with torch.no_grad():
+        final_hidden = hidden_states[:, final_slot].to(device=device)
+        selected_hidden = final_hidden.index_select(0, hidden_positions)
+        selected_hidden = hf_model.model.norm(selected_hidden)
+        logits = hf_model.lm_head(selected_hidden).float()
+        logprobs = torch.log_softmax(logits, dim=-1)
+        gathered = logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    return [float(x) for x in gathered.detach().cpu().tolist()]
 
 
 def _request_scored_hidden(
@@ -417,6 +491,46 @@ def _compare_mode(
         print("  conclusion=mixed; inspect per-document classifications")
 
 
+def _print_self_projection(
+    *,
+    label: str,
+    items: list[dict[str, Any]],
+    runs: dict[int, dict[str, Any]],
+    hf_model: Any,
+    logprob_tol: float,
+) -> None:
+    print(f"TRACE {label}.self_projection")
+    print("  doc_id,dataset_index,self_projection_vs_own_prompt_max_abs,classification,projected_logprobs")
+    bad = 0
+    for item in items:
+        index = item["dataset_index"]
+        run = runs[index]
+        projected = _project_hidden_to_prompt_logprobs(
+            hf_model=hf_model,
+            hidden_states=run["hidden"],
+            prompt=item["token_ids"],
+            score_positions=item["score_positions"],
+        )
+        max_abs = _max_abs_delta(projected, run["token_logprobs"])
+        is_bad = max_abs > logprob_tol
+        bad += int(is_bad)
+        classification = "self_projection_bad" if is_bad else "self_projection_ok"
+        print(
+            "  "
+            f"{item['doc_id']},"
+            f"{index},"
+            f"{_fmt(max_abs)},"
+            f"{classification},"
+            f"{[_fmt(x) for x in projected]}"
+        )
+    print(f"TRACE {label}.self_projection_summary")
+    print(f"  bad_self_projection_count={bad}")
+    if bad:
+        print("  conclusion=some connector hidden tensors do not reconstruct their own request prompt_logprobs")
+    else:
+        print("  conclusion=connector hidden tensors reconstruct their own request prompt_logprobs")
+
+
 def main() -> None:
     args = _parser().parse_args()
 
@@ -457,6 +571,7 @@ def main() -> None:
     print(f"  local_score_positions={list(range(args.local_start + 1, args.local_start + args.gt_len + 1))}")
     print(f"  mode={args.mode}")
     print(f"  compare_full_hidden={args.compare_full_hidden}")
+    print(f"  self_project={args.self_project}")
 
     print("TRACE batch_items")
     for item in items:
@@ -478,6 +593,15 @@ def main() -> None:
         hidden_file_timeout=args.hidden_file_timeout,
     )
     _print_request_summary(label="reference", items=items, runs=references)
+    hf_model = _load_hf_model(args) if args.self_project else None
+    if hf_model is not None:
+        _print_self_projection(
+            label="reference",
+            items=items,
+            runs=references,
+            hf_model=hf_model,
+            logprob_tol=args.logprob_tol,
+        )
 
     replay_modes = ["sequential", "concurrent"] if args.mode == "both" else [args.mode]
     replay_runs: list[tuple[str, dict[int, dict[str, Any]]]] = []
@@ -504,6 +628,14 @@ def main() -> None:
             )
         replay_runs.append((mode, runs))
         _print_request_summary(label=mode, items=items, runs=runs)
+        if hf_model is not None:
+            _print_self_projection(
+                label=mode,
+                items=items,
+                runs=runs,
+                hf_model=hf_model,
+                logprob_tol=args.logprob_tol,
+            )
         _compare_mode(
             mode=mode,
             items=items,

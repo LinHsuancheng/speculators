@@ -20,21 +20,18 @@ GT_LEN="${GT_LEN:-7}"
 PROMPT_LOGPROBS="${PROMPT_LOGPROBS:-1}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-120}"
 HIDDEN_FILE_TIMEOUT="${HIDDEN_FILE_TIMEOUT:-30}"
-MODE="${MODE:-both}"
 MAX_WORKERS="${MAX_WORKERS:-0}"
-LOGPROB_TOL="${LOGPROB_TOL:-0.5}"
-HIDDEN_TOL="${HIDDEN_TOL:-0.01}"
-COMPARE_FULL_HIDDEN="${COMPARE_FULL_HIDDEN:-0}"
-SELF_PROJECT="${SELF_PROJECT:-1}"
+ROUNDS="${ROUNDS:-1}"
+TOLERANCE="${TOLERANCE:-0.5}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 KEEP_HIDDEN_FILES="${KEEP_HIDDEN_FILES:-0}"
 
 LOG_DIR="${LOG_DIR:-/tmp/dspark_trace_logs}"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/check_dspark_batch_request_binding_$(date +%Y%m%d_%H%M%S).log}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/check_dspark_concurrent_hidden_self_projection_$(date +%Y%m%d_%H%M%S).log}"
 
 args=(
-  "${REPO_ROOT}/script/debug/check_dspark_batch_request_binding.py"
+  "${REPO_ROOT}/script/debug/check_dspark_concurrent_hidden_self_projection.py"
   --model-path "${MODEL_PATH}"
   --data-path "${DATA_PATH}"
   --dataset-index "${DATASET_INDEX}"
@@ -47,23 +44,14 @@ args=(
   --prompt-logprobs "${PROMPT_LOGPROBS}"
   --request-timeout "${REQUEST_TIMEOUT}"
   --hidden-file-timeout "${HIDDEN_FILE_TIMEOUT}"
-  --mode "${MODE}"
   --max-workers "${MAX_WORKERS}"
-  --logprob-tol "${LOGPROB_TOL}"
-  --hidden-tol "${HIDDEN_TOL}"
+  --rounds "${ROUNDS}"
+  --tolerance "${TOLERANCE}"
 )
 
 if [[ -n "${BATCH_INDICES}" ]]; then
   read -r -a BATCH_INDEX_ARGS <<< "${BATCH_INDICES}"
   args+=(--batch-indices "${BATCH_INDEX_ARGS[@]}")
-fi
-
-if [[ "${COMPARE_FULL_HIDDEN}" == "1" ]]; then
-  args+=(--compare-full-hidden)
-fi
-
-if [[ "${SELF_PROJECT}" != "1" ]]; then
-  args+=(--no-self-project)
 fi
 
 if [[ "${TRUST_REMOTE_CODE}" == "1" ]]; then
@@ -74,7 +62,7 @@ if [[ "${KEEP_HIDDEN_FILES}" == "1" ]]; then
   args+=(--keep-hidden-files)
 fi
 
-echo "Writing DSpark batch request binding check to ${LOG_FILE}"
+echo "Writing concurrent hidden self-projection check to ${LOG_FILE}"
 echo "Command:"
 printf ' %q' "${PYTHON_BIN}" "${args[@]}"
 echo
