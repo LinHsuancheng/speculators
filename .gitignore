@@ -183,3 +183,4 @@ logs/*
 # ai
 CLAUDE.md
 AGENT.md
+.codex/*
