@@ -50,6 +50,15 @@ def _parser() -> argparse.ArgumentParser:
         help="0 means use the full dataset item for the raw_doc case.",
     )
     parser.add_argument("--repeat", type=int, default=2)
+    parser.add_argument(
+        "--warmup-generate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "First issue a dataloader-style hidden-only raw-doc request "
+            "without prompt_logprobs, then compare later requests against it."
+        ),
+    )
     parser.add_argument("--prompt-logprobs", type=int, default=1)
     parser.add_argument("--request-timeout", type=float, default=120.0)
     parser.add_argument("--hidden-file-timeout", type=float, default=30.0)
@@ -186,6 +195,44 @@ def _request_vllm(
     }
 
 
+def _request_vllm_hidden_only(
+    *,
+    client: Any,
+    model_id: str,
+    prompt: list[int],
+    request_timeout: float,
+    hidden_file_timeout: float,
+) -> dict[str, Any]:
+    from safetensors.torch import load_file
+    from speculators.data_generation.vllm_client import (
+        _kv_hidden_states_path,
+        _prompt_token_ids,
+    )
+
+    response = client.completions.create(
+        model=model_id,
+        prompt=prompt,
+        max_tokens=1,
+        extra_body={"return_token_ids": True},
+        timeout=request_timeout,
+    )
+    response_prompt_ids = _prompt_token_ids(response)
+    if response_prompt_ids is None:
+        raise RuntimeError("vLLM hidden-only response missing prompt_token_ids")
+    hidden_path = _kv_hidden_states_path(response)
+    if hidden_path is None:
+        raise RuntimeError("vLLM hidden-only response missing hidden_states_path")
+
+    _wait_for_hidden_file(hidden_path, timeout=hidden_file_timeout)
+    loaded = load_file(hidden_path)
+    return {
+        "prompt_ids": response_prompt_ids,
+        "hidden_path": hidden_path,
+        "file_token_ids": loaded["token_ids"].detach().cpu().tolist(),
+        "hidden": loaded["hidden_states"],
+    }
+
+
 def _load_hf_model(args: argparse.Namespace, torch: Any) -> tuple[Any, Any]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -308,6 +355,8 @@ def _compare_case(
     prompt: list[int],
     score_positions: list[int],
     connector_layer_ids: list[int],
+    reference_hidden: dict[str, Any] | None = None,
+    reference_label: str = "reference",
 ) -> None:
     from transformers import AutoConfig
 
@@ -341,6 +390,45 @@ def _compare_case(
     print(f"  hidden_shapes={hf_shapes}")
     print(f"  expected_hidden_size={hidden_size}")
     print(f"  hf_logits_logprobs={[_fmt(x) for x in hf_logprobs]}")
+
+    if reference_hidden is not None:
+        print(f"TRACE case.{name}.{reference_label}_compare")
+        print(f"  prompt_ids_match={reference_hidden['prompt_ids'] == prompt}")
+        print(f"  file_token_ids_match={reference_hidden['file_token_ids'] == prompt}")
+        print(f"  hidden_path={reference_hidden['hidden_path']}")
+        print(f"  hidden_shape={tuple(reference_hidden['hidden'].shape)}")
+        print(
+            "  layer,slot,hidden_pos,ref_vs_hf_max_abs,ref_vs_hf_mean_abs,"
+            "ref_normed_vs_hf_max_abs,ref_normed_vs_hf_mean_abs"
+        )
+        final_layer_id = connector_layer_ids[-1]
+        for slot, layer_id in enumerate(connector_layer_ids):
+            for score_pos in score_positions:
+                hidden_pos = score_pos - 1
+                ref_vec = reference_hidden["hidden"][
+                    hidden_pos,
+                    slot,
+                ].detach().float().cpu()
+                hf_vec = hf_outputs.hidden_states[
+                    layer_id
+                ][0, hidden_pos].detach().float().cpu()
+                raw_diff = (ref_vec - hf_vec).abs()
+                normed_max = "<na>"
+                normed_mean = "<na>"
+                if layer_id == final_layer_id:
+                    device = next(hf_model.parameters()).device
+                    normed = hf_model.model.norm(
+                        reference_hidden["hidden"][hidden_pos, slot].to(device=device)
+                    ).detach().float().cpu()
+                    normed_diff = (normed - hf_vec).abs()
+                    normed_max = _fmt(float(normed_diff.max().item()))
+                    normed_mean = _fmt(float(normed_diff.mean().item()))
+                print(
+                    f"  {layer_id},{slot},{hidden_pos},"
+                    f"{_fmt(float(raw_diff.max().item()))},"
+                    f"{_fmt(float(raw_diff.mean().item()))},"
+                    f"{normed_max},{normed_mean}"
+                )
 
     runs = []
     for run_idx in range(max(args.repeat, 1)):
@@ -460,9 +548,32 @@ def _compare_case(
                         f"{_fmt(float(diff.mean().item()))}"
                     )
 
+    if reference_hidden is not None:
+        print(f"TRACE case.{name}.{reference_label}_vs_vllm_run0")
+        print("  layer,slot,hidden_pos,max_abs_diff,mean_abs_diff")
+        ref = reference_hidden["hidden"]
+        cur = runs[0]["hidden"]
+        if tuple(ref.shape) != tuple(cur.shape):
+            print(f"  <shape_mismatch>,{tuple(ref.shape)}!={tuple(cur.shape)}")
+        else:
+            for slot, layer_id in enumerate(connector_layer_ids):
+                for score_pos in score_positions:
+                    hidden_pos = score_pos - 1
+                    diff = (
+                        ref[hidden_pos, slot].detach().float().cpu()
+                        - cur[hidden_pos, slot].detach().float().cpu()
+                    ).abs()
+                    print(
+                        f"  {layer_id},{slot},{hidden_pos},"
+                        f"{_fmt(float(diff.max().item()))},"
+                        f"{_fmt(float(diff.mean().item()))}"
+                    )
+
     if not args.keep_hidden_files:
         for run in runs:
             _delete_hidden_file(run["hidden_path"])
+        if reference_hidden is not None:
+            _delete_hidden_file(reference_hidden["hidden_path"])
 
 
 def main() -> None:
@@ -508,12 +619,31 @@ def main() -> None:
     print(f"  prefix_len={args.prefix_len}")
     print(f"  gt_len={args.gt_len}")
     print(f"  repeat={args.repeat}")
+    print(f"  warmup_generate={args.warmup_generate}")
 
     client, model_id = _make_openai_client(args.vllm_endpoint)
     print("TRACE vllm")
     print(f"  model_id={model_id}")
 
     hf_model, tokenizer = _load_hf_model(args, torch)
+
+    warmup_hidden = None
+    raw_len = len(token_ids) if args.raw_max_len <= 0 else min(args.raw_max_len, len(token_ids))
+    if args.warmup_generate:
+        warmup_prompt = token_ids[:raw_len]
+        warmup_hidden = _request_vllm_hidden_only(
+            client=client,
+            model_id=model_id,
+            prompt=warmup_prompt,
+            request_timeout=args.request_timeout,
+            hidden_file_timeout=args.hidden_file_timeout,
+        )
+        print("TRACE warmup_generate")
+        print(f"  prompt_len={len(warmup_prompt)}")
+        print(f"  prompt_ids_match={warmup_hidden['prompt_ids'] == warmup_prompt}")
+        print(f"  file_token_ids_match={warmup_hidden['file_token_ids'] == warmup_prompt}")
+        print(f"  hidden_path={warmup_hidden['hidden_path']}")
+        print(f"  hidden_shape={tuple(warmup_hidden['hidden'].shape)}")
 
     doc_prompt_len = args.prefix_len + args.gt_len
     doc_prompt = token_ids[:doc_prompt_len]
@@ -531,7 +661,6 @@ def main() -> None:
         connector_layer_ids=connector_layer_ids,
     )
 
-    raw_len = len(token_ids) if args.raw_max_len <= 0 else min(args.raw_max_len, len(token_ids))
     if raw_len >= doc_prompt_len:
         raw_prompt = token_ids[:raw_len]
         raw_score_positions = list(range(args.prefix_len, args.prefix_len + args.gt_len))
@@ -546,6 +675,8 @@ def main() -> None:
             prompt=raw_prompt,
             score_positions=raw_score_positions,
             connector_layer_ids=connector_layer_ids,
+            reference_hidden=warmup_hidden,
+            reference_label="warmup_generate",
         )
     else:
         print("TRACE case.raw_doc skipped: raw_len shorter than prefix+gt")

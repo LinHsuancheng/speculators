@@ -19,6 +19,7 @@ PREFIX_LEN="${PREFIX_LEN:-68}"
 GT_LEN="${GT_LEN:-7}"
 RAW_MAX_LEN="${RAW_MAX_LEN:-0}"
 REPEAT="${REPEAT:-2}"
+WARMUP_GENERATE="${WARMUP_GENERATE:-1}"
 PROMPT_LOGPROBS="${PROMPT_LOGPROBS:-1}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-120}"
 HIDDEN_FILE_TIMEOUT="${HIDDEN_FILE_TIMEOUT:-30}"
@@ -61,6 +62,10 @@ fi
 
 if [[ "${KEEP_HIDDEN_FILES}" == "1" ]]; then
   args+=(--keep-hidden-files)
+fi
+
+if [[ "${WARMUP_GENERATE}" != "1" ]]; then
+  args+=(--no-warmup-generate)
 fi
 
 echo "Writing alignment check to ${LOG_FILE}"
