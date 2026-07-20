@@ -62,6 +62,10 @@ RESULT_COLUMNS = [
     "acceptance_length",
     "accepted_draft_length",
     "position_accept_rates",
+    "position_accept_prob_means",
+    "position_support_accept_rate_means",
+    "position_accept_prob_sums",
+    "position_support_accept_rate_sums",
     "position_accepted_counts",
     "position_proposed_counts",
 ]
@@ -79,6 +83,8 @@ class VerificationResult:
     target_output: Any
     target_probs: Any
     accept_prefix_mask: Any | None
+    accept_probs: Any | None
+    support_accept_rates: Any | None
     accepted_draft_tokens: int
     next_token: Any
     effective_proposal_length: int
@@ -95,6 +101,8 @@ class EvalStats:
     num_accepted_draft_tokens: int = 0
     position_proposed_counts: list[int] = field(default_factory=list)
     position_accepted_counts: list[int] = field(default_factory=list)
+    position_accept_prob_sums: list[float] = field(default_factory=list)
+    position_support_accept_rate_sums: list[float] = field(default_factory=list)
 
     @property
     def acceptance_length(self) -> float:
@@ -125,10 +133,36 @@ class EvalStats:
             )
         ]
 
+    @property
+    def position_accept_prob_means(self) -> list[float]:
+        return [
+            accept_prob_sum / proposed if proposed else 0.0
+            for accept_prob_sum, proposed in zip(
+                self.position_accept_prob_sums,
+                self.position_proposed_counts,
+                strict=True,
+            )
+        ]
+
+    @property
+    def position_support_accept_rate_means(self) -> list[float]:
+        return [
+            support_accept_rate_sum / proposed if proposed else 0.0
+            for support_accept_rate_sum, proposed in zip(
+                self.position_support_accept_rate_sums,
+                self.position_proposed_counts,
+                strict=True,
+            )
+        ]
+
     def add_response(self, response: SimpleNamespace) -> None:
         self.total_output_tokens += int(response.num_output_tokens)
         proposal_lengths = getattr(response, "proposal_lengths", [])
         accepted_lengths = getattr(response, "accepted_draft_lengths", [])
+        accept_prob_lists = getattr(response, "accept_prob_lists", [])
+        support_accept_rate_lists = getattr(
+            response, "support_accept_rate_lists", []
+        )
         self.num_proposals += len(proposal_lengths)
         self.num_proposed_draft_tokens += sum(int(x) for x in proposal_lengths)
         self.num_accepted_draft_tokens += sum(int(x) for x in accepted_lengths)
@@ -138,6 +172,18 @@ class EvalStats:
             strict=True,
         ):
             self.add_proposal_positions(int(proposal_len), int(accepted_len))
+        if accept_prob_lists or support_accept_rate_lists:
+            for proposal_len, accept_probs, support_accept_rates in zip(
+                proposal_lengths,
+                accept_prob_lists,
+                support_accept_rate_lists,
+                strict=True,
+            ):
+                self.add_proposal_probability_stats(
+                    int(proposal_len),
+                    accept_probs,
+                    support_accept_rates,
+                )
 
     def add_proposal_positions(self, proposal_len: int, accepted_len: int) -> None:
         if proposal_len < 0 or accepted_len < 0:
@@ -156,6 +202,38 @@ class EvalStats:
             if pos < accepted_len:
                 self.position_accepted_counts[pos] += 1
 
+    def add_proposal_probability_stats(
+        self,
+        proposal_len: int,
+        accept_probs: list[float],
+        support_accept_rates: list[float] | None,
+    ) -> None:
+        if len(accept_probs) != proposal_len:
+            raise ValueError(
+                f"accept_probs length {len(accept_probs)} does not match "
+                f"proposal_len {proposal_len}"
+            )
+        if (
+            support_accept_rates is not None
+            and len(support_accept_rates) != proposal_len
+        ):
+            raise ValueError(
+                f"support_accept_rates length {len(support_accept_rates)} does not "
+                f"match proposal_len {proposal_len}"
+            )
+
+        missing = proposal_len - len(self.position_accept_prob_sums)
+        if missing > 0:
+            self.position_accept_prob_sums.extend([0.0] * missing)
+            self.position_support_accept_rate_sums.extend([0.0] * missing)
+
+        for pos in range(proposal_len):
+            self.position_accept_prob_sums[pos] += float(accept_probs[pos])
+            if support_accept_rates is not None:
+                self.position_support_accept_rate_sums[pos] += float(
+                    support_accept_rates[pos]
+                )
+
 
 def _format_position_accept_rates(stats: EvalStats) -> str:
     rates = stats.position_accept_rates
@@ -171,6 +249,14 @@ def _format_position_accept_rates(stats: EvalStats) -> str:
     ) + "]"
 
 
+def _format_position_float_rates(prefix: str, values: list[float]) -> str:
+    if not values:
+        return "[]"
+    return "[" + ", ".join(
+        f"{prefix}{idx}={value:.4f}" for idx, value in enumerate(values)
+    ) + "]"
+
+
 def _parse_count_list(value: Any) -> list[int]:
     if isinstance(value, str):
         if not value:
@@ -179,6 +265,16 @@ def _parse_count_list(value: Any) -> list[int]:
     if not isinstance(value, list):
         return []
     return [int(item) for item in value]
+
+
+def _parse_float_list(value: Any) -> list[float]:
+    if isinstance(value, str):
+        if not value:
+            return []
+        value = json.loads(value)
+    if not isinstance(value, list):
+        return []
+    return [float(item) for item in value]
 
 
 def logits_to_probs(logits, temperature: float):
@@ -406,17 +502,35 @@ def _format_device_memory() -> str:
 def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     position_proposed_counts: list[int] = []
     position_accepted_counts: list[int] = []
+    position_accept_prob_sums: list[float] = []
+    position_support_accept_rate_sums: list[float] = []
     for row in rows:
         proposed = _parse_count_list(row.get("position_proposed_counts", []))
         accepted = _parse_count_list(row.get("position_accepted_counts", []))
+        accept_prob_sums = _parse_float_list(
+            row.get("position_accept_prob_sums", [])
+        )
+        support_accept_rate_sums = _parse_float_list(
+            row.get("position_support_accept_rate_sums", [])
+        )
         size = max(len(position_proposed_counts), len(proposed))
         if len(position_proposed_counts) < size:
             position_proposed_counts.extend([0] * (size - len(position_proposed_counts)))
             position_accepted_counts.extend([0] * (size - len(position_accepted_counts)))
+            position_accept_prob_sums.extend(
+                [0.0] * (size - len(position_accept_prob_sums))
+            )
+            position_support_accept_rate_sums.extend(
+                [0.0] * (size - len(position_support_accept_rate_sums))
+            )
         for idx, count in enumerate(proposed):
             position_proposed_counts[idx] += count
         for idx, count in enumerate(accepted):
             position_accepted_counts[idx] += count
+        for idx, value in enumerate(accept_prob_sums):
+            position_accept_prob_sums[idx] += value
+        for idx, value in enumerate(support_accept_rate_sums):
+            position_support_accept_rate_sums[idx] += value
 
     stats = EvalStats(
         elapsed_s=max((float(row["elapsed_s"]) for row in rows), default=0.0),
@@ -430,6 +544,8 @@ def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         position_proposed_counts=position_proposed_counts,
         position_accepted_counts=position_accepted_counts,
+        position_accept_prob_sums=position_accept_prob_sums,
+        position_support_accept_rate_sums=position_support_accept_rate_sums,
     )
     num_requests = sum(int(row["num_requests"]) for row in rows)
     return {
@@ -448,6 +564,14 @@ def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "acceptance_length": stats.acceptance_length,
         "accepted_draft_length": stats.accepted_draft_length,
         "position_accept_rates": json.dumps(stats.position_accept_rates),
+        "position_accept_prob_means": json.dumps(stats.position_accept_prob_means),
+        "position_support_accept_rate_means": json.dumps(
+            stats.position_support_accept_rate_means
+        ),
+        "position_accept_prob_sums": json.dumps(stats.position_accept_prob_sums),
+        "position_support_accept_rate_sums": json.dumps(
+            stats.position_support_accept_rate_sums
+        ),
         "position_accepted_counts": json.dumps(stats.position_accepted_counts),
         "position_proposed_counts": json.dumps(stats.position_proposed_counts),
     }
@@ -552,15 +676,36 @@ def verify_draft_tokens(
     target_probs = logits_to_probs(target_output.logits, float(temperature))
 
     accept_prefix_mask = None
+    accept_probs = None
+    support_accept_rates = None
     if draft_token_count > 0:
         assert proposal.draft_probs is not None
         proposed_tokens = proposal.verify_input_ids[:, 1:]
-        selected_target_probs = gather_token_probs(target_probs[:, :-1, :], proposed_tokens)
+        selected_target_probs = gather_token_probs(
+            target_probs[:, :-1, :],
+            proposed_tokens,
+        )
         selected_draft_probs = gather_token_probs(
             proposal.draft_probs,
             proposed_tokens,
         ).clamp_min(1e-8)
-        accept_prob = torch.clamp(selected_target_probs / selected_draft_probs, max=1.0)
+        accept_prob = torch.clamp(
+            selected_target_probs / selected_draft_probs,
+            max=1.0,
+        )
+        accept_probs = accept_prob
+        support_target_logits = target_output.logits[:, :-1, :].masked_fill(
+            proposal.draft_probs[:, :draft_token_count, :] <= 0,
+            torch.finfo(target_output.logits.dtype).min,
+        )
+        support_target_probs = logits_to_probs(
+            support_target_logits,
+            float(temperature),
+        )
+        support_accept_rates = torch.minimum(
+            proposal.draft_probs[:, :draft_token_count, :],
+            support_target_probs,
+        ).sum(dim=-1)
         accept_mask = (torch.rand_like(accept_prob) < accept_prob).to(torch.int64)
         accept_prefix_mask = accept_mask.cumprod(dim=1)
         accepted_draft_tokens = int(accept_prefix_mask.sum(dim=1)[0].item())
@@ -602,6 +747,8 @@ def verify_draft_tokens(
         target_output=target_output,
         target_probs=target_probs,
         accept_prefix_mask=accept_prefix_mask,
+        accept_probs=accept_probs,
+        support_accept_rates=support_accept_rates,
         accepted_draft_tokens=accepted_draft_tokens,
         next_token=next_token,
         effective_proposal_length=effective_proposal_length,
@@ -651,6 +798,8 @@ def generate_decoding_sample(
     acceptance_lengths: list[int] = []
     proposal_lengths: list[int] = []
     accepted_draft_lengths: list[int] = []
+    accept_prob_lists: list[list[float]] = []
+    support_accept_rate_lists: list[list[float]] = []
     initial_token = output_ids[:, num_input_tokens : num_input_tokens + 1]
     if has_stop_token(initial_token, stop_token_ids):
         output_ids = output_ids[:, : num_input_tokens + 1]
@@ -662,6 +811,8 @@ def generate_decoding_sample(
             acceptance_lengths=acceptance_lengths,
             proposal_lengths=proposal_lengths,
             accepted_draft_lengths=accepted_draft_lengths,
+            accept_prob_lists=accept_prob_lists,
+            support_accept_rate_lists=support_accept_rate_lists,
             verify_count=0,
         )
 
@@ -696,6 +847,18 @@ def generate_decoding_sample(
         proposal_lengths.append(int(verification.effective_proposal_length))
         accepted = int(verification.accepted_draft_tokens)
         accepted_draft_lengths.append(accepted)
+        if verification.accept_probs is None:
+            accept_prob_lists.append([])
+        else:
+            accept_prob_lists.append(
+                verification.accept_probs.detach().float()[0].tolist()
+            )
+        if verification.support_accept_rates is None:
+            support_accept_rate_lists.append([])
+        else:
+            support_accept_rate_lists.append(
+                verification.support_accept_rates.detach().float()[0].tolist()
+            )
         output_ids[:, start : start + accepted + 1] = (
             proposal.verify_input_ids[:, : accepted + 1]
         )
@@ -726,6 +889,8 @@ def generate_decoding_sample(
         acceptance_lengths=acceptance_lengths,
         proposal_lengths=proposal_lengths,
         accepted_draft_lengths=accepted_draft_lengths,
+        accept_prob_lists=accept_prob_lists,
+        support_accept_rate_lists=support_accept_rate_lists,
         verify_count=len(proposal_lengths),
     )
 
@@ -997,7 +1162,7 @@ def _evaluate_dataset(
                 (
                     "[%s%s] %d/%d samples | out_tok=%d | tok/s=%.2f | "
                     "acc_len=%.3f | draft_len=%.3f | accepted_draft_len=%.3f | "
-                    "pos_accept=%s | mem=%s"
+                    "pos_accept=%s | pos_accept_prob=%s | pos_proxy=%s | mem=%s"
                 ),
                 path.stem,
                 _shard_label(args),
@@ -1009,6 +1174,14 @@ def _evaluate_dataset(
                 stats.draft_length,
                 stats.accepted_draft_length,
                 _format_position_accept_rates(stats),
+                _format_position_float_rates(
+                    "pos",
+                    stats.position_accept_prob_means,
+                ),
+                _format_position_float_rates(
+                    "proxy",
+                    stats.position_support_accept_rate_means,
+                ),
                 _format_device_memory(),
             )
         del response
@@ -1032,6 +1205,14 @@ def _evaluate_dataset(
         "acceptance_length": stats.acceptance_length,
         "accepted_draft_length": stats.accepted_draft_length,
         "position_accept_rates": json.dumps(stats.position_accept_rates),
+        "position_accept_prob_means": json.dumps(stats.position_accept_prob_means),
+        "position_support_accept_rate_means": json.dumps(
+            stats.position_support_accept_rate_means
+        ),
+        "position_accept_prob_sums": json.dumps(stats.position_accept_prob_sums),
+        "position_support_accept_rate_sums": json.dumps(
+            stats.position_support_accept_rate_sums
+        ),
         "position_accepted_counts": json.dumps(stats.position_accepted_counts),
         "position_proposed_counts": json.dumps(stats.position_proposed_counts),
     }
@@ -1198,7 +1379,8 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
         logger.info(
             (
                 "[%s] result | requests=%d | tok/s=%.2f | acc_len=%.4f | "
-                "draft_len=%.4f | accepted_draft_len=%.4f | pos_accept=%s"
+                "draft_len=%.4f | accepted_draft_len=%.4f | "
+                "pos_accept=%s | pos_accept_prob=%s | pos_proxy=%s"
             ),
             dataset_path.stem,
             row["num_requests"],
@@ -1214,6 +1396,16 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
                     position_proposed_counts=_parse_count_list(
                         row.get("position_proposed_counts", []),
                     ),
+                ),
+            ),
+            _format_position_float_rates(
+                "pos",
+                _parse_float_list(row.get("position_accept_prob_means", [])),
+            ),
+            _format_position_float_rates(
+                "proxy",
+                _parse_float_list(
+                    row.get("position_support_accept_rate_means", []),
                 ),
             ),
         )
@@ -1315,7 +1507,7 @@ def run(args: argparse.Namespace) -> None:
             (
                 "[%s%s] done | requests=%d | tok/s=%.2f | "
                 "acc_len=%.4f | draft_len=%.4f | accepted_draft_len=%.4f | "
-                "pos_accept=%s | mem=%s"
+                "pos_accept=%s | pos_accept_prob=%s | pos_proxy=%s | mem=%s"
             ),
             path.stem,
             _shard_label(args),
@@ -1332,6 +1524,16 @@ def run(args: argparse.Namespace) -> None:
                     position_proposed_counts=_parse_count_list(
                         row.get("position_proposed_counts", []),
                     ),
+                ),
+            ),
+            _format_position_float_rates(
+                "pos",
+                _parse_float_list(row.get("position_accept_prob_means", [])),
+            ),
+            _format_position_float_rates(
+                "proxy",
+                _parse_float_list(
+                    row.get("position_support_accept_rate_means", []),
                 ),
             ),
             _format_device_memory(),

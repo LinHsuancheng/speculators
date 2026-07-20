@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import math
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -114,6 +115,53 @@ def test_eval_stats_position_accept_rates():
     assert stats.position_proposed_counts == [3, 3, 2]
     assert stats.position_accepted_counts == [2, 1, 1]
     assert stats.position_accept_rates == [2 / 3, 1 / 3, 1 / 2]
+
+
+def test_eval_stats_position_probability_means():
+    module = _load_module()
+    stats = module.EvalStats()
+    stats.add_response(
+        SimpleNamespace(
+            num_output_tokens=0,
+            proposal_lengths=[2, 2],
+            accepted_draft_lengths=[1, 0],
+            accept_prob_lists=[[0.8, 0.2], [0.4, 0.1]],
+            support_accept_rate_lists=[[0.9, 0.3], [0.7, 0.5]],
+        ),
+    )
+
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(
+            stats.position_accept_prob_sums,
+            [1.2, 0.3],
+            strict=True,
+        )
+    )
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(
+            stats.position_support_accept_rate_sums,
+            [1.6, 0.8],
+            strict=True,
+        )
+    )
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(
+            stats.position_accept_prob_means,
+            [0.6, 0.15],
+            strict=True,
+        )
+    )
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(
+            stats.position_support_accept_rate_means,
+            [0.8, 0.4],
+            strict=True,
+        )
+    )
 
 
 def test_aggregate_rows_merges_position_accept_rates():
