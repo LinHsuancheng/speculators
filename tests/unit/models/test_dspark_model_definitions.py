@@ -3,8 +3,13 @@
 import pytest
 import torch
 
+from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+
+
+def test_dspark_sample_from_anchor_defaults_to_false():
+    assert DSparkSpeculatorConfig().sample_from_anchor is False
 
 
 class TestMarkovHead:

@@ -136,7 +136,7 @@ class DSparkDraftModel(DFlashDraftModel):
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
         prev_token_ids = self._build_markov_prev_token_ids(
             block_tokens,
-            getattr(self.config, "sample_from_anchor", True),
+            getattr(self.config, "sample_from_anchor", False),
         )
         hidden_blocks = hidden.view(num_blocks, block, -1)
 

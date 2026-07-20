@@ -120,6 +120,8 @@ def run(args: argparse.Namespace) -> None:
     ).to(device).eval()
 
     draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    if args.sample_from_anchor:
+        draft_config.sample_from_anchor = True
     draft_attn_impl = eval_impl._resolve_draft_attn_impl(args.device, args.draft_attn_impl)
     if draft_attn_impl is not None:
         draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
@@ -266,6 +268,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--d2t-path", type=Path, default=None)
     parser.add_argument("--t2d-path", type=Path, default=None)
+    parser.add_argument(
+        "--sample-from-anchor",
+        action="store_true",
+        help="Enable PR 806 DSpark Markov previous-token alignment.",
+    )
     parser.add_argument(
         "--draft-attn-impl",
         choices=["auto", "simple_flex_attention", "sdpa", "eager"],

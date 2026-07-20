@@ -379,7 +379,7 @@ def _draft_ids_to_target_ids(draft, draft_ids: list[int]) -> list[int]:
 
 
 def _draft_sample_from_anchor(draft) -> bool:
-    return bool(getattr(getattr(draft, "config", None), "sample_from_anchor", True))
+    return bool(getattr(getattr(draft, "config", None), "sample_from_anchor", False))
 
 
 def _load_vocab_mapping_tensors(
@@ -1167,6 +1167,8 @@ def run(args: argparse.Namespace) -> None:
 
     logger.info("Loading DSpark draft: %s", args.draft_model)
     draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    if args.sample_from_anchor:
+        draft_config.sample_from_anchor = True
     draft_attn_impl = _resolve_draft_attn_impl(args.device, args.draft_attn_impl)
     if draft_attn_impl is not None:
         logger.info("Using draft attention backend: %s", draft_attn_impl)
@@ -1256,6 +1258,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--d2t-path", type=Path, default=None)
     parser.add_argument("--t2d-path", type=Path, default=None)
+    parser.add_argument(
+        "--sample-from-anchor",
+        action="store_true",
+        help="Enable PR 806 DSpark Markov previous-token alignment.",
+    )
     parser.add_argument(
         "--ascend-devices",
         default=None,

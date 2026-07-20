@@ -53,3 +53,12 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+    sample_from_anchor: bool = Field(
+        default=False,
+        description=(
+            "Use PR 806 Markov previous-token alignment. When enabled, the Markov "
+            "head conditions each draft slot on the token at the same block offset; "
+            "when disabled, it uses the shifted previous-token alignment expected "
+            "by older checkpoints."
+        ),
+    )
