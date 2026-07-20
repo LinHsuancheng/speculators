@@ -275,6 +275,33 @@ def _shard_label(args: argparse.Namespace) -> str:
     return f"/shard{shard_index}"
 
 
+def _format_device_memory() -> str:
+    if torch is None:
+        return "unavailable"
+
+    backend = None
+    if hasattr(torch, "npu"):
+        backend = torch.npu
+    elif hasattr(torch, "cuda") and torch.cuda.is_available():
+        backend = torch.cuda
+    if backend is None:
+        return "unavailable"
+
+    try:
+        allocated = backend.memory_allocated()
+        reserved = backend.memory_reserved()
+        max_allocated = backend.max_memory_allocated()
+    except Exception as exc:  # pragma: no cover - backend-specific diagnostics
+        return f"unavailable:{exc}"
+
+    gib = 1024**3
+    return (
+        f"allocated={allocated / gib:.2f}GiB "
+        f"reserved={reserved / gib:.2f}GiB "
+        f"max_allocated={max_allocated / gib:.2f}GiB"
+    )
+
+
 def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     stats = EvalStats(
         elapsed_s=max((float(row["elapsed_s"]) for row in rows), default=0.0),
@@ -469,6 +496,7 @@ def generate_decoding_sample(
         position_ids=position_ids,
         num_input_tokens=num_input_tokens,
     )
+    del output
 
     while start < max_length:
         proposal = propose(
@@ -509,6 +537,7 @@ def generate_decoding_sample(
         start += accepted + 1
         past_key_values_target.crop(start)
         update(context, verification)
+        del proposal, verification
 
         if has_stop_token(new_token_ids, stop_token_ids):
             break
@@ -709,17 +738,18 @@ class DSparkOfflineRunner:
 
     def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
-        return generate_decoding_sample(
-            target_model=self.target_model,
-            input_ids=input_ids,
-            max_new_tokens=int(self.args.max_new_tokens),
-            max_proposal_tokens=self.max_proposal_tokens,
-            temperature=float(self.args.temperature),
-            stop_token_ids=stop_token_ids,
-            init_context=self._init_context,
-            propose=self._propose,
-            update=self._update,
-        )
+        with torch.inference_mode():
+            return generate_decoding_sample(
+                target_model=self.target_model,
+                input_ids=input_ids,
+                max_new_tokens=int(self.args.max_new_tokens),
+                max_proposal_tokens=self.max_proposal_tokens,
+                temperature=float(self.args.temperature),
+                stop_token_ids=stop_token_ids,
+                init_context=self._init_context,
+                propose=self._propose,
+                update=self._update,
+            )
 
 
 def _evaluate_dataset(
@@ -778,7 +808,7 @@ def _evaluate_dataset(
             logger.info(
                 (
                     "[%s%s] %d/%d samples | out_tok=%d | tok/s=%.2f | "
-                    "acc_len=%.3f | draft_len=%.3f | accepted_draft_len=%.3f"
+                    "acc_len=%.3f | draft_len=%.3f | accepted_draft_len=%.3f | mem=%s"
                 ),
                 path.stem,
                 _shard_label(args),
@@ -789,7 +819,9 @@ def _evaluate_dataset(
                 stats.acceptance_length,
                 stats.draft_length,
                 stats.accepted_draft_length,
+                _format_device_memory(),
             )
+        del response
 
     stats.elapsed_s = time.perf_counter() - start_time
     row = {
@@ -1033,6 +1065,12 @@ def run(args: argparse.Namespace) -> None:
         args.draft_model,
         config=draft_config,
     ).to(device).eval()
+    logger.info(
+        "Loaded models | device=%s | ASCEND_RT_VISIBLE_DEVICES=%s | mem=%s",
+        device,
+        os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
+        _format_device_memory(),
+    )
 
     runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
     stop_token_ids = resolve_stop_token_ids(target_model, tokenizer)
@@ -1054,7 +1092,7 @@ def run(args: argparse.Namespace) -> None:
         logger.info(
             (
                 "[%s%s] done | requests=%d | tok/s=%.2f | "
-                "acc_len=%.4f | draft_len=%.4f | accepted_draft_len=%.4f"
+                "acc_len=%.4f | draft_len=%.4f | accepted_draft_len=%.4f | mem=%s"
             ),
             path.stem,
             _shard_label(args),
@@ -1063,6 +1101,7 @@ def run(args: argparse.Namespace) -> None:
             row["acceptance_length"],
             row["draft_length"],
             row["accepted_draft_length"],
+            _format_device_memory(),
         )
 
     _write_outputs(args.output_dir, rows, artifacts_by_dataset)
