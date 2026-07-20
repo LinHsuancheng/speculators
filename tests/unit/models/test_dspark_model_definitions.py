@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
 
 
@@ -64,6 +65,29 @@ class TestMarkovHead:
                 hidden_size=16,
                 head_type="bogus",
             )
+
+
+class TestDSparkMarkovPrevTokens:
+    def test_sample_from_anchor_uses_raw_block_tokens(self):
+        block_tokens = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+
+        prev_token_ids = DSparkDraftModel._build_markov_prev_token_ids(
+            block_tokens,
+            sample_from_anchor=True,
+        )
+
+        assert torch.equal(prev_token_ids, block_tokens)
+
+    def test_non_anchor_sampling_uses_shifted_previous_tokens(self):
+        block_tokens = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+
+        prev_token_ids = DSparkDraftModel._build_markov_prev_token_ids(
+            block_tokens,
+            sample_from_anchor=False,
+        )
+
+        expected = torch.tensor([[10, 10, 11, 12], [20, 20, 21, 22]])
+        assert torch.equal(prev_token_ids, expected)
 
 
 class TestConfidenceHead:
