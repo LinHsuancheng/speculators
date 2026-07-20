@@ -5,6 +5,7 @@
 #   VERIFIER_MODEL=/path/to/verifier \
 #   DRAFT_MODEL=/path/to/dspark/checkpoint \
 #   DEEPSPEC_EVAL_DATASETS=/path/to/DeepSpec/eval_datasets \
+#   ASCEND_DEVICES=8,9,10,11,12,13,14,15 \
 #   bash examples/evaluate/dspark_deepspec_offline.sh
 
 set -euo pipefail
@@ -20,6 +21,7 @@ TEMPERATURE="${TEMPERATURE:-0.0}"
 DEVICE="${DEVICE:-npu}"
 DTYPE="${DTYPE:-bfloat16}"
 DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-auto}"
+ASCEND_DEVICES="${ASCEND_DEVICES:-8,9,10,11,12,13,14,15}"
 DATASETS="${DATASETS:-}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
 SKIP_ARTIFACTS="${SKIP_ARTIFACTS:-0}"
@@ -56,6 +58,10 @@ cmd=(
     --draft-attn-impl "$DRAFT_ATTN_IMPL"
     --trust-remote-code
 )
+
+if [[ -n "$ASCEND_DEVICES" ]]; then
+    cmd+=(--ascend-devices "$ASCEND_DEVICES")
+fi
 
 if [[ -n "$DATASETS" ]]; then
     cmd+=(--datasets "$DATASETS")

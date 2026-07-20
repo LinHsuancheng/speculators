@@ -20,6 +20,9 @@ import argparse
 import csv
 import json
 import logging
+import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +58,7 @@ RESULT_COLUMNS = [
     "num_proposals",
     "num_proposed_draft_tokens",
     "num_accepted_draft_tokens",
+    "draft_length",
     "acceptance_length",
     "accepted_draft_length",
 ]
@@ -92,6 +96,12 @@ class EvalStats:
         if self.num_proposals == 0:
             return 1.0
         return 1.0 + self.num_accepted_draft_tokens / self.num_proposals
+
+    @property
+    def draft_length(self) -> float:
+        if self.num_proposals == 0:
+            return 0.0
+        return self.num_proposed_draft_tokens / self.num_proposals
 
     @property
     def accepted_draft_length(self) -> float:
@@ -230,6 +240,70 @@ def _discover_datasets(root: Path, names: list[str] | None) -> list[Path]:
     if not paths:
         raise FileNotFoundError(f"No JSONL datasets found under {root}")
     return paths
+
+
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _shard_records(
+    records: list[dict[str, Any]],
+    *,
+    shard_index: int | None,
+    num_shards: int,
+) -> list[tuple[int, dict[str, Any]]]:
+    indexed_records = list(enumerate(records, start=1))
+    if shard_index is None or num_shards <= 1:
+        return indexed_records
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(
+            f"shard_index must be in [0, {num_shards}), got {shard_index}"
+        )
+    return [
+        item
+        for zero_based_index, item in enumerate(indexed_records)
+        if zero_based_index % num_shards == shard_index
+    ]
+
+
+def _shard_label(args: argparse.Namespace) -> str:
+    shard_index = getattr(args, "worker_shard_index", None)
+    if shard_index is None:
+        return ""
+    return f"/shard{shard_index}"
+
+
+def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    stats = EvalStats(
+        elapsed_s=max((float(row["elapsed_s"]) for row in rows), default=0.0),
+        total_output_tokens=sum(int(row["total_output_tokens"]) for row in rows),
+        num_proposals=sum(int(row["num_proposals"]) for row in rows),
+        num_proposed_draft_tokens=sum(
+            int(row["num_proposed_draft_tokens"]) for row in rows
+        ),
+        num_accepted_draft_tokens=sum(
+            int(row["num_accepted_draft_tokens"]) for row in rows
+        ),
+    )
+    num_requests = sum(int(row["num_requests"]) for row in rows)
+    return {
+        "dataset": dataset,
+        "num_requests": num_requests,
+        "elapsed_s": stats.elapsed_s,
+        "requests_per_second": num_requests / stats.elapsed_s if stats.elapsed_s else 0,
+        "output_tokens_per_second": (
+            stats.total_output_tokens / stats.elapsed_s if stats.elapsed_s else 0
+        ),
+        "total_output_tokens": stats.total_output_tokens,
+        "num_proposals": stats.num_proposals,
+        "num_proposed_draft_tokens": stats.num_proposed_draft_tokens,
+        "num_accepted_draft_tokens": stats.num_accepted_draft_tokens,
+        "draft_length": stats.draft_length,
+        "acceptance_length": stats.acceptance_length,
+        "accepted_draft_length": stats.accepted_draft_length,
+    }
 
 
 def _draft_ids_to_target_ids(draft, draft_ids: list[int]) -> list[int]:
@@ -658,15 +732,25 @@ def _evaluate_dataset(
     records = _load_jsonl(path)
     if args.max_samples is not None:
         records = records[: args.max_samples]
+    indexed_records = _shard_records(
+        records,
+        shard_index=getattr(args, "worker_shard_index", None),
+        num_shards=getattr(args, "worker_num_shards", 1),
+    )
 
     stats = EvalStats()
     artifacts: list[dict[str, Any]] = []
     start_time = time.perf_counter()
-    iterator = enumerate(records, start=1)
+    iterator = indexed_records
     if tqdm is not None and not args.no_progress:
-        iterator = tqdm(iterator, total=len(records), desc=path.stem, unit="sample")
+        iterator = tqdm(
+            iterator,
+            total=len(indexed_records),
+            desc=path.stem,
+            unit="sample",
+        )
 
-    for idx, record in iterator:
+    for processed, (idx, record) in enumerate(iterator, start=1):
         prompt = _prompt_from_record(
             record,
             runner.tokenizer,
@@ -680,28 +764,41 @@ def _evaluate_dataset(
                     "prompt": prompt,
                     "output_token_ids": response.output_ids[0].tolist(),
                     "num_input_tokens": int(response.num_input_tokens),
+                    "source_index": idx,
                 }
             )
 
-        if idx == 1 or idx % args.log_every == 0 or idx == len(records):
+        if (
+            processed == 1
+            or processed % args.log_every == 0
+            or processed == len(indexed_records)
+        ):
             elapsed = time.perf_counter() - start_time
             out_tps = stats.total_output_tokens / elapsed if elapsed else 0.0
             logger.info(
-                "[%s] %d/%d samples | out_tok=%d | out_tps=%.2f | acc_len=%.3f",
+                (
+                    "[%s%s] %d/%d samples | out_tok=%d | tok/s=%.2f | "
+                    "acc_len=%.3f | draft_len=%.3f | accepted_draft_len=%.3f"
+                ),
                 path.stem,
-                idx,
-                len(records),
+                _shard_label(args),
+                processed,
+                len(indexed_records),
                 stats.total_output_tokens,
                 out_tps,
                 stats.acceptance_length,
+                stats.draft_length,
+                stats.accepted_draft_length,
             )
 
     stats.elapsed_s = time.perf_counter() - start_time
     row = {
         "dataset": path.stem,
-        "num_requests": len(records),
+        "num_requests": len(indexed_records),
         "elapsed_s": stats.elapsed_s,
-        "requests_per_second": len(records) / stats.elapsed_s if stats.elapsed_s else 0,
+        "requests_per_second": (
+            len(indexed_records) / stats.elapsed_s if stats.elapsed_s else 0
+        ),
         "output_tokens_per_second": (
             stats.total_output_tokens / stats.elapsed_s if stats.elapsed_s else 0
         ),
@@ -709,6 +806,7 @@ def _evaluate_dataset(
         "num_proposals": stats.num_proposals,
         "num_proposed_draft_tokens": stats.num_proposed_draft_tokens,
         "num_accepted_draft_tokens": stats.num_accepted_draft_tokens,
+        "draft_length": stats.draft_length,
         "acceptance_length": stats.acceptance_length,
         "accepted_draft_length": stats.accepted_draft_length,
     }
@@ -738,6 +836,152 @@ def _write_outputs(
                 f.write(json.dumps(artifact) + "\n")
 
 
+def _read_worker_row(output_dir: Path) -> dict[str, Any]:
+    with (output_dir / "summary.json").open(encoding="utf-8") as f:
+        rows = json.load(f)
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise ValueError(f"{output_dir}/summary.json must contain one result row")
+    return rows[0]
+
+
+def _read_worker_artifacts(output_dir: Path, dataset: str) -> list[dict[str, Any]]:
+    path = output_dir / "artifacts" / f"{dataset}.jsonl"
+    if not path.exists():
+        return []
+    return _load_jsonl(path)
+
+
+def _worker_command(
+    args: argparse.Namespace,
+    *,
+    dataset_path: Path,
+    shard_index: int,
+    num_shards: int,
+    output_dir: Path,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--verifier-model",
+        args.verifier_model,
+        "--draft-model",
+        args.draft_model,
+        "--datasets-root",
+        str(dataset_path),
+        "--output-dir",
+        str(output_dir),
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--temperature",
+        str(args.temperature),
+        "--device",
+        args.device,
+        "--dtype",
+        args.dtype,
+        "--draft-attn-impl",
+        args.draft_attn_impl,
+        "--log-every",
+        str(args.log_every),
+        "--worker-shard-index",
+        str(shard_index),
+        "--worker-num-shards",
+        str(num_shards),
+        "--no-progress",
+    ]
+    if args.max_samples is not None:
+        cmd.extend(["--max-samples", str(args.max_samples)])
+    if args.skip_artifacts:
+        cmd.append("--skip-artifacts")
+    if args.trust_remote_code:
+        cmd.append("--trust-remote-code")
+    return cmd
+
+
+def run_ascend_data_parallel(args: argparse.Namespace) -> None:
+    devices = _split_csv(args.ascend_devices)
+    if not devices:
+        raise ValueError("--ascend-devices must contain at least one device id")
+
+    dataset_names = _split_csv(args.datasets)
+    dataset_paths = _discover_datasets(args.datasets_root, dataset_names or None)
+    rows: list[dict[str, Any]] = []
+    artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
+
+    for dataset_path in dataset_paths:
+        dataset_start = time.perf_counter()
+        shard_root = args.output_dir / "_shards" / dataset_path.stem
+        logger.info(
+            "[%s] loading dataset | shards=%d | ASCEND devices=%s",
+            dataset_path.stem,
+            len(devices),
+            ",".join(devices),
+        )
+
+        processes = []
+        for shard_index, visible_device in enumerate(devices):
+            shard_output_dir = shard_root / f"shard_{shard_index}"
+            cmd = _worker_command(
+                args,
+                dataset_path=dataset_path,
+                shard_index=shard_index,
+                num_shards=len(devices),
+                output_dir=shard_output_dir,
+            )
+            env = os.environ.copy()
+            env["ASCEND_RT_VISIBLE_DEVICES"] = visible_device
+            logger.info(
+                "[%s/shard%d] start | ASCEND_RT_VISIBLE_DEVICES=%s",
+                dataset_path.stem,
+                shard_index,
+                visible_device,
+            )
+            processes.append((shard_index, shard_output_dir, subprocess.Popen(cmd, env=env)))
+
+        failed = []
+        for shard_index, _, process in processes:
+            returncode = process.wait()
+            if returncode != 0:
+                failed.append((shard_index, returncode))
+        if failed:
+            raise RuntimeError(f"{dataset_path.stem} worker failures: {failed}")
+
+        shard_rows = [
+            _read_worker_row(shard_output_dir) for _, shard_output_dir, _ in processes
+        ]
+        row = _aggregate_rows(dataset_path.stem, shard_rows)
+        row["elapsed_s"] = time.perf_counter() - dataset_start
+        row["requests_per_second"] = (
+            row["num_requests"] / row["elapsed_s"] if row["elapsed_s"] else 0
+        )
+        row["output_tokens_per_second"] = (
+            row["total_output_tokens"] / row["elapsed_s"] if row["elapsed_s"] else 0
+        )
+        rows.append(row)
+
+        if not args.skip_artifacts:
+            artifacts = []
+            for _, shard_output_dir, _ in processes:
+                artifacts.extend(_read_worker_artifacts(shard_output_dir, dataset_path.stem))
+            artifacts.sort(key=lambda item: int(item.get("source_index", 0)))
+            artifacts_by_dataset[dataset_path.stem] = artifacts
+
+        _write_outputs(args.output_dir, rows, artifacts_by_dataset)
+        logger.info(
+            (
+                "[%s] result | requests=%d | tok/s=%.2f | acc_len=%.4f | "
+                "draft_len=%.4f | accepted_draft_len=%.4f"
+            ),
+            dataset_path.stem,
+            row["num_requests"],
+            row["output_tokens_per_second"],
+            row["acceptance_length"],
+            row["draft_length"],
+            row["accepted_draft_length"],
+        )
+
+    logger.info("Wrote merged results to %s", args.output_dir)
+
+
 def _resolve_draft_attn_impl(device: str, draft_attn_impl: str) -> str | None:
     if draft_attn_impl != "auto":
         return draft_attn_impl
@@ -748,6 +992,13 @@ def _resolve_draft_attn_impl(device: str, draft_attn_impl: str) -> str | None:
 
 def run(args: argparse.Namespace) -> None:
     global torch, DynamicCache
+
+    if (
+        getattr(args, "ascend_devices", None)
+        and getattr(args, "worker_shard_index", None) is None
+    ):
+        run_ascend_data_parallel(args)
+        return
 
     import torch as torch_module  # noqa: PLC0415
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
@@ -801,10 +1052,17 @@ def run(args: argparse.Namespace) -> None:
         if not args.skip_artifacts:
             artifacts_by_dataset[path.stem] = artifacts
         logger.info(
-            "[%s] output_tps=%.2f acceptance_length=%.4f",
+            (
+                "[%s%s] done | requests=%d | tok/s=%.2f | "
+                "acc_len=%.4f | draft_len=%.4f | accepted_draft_len=%.4f"
+            ),
             path.stem,
+            _shard_label(args),
+            row["num_requests"],
             row["output_tokens_per_second"],
             row["acceptance_length"],
+            row["draft_length"],
+            row["accepted_draft_length"],
         )
 
     _write_outputs(args.output_dir, rows, artifacts_by_dataset)
@@ -834,6 +1092,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--skip-artifacts", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--ascend-devices",
+        default=None,
+        help=(
+            "Comma-separated physical Ascend device ids for dataset-sharded "
+            "parallel evaluation, for example 8,9,10,11,12,13,14,15."
+        ),
+    )
+    parser.add_argument("--worker-shard-index", type=int, default=None)
+    parser.add_argument("--worker-num-shards", type=int, default=1)
     return parser.parse_args()
 
 

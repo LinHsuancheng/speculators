@@ -70,4 +70,48 @@ def test_eval_stats_acceptance_length():
     )
 
     assert stats.acceptance_length == 4.0
+    assert stats.draft_length == 7.0
     assert stats.accepted_draft_length == 3.0
+
+
+def test_shard_records_round_robin():
+    module = _load_module()
+    records = [{"prompt": str(i)} for i in range(7)]
+
+    shard = module._shard_records(records, shard_index=1, num_shards=3)
+
+    assert shard == [(2, records[1]), (5, records[4])]
+
+
+def test_aggregate_rows_recomputes_weighted_lengths():
+    module = _load_module()
+
+    row = module._aggregate_rows(
+        "sample",
+        [
+            {
+                "num_requests": 2,
+                "elapsed_s": 4.0,
+                "total_output_tokens": 20,
+                "num_proposals": 2,
+                "num_proposed_draft_tokens": 8,
+                "num_accepted_draft_tokens": 4,
+            },
+            {
+                "num_requests": 3,
+                "elapsed_s": 5.0,
+                "total_output_tokens": 40,
+                "num_proposals": 3,
+                "num_proposed_draft_tokens": 18,
+                "num_accepted_draft_tokens": 9,
+            },
+        ],
+    )
+
+    assert row["dataset"] == "sample"
+    assert row["num_requests"] == 5
+    assert row["elapsed_s"] == 5.0
+    assert row["output_tokens_per_second"] == 12.0
+    assert row["draft_length"] == 5.2
+    assert row["acceptance_length"] == 3.6
+    assert row["accepted_draft_length"] == 2.6
