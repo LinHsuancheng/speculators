@@ -16,8 +16,6 @@ backbone forward. The evaluator structure is intentionally the same, so that can
 be swapped for a cached draft path once the model API supports it.
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import json
