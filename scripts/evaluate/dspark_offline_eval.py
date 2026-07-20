@@ -340,6 +340,10 @@ def _draft_ids_to_target_ids(draft, draft_ids: list[int]) -> list[int]:
     return draft_ids
 
 
+def _draft_sample_from_anchor(draft) -> bool:
+    return bool(getattr(getattr(draft, "config", None), "sample_from_anchor", True))
+
+
 def _load_vocab_mapping_tensors(
     *,
     draft_model_path: str,
@@ -613,7 +617,13 @@ class DSparkOfflineRunner:
         self.tokenizer = tokenizer
         self.args = args
         self.device = next(target_model.parameters()).device
-        self.max_proposal_tokens = max(1, int(draft_model.block_size) - 1)
+        self.sample_from_anchor = _draft_sample_from_anchor(draft_model)
+        speculative_slots = (
+            int(draft_model.block_size)
+            if self.sample_from_anchor
+            else int(draft_model.block_size) - 1
+        )
+        self.max_proposal_tokens = max(1, speculative_slots)
 
     def _extract_context_feature(self, hidden_states):
         return torch.cat(
@@ -713,9 +723,10 @@ class DSparkOfflineRunner:
         proposed_target_ids: list[int] = []
         draft_probs = []
         prev_token = first_prev_token_id.reshape(1, 1).long()
+        first_slot = 0 if self.sample_from_anchor else 1
 
         for token_idx in range(max_tokens):
-            slot = token_idx + 1
+            slot = first_slot + token_idx
             logits = base_logits[:, slot : slot + 1, :]
             if draft.markov_head is not None:
                 logits = logits + draft.markov_head.block_bias(

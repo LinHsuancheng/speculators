@@ -75,6 +75,20 @@ def test_eval_stats_acceptance_length():
     assert stats.accepted_draft_length == 3.0
 
 
+def test_draft_sample_from_anchor_defaults_to_true():
+    module = _load_module()
+
+    assert module._draft_sample_from_anchor(SimpleNamespace()) is True
+
+
+def test_draft_sample_from_anchor_reads_config():
+    module = _load_module()
+
+    draft = SimpleNamespace(config=SimpleNamespace(sample_from_anchor=False))
+
+    assert module._draft_sample_from_anchor(draft) is False
+
+
 def test_shard_records_round_robin():
     module = _load_module()
     records = [{"prompt": str(i)} for i in range(7)]

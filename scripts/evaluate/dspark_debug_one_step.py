@@ -149,7 +149,7 @@ def run(args: argparse.Namespace) -> None:
     logger.info(
         (
             "draft block_size=%s max_proposal_tokens=%s use_draft_vocab=%s "
-            "draft_vocab=%s verifier_vocab=%s markov_head=%s"
+            "draft_vocab=%s verifier_vocab=%s markov_head=%s sample_from_anchor=%s"
         ),
         draft_model.block_size,
         runner.max_proposal_tokens,
@@ -157,6 +157,7 @@ def run(args: argparse.Namespace) -> None:
         draft_model.draft_vocab_size,
         draft_model.verifier_vocab_size,
         draft_model.markov_head is not None,
+        runner.sample_from_anchor,
     )
     logger.info("loaded | mem=%s", eval_impl._format_device_memory())
 
@@ -213,8 +214,9 @@ def run(args: argparse.Namespace) -> None:
 
         sampled_target_ids = []
         prev_token = anchor_token.reshape(1, 1).long()
+        first_slot = 0 if runner.sample_from_anchor else 1
         for token_idx in range(runner.max_proposal_tokens):
-            slot = token_idx + 1
+            slot = first_slot + token_idx
             logits = base_logits[:, slot : slot + 1, :]
             if draft_model.markov_head is not None:
                 logits = logits + draft_model.markov_head.block_bias(
