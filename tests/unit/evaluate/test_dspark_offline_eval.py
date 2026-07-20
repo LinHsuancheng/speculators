@@ -1,5 +1,6 @@
 import importlib.util
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -115,3 +116,59 @@ def test_aggregate_rows_recomputes_weighted_lengths():
     assert row["draft_length"] == 5.2
     assert row["acceptance_length"] == 3.6
     assert row["accepted_draft_length"] == 2.6
+
+
+def test_draft_ids_to_target_ids_uses_d2t_offsets():
+    module = _load_module()
+    module.torch = __import__("torch")
+
+    class Draft:
+        use_draft_vocab = True
+        d2t = module.torch.tensor([0, 4, 10])
+
+    assert module._draft_ids_to_target_ids(Draft(), [0, 1, 2]) == [0, 5, 12]
+
+
+def test_expand_draft_probs_uses_d2t_offsets():
+    module = _load_module()
+    module.torch = __import__("torch")
+
+    class Draft:
+        use_draft_vocab = True
+        verifier_vocab_size = 8
+        t2d = module.torch.zeros(8, dtype=module.torch.bool)
+        d2t = module.torch.tensor([0, 2, 4])
+
+    runner = object.__new__(module.DSparkOfflineRunner)
+    runner.draft_model = Draft()
+    draft_probs = module.torch.tensor([[[0.2, 0.3, 0.5]]])
+
+    expanded = runner._expand_draft_probs_to_target_vocab(draft_probs)
+
+    assert expanded.shape == (1, 1, 8)
+    assert module.torch.allclose(
+        expanded[0, 0],
+        module.torch.tensor([0.2, 0.0, 0.0, 0.3, 0.0, 0.0, 0.5, 0.0]),
+    )
+    assert module.torch.allclose(expanded.sum(), module.torch.tensor(1.0))
+
+
+def test_ensure_loaded_vocab_mappings_rejects_missing_pruned_mapping(tmp_path: Path):
+    module = _load_module()
+    module.torch = __import__("torch")
+
+    class Draft:
+        use_draft_vocab = True
+
+    args = SimpleNamespace(
+        draft_model=str(tmp_path),
+        d2t_path=None,
+        t2d_path=None,
+    )
+
+    try:
+        module._ensure_loaded_vocab_mappings(Draft(), args)
+    except ValueError as exc:
+        assert "no real d2t/t2d mapping" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")

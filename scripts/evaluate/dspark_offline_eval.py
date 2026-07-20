@@ -336,8 +336,60 @@ def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _draft_ids_to_target_ids(draft, draft_ids: list[int]) -> list[int]:
     if draft.use_draft_vocab and draft.d2t is not None:
         d2t = draft.d2t
-        return [int(d2t[token_id].item()) for token_id in draft_ids]
+        return [int(token_id + d2t[token_id].item()) for token_id in draft_ids]
     return draft_ids
+
+
+def _load_vocab_mapping_tensors(
+    *,
+    draft_model_path: str,
+    d2t_path: Path | None,
+    t2d_path: Path | None,
+):
+    if d2t_path is None and t2d_path is None:
+        draft_path = Path(draft_model_path)
+        d2t_path = draft_path / "d2t.npy"
+        t2d_path = draft_path / "t2d.npy"
+        if not d2t_path.exists() and not t2d_path.exists():
+            return None, None
+    elif d2t_path is None or t2d_path is None:
+        raise ValueError("--d2t-path and --t2d-path must be provided together.")
+
+    if d2t_path is None or t2d_path is None:
+        return None, None
+    if not d2t_path.exists():
+        raise FileNotFoundError(f"d2t mapping file not found: {d2t_path}")
+    if not t2d_path.exists():
+        raise FileNotFoundError(f"t2d mapping file not found: {t2d_path}")
+
+    import numpy as np  # noqa: PLC0415
+
+    logger.info("Loading vocab mappings: d2t=%s t2d=%s", d2t_path, t2d_path)
+    return torch.from_numpy(np.load(d2t_path)), torch.from_numpy(np.load(t2d_path))
+
+
+def _ensure_loaded_vocab_mappings(draft_model, args: argparse.Namespace) -> None:
+    if not draft_model.use_draft_vocab:
+        return
+    if (
+        draft_model.t2d is not None
+        and int(draft_model.t2d.sum(dtype=torch.long).item())
+        == int(draft_model.draft_vocab_size)
+    ):
+        return
+
+    d2t, t2d = _load_vocab_mapping_tensors(
+        draft_model_path=args.draft_model,
+        d2t_path=args.d2t_path,
+        t2d_path=args.t2d_path,
+    )
+    if d2t is None or t2d is None:
+        raise ValueError(
+            "DSpark draft uses a pruned draft vocab, but no real d2t/t2d mapping "
+            "was loaded. Pass --d2t-path and --t2d-path, or place d2t.npy and "
+            "t2d.npy under --draft-model."
+        )
+    draft_model.load_vocab_mappings(t2d, d2t)
 
 
 def verify_draft_tokens(
@@ -471,7 +523,6 @@ def generate_decoding_sample(
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample_from_probs(
         logits_to_probs(output.logits[:, -1:, :], float(temperature))
     )
-
     start = num_input_tokens
     acceptance_lengths: list[int] = []
     proposal_lengths: list[int] = []
@@ -682,13 +733,19 @@ class DSparkOfflineRunner:
 
     def _expand_draft_probs_to_target_vocab(self, draft_probs):
         draft = self.draft_model
-        if not draft.use_draft_vocab or draft.t2d is None:
+        if not draft.use_draft_vocab or draft.d2t is None:
             return draft_probs
-        target_vocab_size = int(draft.t2d.shape[0])
+        if draft.t2d is not None:
+            target_vocab_size = int(draft.t2d.shape[0])
+        else:
+            target_vocab_size = int(draft.verifier_vocab_size)
         expanded = draft_probs.new_zeros(*draft_probs.shape[:-1], target_vocab_size)
-        target_ids = torch.nonzero(draft.t2d, as_tuple=False).flatten().to(
+        draft_ids = torch.arange(
+            draft_probs.shape[-1],
             device=draft_probs.device,
+            dtype=draft.d2t.dtype,
         )
+        target_ids = (draft_ids + draft.d2t.to(draft_probs.device)).long()
         expanded.index_copy_(-1, target_ids, draft_probs)
         return expanded
 
@@ -922,6 +979,10 @@ def _worker_command(
     ]
     if args.max_samples is not None:
         cmd.extend(["--max-samples", str(args.max_samples)])
+    if args.d2t_path is not None:
+        cmd.extend(["--d2t-path", str(args.d2t_path)])
+    if args.t2d_path is not None:
+        cmd.extend(["--t2d-path", str(args.t2d_path)])
     if args.skip_artifacts:
         cmd.append("--skip-artifacts")
     if args.trust_remote_code:
@@ -1061,14 +1122,27 @@ def run(args: argparse.Namespace) -> None:
     if draft_attn_impl is not None:
         logger.info("Using draft attention backend: %s", draft_attn_impl)
         draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
+    d2t, t2d = _load_vocab_mapping_tensors(
+        draft_model_path=args.draft_model,
+        d2t_path=args.d2t_path,
+        t2d_path=args.t2d_path,
+    )
     draft_model = DSparkDraftModel.from_pretrained(
         args.draft_model,
         config=draft_config,
+        d2t=d2t,
+        t2d=t2d,
     ).to(device).eval()
+    _ensure_loaded_vocab_mappings(draft_model, args)
     logger.info(
-        "Loaded models | device=%s | ASCEND_RT_VISIBLE_DEVICES=%s | mem=%s",
+        (
+            "Loaded models | device=%s | ASCEND_RT_VISIBLE_DEVICES=%s | "
+            "use_draft_vocab=%s | d2t_loaded=%s | mem=%s"
+        ),
         device,
         os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
+        draft_model.use_draft_vocab,
+        draft_model.t2d is not None and bool(draft_model.t2d.any().item()),
         _format_device_memory(),
     )
 
@@ -1131,6 +1205,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--skip-artifacts", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--d2t-path", type=Path, default=None)
+    parser.add_argument("--t2d-path", type=Path, default=None)
     parser.add_argument(
         "--ascend-devices",
         default=None,

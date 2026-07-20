@@ -22,6 +22,8 @@ DEVICE="${DEVICE:-npu}"
 DTYPE="${DTYPE:-bfloat16}"
 DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-auto}"
 ASCEND_DEVICES="${ASCEND_DEVICES:-8,9,10,11,12,13,14,15}"
+D2T_PATH="${D2T_PATH:-}"
+T2D_PATH="${T2D_PATH:-}"
 DATASETS="${DATASETS:-}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
 SKIP_ARTIFACTS="${SKIP_ARTIFACTS:-0}"
@@ -61,6 +63,10 @@ cmd=(
 
 if [[ -n "$ASCEND_DEVICES" ]]; then
     cmd+=(--ascend-devices "$ASCEND_DEVICES")
+fi
+
+if [[ -n "$D2T_PATH" || -n "$T2D_PATH" ]]; then
+    cmd+=(--d2t-path "$D2T_PATH" --t2d-path "$T2D_PATH")
 fi
 
 if [[ -n "$DATASETS" ]]; then
