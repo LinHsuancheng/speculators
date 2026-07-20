@@ -241,6 +241,18 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         block_size = kwargs.get("block_size", 16)
         micro_block_size = kwargs.get("micro_block_size", 0) or None
+        default_sample_from_anchor = algorithm == "dspark"
+        sample_from_anchor_arg = kwargs.get("sample_from_anchor")
+        sample_from_anchor = (
+            default_sample_from_anchor
+            if sample_from_anchor_arg is None
+            else sample_from_anchor_arg
+        )
+
+        # Calculate speculative tokens based on sample_from_anchor.
+        # False: anchor is bonus token (block_size - 1 tokens).
+        # True: sample from anchor too (block_size tokens).
+        speculative_tokens = block_size if sample_from_anchor else block_size - 1
         return {
             "transformer_layer_config": verifier_config,
             "draft_vocab_size": kwargs["draft_vocab_size"],
@@ -259,11 +271,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 "micro_token_layer_growth", False
             ),
             "max_prev_micro_tokens": kwargs.get("max_prev_micro_tokens"),
+            "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
-                    # First block position is the anchor, not emitted during gen.
-                    GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
+                    GreedyTokenProposalConfig(speculative_tokens=speculative_tokens)
                 ],
                 default_proposal_method="greedy",
                 verifier=VerifierConfig.from_pretrained(
@@ -470,8 +482,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             verifier_logits = self.verifier_lm_head(
                 self.verifier_norm(verifier_last_hidden_states)
             )
-            # Shift right by 1 so verifier_logits[i] predicts token at position i
-            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+            if not self.config.sample_from_anchor:
+                # False: shift right by 1 so slot j predicts token at position j
+                verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+            # else: True, slot k predicts token at position k+1 (next), no shift
             targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
@@ -504,7 +518,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             .to(aligned_loss_mask.dtype)
         )  # shape: [1, num_anchors*block_size]
 
-        aligned_loss_mask[:, :: self.block_size] = 0
+        # For sample_from_anchor=False, mask slot 0 (anchor) since it's not trained
+        if not self.config.sample_from_anchor:
+            aligned_loss_mask[:, :: self.block_size] = 0
 
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
@@ -537,6 +553,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.block_size,
             gamma=gamma,
             loss_config=loss_config,
+            sample_from_anchor=self.config.sample_from_anchor,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
 
