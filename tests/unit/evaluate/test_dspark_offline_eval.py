@@ -37,6 +37,31 @@ def test_prompt_from_raw_problem_field():
     assert prompt == "What is 1+1?"
 
 
+def test_prompt_from_sharegpt_conversations_stops_before_answer():
+    module = _load_module()
+
+    class Tokenizer:
+        @staticmethod
+        def apply_chat_template(messages, tokenize, add_generation_prompt):
+            assert tokenize is False
+            assert add_generation_prompt is True
+            return repr(messages)
+
+    prompt = module._prompt_from_record(
+        {
+            "conversations": [
+                {"from": "human", "value": "Question?"},
+                {"from": "gpt", "value": "Answer."},
+            ],
+        },
+        tokenizer=Tokenizer(),
+        source="sample.jsonl:1",
+    )
+
+    assert prompt == "[{'role': 'user', 'content': 'Question?'}]"
+    assert "Answer." not in prompt
+
+
 def test_load_jsonl_rejects_non_object(tmp_path: Path):
     module = _load_module()
     path = tmp_path / "bad.jsonl"

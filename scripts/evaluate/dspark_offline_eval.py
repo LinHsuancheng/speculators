@@ -201,6 +201,36 @@ def _string_turns(value: Any) -> list[str] | None:
     return None
 
 
+def _messages_from_conversations(value: Any) -> list[dict[str, str]] | None:
+    if not isinstance(value, list):
+        return None
+
+    messages: list[dict[str, str]] = []
+    role_map = {
+        "human": "user",
+        "user": "user",
+        "gpt": "assistant",
+        "assistant": "assistant",
+        "system": "system",
+    }
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        raw_role = item.get("from", item.get("role"))
+        raw_content = item.get("value", item.get("content"))
+        if not isinstance(raw_role, str) or not isinstance(raw_content, str):
+            return None
+        role = role_map.get(raw_role)
+        content = raw_content.strip()
+        if role is None or not content:
+            return None
+        if role == "assistant":
+            break
+        messages.append({"role": role, "content": content})
+
+    return messages or None
+
+
 def _prompt_from_record(record: dict[str, Any], tokenizer, *, source: str) -> str:
     turns = _string_turns(record.get("turns"))
     if turns is not None:
@@ -216,13 +246,21 @@ def _prompt_from_record(record: dict[str, Any], tokenizer, *, source: str) -> st
             add_generation_prompt=True,
         )
 
+    messages = _messages_from_conversations(record.get("conversations"))
+    if messages is not None:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     for field in PROMPT_FIELDS:
         turns = _string_turns(record.get(field))
         if turns is not None:
             return "\n\n".join(turns)
 
     keys = ", ".join(sorted(record.keys()))
-    supported = ", ".join(["turns", "messages", *PROMPT_FIELDS])
+    supported = ", ".join(["turns", "messages", "conversations", *PROMPT_FIELDS])
     raise ValueError(
         f"{source}: record has no supported prompt field ({supported}); keys=[{keys}]"
     )
