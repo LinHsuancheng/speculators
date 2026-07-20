@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""Offline DSpark evaluation, adapted from DeepSeek/DeepSpec.
+
+DeepSpec evaluates speculative decoding without vLLM by keeping the verifier KV
+cache live and verifying each draft proposal incrementally. This script ports
+that evaluator shape to the speculators DSpark model:
+
+* target prefill runs once with ``DynamicCache``;
+* each loop builds a DSpark draft proposal from the current anchor token;
+* verifier checks ``[anchor, draft_tokens...]`` with the target cache;
+* acceptance uses standard rejection sampling from target/draft probabilities.
+
+The current speculators DSpark backbone does not expose DeepSpec's cached draft
+``_forward_backbone`` API, so the draft proposal path uses a single-anchor
+backbone forward. The evaluator structure is intentionally the same, so that can
+be swapped for a cached draft path once the model API supports it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
+
+logger = logging.getLogger("dspark_offline_eval")
+torch = None
+DynamicCache = None
+
+PROMPT_FIELDS = (
+    "prompt",
+    "input",
+    "question",
+    "instruction",
+    "text",
+    "problem",
+    "problem_statement",
+    "question_content",
+)
+RESULT_COLUMNS = [
+    "dataset",
+    "num_requests",
+    "elapsed_s",
+    "requests_per_second",
+    "output_tokens_per_second",
+    "total_output_tokens",
+    "num_proposals",
+    "num_proposed_draft_tokens",
+    "num_accepted_draft_tokens",
+    "acceptance_length",
+    "accepted_draft_length",
+]
+
+
+@dataclass
+class DraftProposal:
+    draft_token_count: int
+    verify_input_ids: Any
+    draft_probs: Any | None
+
+
+@dataclass
+class VerificationResult:
+    target_output: Any
+    target_probs: Any
+    accept_prefix_mask: Any | None
+    accepted_draft_tokens: int
+    next_token: Any
+    effective_proposal_length: int
+    terminated_by_stop_token: bool = False
+    committed_tokens: Any | None = None
+
+
+@dataclass
+class EvalStats:
+    elapsed_s: float = 0.0
+    total_output_tokens: int = 0
+    num_proposals: int = 0
+    num_proposed_draft_tokens: int = 0
+    num_accepted_draft_tokens: int = 0
+
+    @property
+    def acceptance_length(self) -> float:
+        if self.num_proposals == 0:
+            return 1.0
+        return 1.0 + self.num_accepted_draft_tokens / self.num_proposals
+
+    @property
+    def accepted_draft_length(self) -> float:
+        if self.num_proposals == 0:
+            return 0.0
+        return self.num_accepted_draft_tokens / self.num_proposals
+
+    def add_response(self, response: SimpleNamespace) -> None:
+        self.total_output_tokens += int(response.num_output_tokens)
+        proposal_lengths = getattr(response, "proposal_lengths", [])
+        accepted_lengths = getattr(response, "accepted_draft_lengths", [])
+        self.num_proposals += len(proposal_lengths)
+        self.num_proposed_draft_tokens += sum(int(x) for x in proposal_lengths)
+        self.num_accepted_draft_tokens += sum(int(x) for x in accepted_lengths)
+
+
+def logits_to_probs(logits, temperature: float):
+    if temperature <= 0:
+        return torch.nn.functional.one_hot(
+            torch.argmax(logits, dim=-1),
+            num_classes=logits.shape[-1],
+        ).to(logits.dtype)
+    return torch.softmax(logits.float() / temperature, dim=-1)
+
+
+def sample_from_probs(probs):
+    flat = probs.reshape(-1, probs.shape[-1])
+    sampled = torch.multinomial(flat, num_samples=1)
+    return sampled.reshape(*probs.shape[:-1])
+
+
+def gather_token_probs(probs, token_ids):
+    return torch.gather(probs, dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
+
+
+def sample_residual(target_probs, draft_probs):
+    residual = (target_probs - draft_probs).clamp_min(0)
+    denom = residual.sum(dim=-1, keepdim=True)
+    residual = torch.where(denom > 0, residual / denom.clamp_min(1e-8), target_probs)
+    return sample_from_probs(residual)
+
+
+def has_stop_token(token_ids, stop_token_ids: list[int] | None) -> bool:
+    if stop_token_ids is None:
+        return False
+    stop_tensor = torch.tensor(stop_token_ids, device=token_ids.device)
+    return bool(torch.isin(token_ids, stop_tensor).any().item())
+
+
+def trim_output_ids(output_ids, num_input_tokens: int, stop_token_ids: list[int] | None):
+    if stop_token_ids is None:
+        return output_ids
+    stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+    stop_indices = torch.isin(output_ids[0][num_input_tokens:], stop_tensor).nonzero(
+        as_tuple=True,
+    )[0]
+    if stop_indices.numel() == 0:
+        return output_ids
+    return output_ids[:, : num_input_tokens + int(stop_indices[0].item()) + 1]
+
+
+def resolve_stop_token_ids(target_model, tokenizer) -> list[int] | None:
+    generation_config = getattr(target_model, "generation_config", None)
+    eos_token_id = getattr(generation_config, "eos_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        return None
+    if isinstance(eos_token_id, int):
+        return [int(eos_token_id)]
+    return list(dict.fromkeys(int(token_id) for token_id in eos_token_id))
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{line_no}: invalid JSON: {e}") from e
+            if not isinstance(item, dict):
+                raise ValueError(f"{path}:{line_no}: expected JSON object")
+            records.append(item)
+    return records
+
+
+def _string_turns(value: Any) -> list[str] | None:
+    if isinstance(value, str) and value.strip():
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        turns = [item for item in value if item.strip()]
+        return turns or None
+    return None
+
+
+def _prompt_from_record(record: dict[str, Any], tokenizer, *, source: str) -> str:
+    turns = _string_turns(record.get("turns"))
+    if turns is not None:
+        # DeepSpec keeps only the first turn for eval. Keep all turns joined here
+        # because existing local data may already be single-response prompts.
+        return "\n\n".join(turns)
+
+    messages = record.get("messages")
+    if isinstance(messages, list):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    for field in PROMPT_FIELDS:
+        turns = _string_turns(record.get(field))
+        if turns is not None:
+            return "\n\n".join(turns)
+
+    keys = ", ".join(sorted(record.keys()))
+    supported = ", ".join(["turns", "messages", *PROMPT_FIELDS])
+    raise ValueError(
+        f"{source}: record has no supported prompt field ({supported}); keys=[{keys}]"
+    )
+
+
+def _discover_datasets(root: Path, names: list[str] | None) -> list[Path]:
+    paths = [root] if root.is_file() else sorted(root.rglob("*.jsonl"))
+    if names:
+        wanted = set(names)
+        paths = [
+            path
+            for path in paths
+            if path.stem in wanted or path.name in wanted or str(path) in wanted
+        ]
+    if not paths:
+        raise FileNotFoundError(f"No JSONL datasets found under {root}")
+    return paths
+
+
+def _draft_ids_to_target_ids(draft, draft_ids: list[int]) -> list[int]:
+    if draft.use_draft_vocab and draft.d2t is not None:
+        d2t = draft.d2t
+        return [int(d2t[token_id].item()) for token_id in draft_ids]
+    return draft_ids
+
+
+def verify_draft_tokens(
+    *,
+    target_model,
+    proposal: DraftProposal,
+    position_ids,
+    start: int,
+    past_key_values_target,
+    temperature: float,
+    max_proposal_tokens: int,
+    current_token_ids=None,
+    stop_token_ids: list[int] | None = None,
+) -> VerificationResult:
+    if proposal.draft_token_count > max_proposal_tokens:
+        raise ValueError(
+            "DraftProposal.draft_token_count must not exceed "
+            f"max_proposal_tokens={max_proposal_tokens}, "
+            f"got {proposal.draft_token_count}."
+        )
+    if current_token_ids is not None and not torch.equal(
+        proposal.verify_input_ids[:, :1],
+        current_token_ids,
+    ):
+        raise ValueError("DraftProposal.verify_input_ids must start with current token.")
+
+    draft_token_count = int(proposal.draft_token_count)
+    verify_length = draft_token_count + 1
+    target_output = target_model(
+        input_ids=proposal.verify_input_ids,
+        position_ids=position_ids[:, start : start + verify_length],
+        past_key_values=past_key_values_target,
+        use_cache=True,
+        output_hidden_states=True,
+    )
+    target_probs = logits_to_probs(target_output.logits, float(temperature))
+
+    accept_prefix_mask = None
+    if draft_token_count > 0:
+        assert proposal.draft_probs is not None
+        proposed_tokens = proposal.verify_input_ids[:, 1:]
+        selected_target_probs = gather_token_probs(target_probs[:, :-1, :], proposed_tokens)
+        selected_draft_probs = gather_token_probs(
+            proposal.draft_probs,
+            proposed_tokens,
+        ).clamp_min(1e-8)
+        accept_prob = torch.clamp(selected_target_probs / selected_draft_probs, max=1.0)
+        accept_mask = (torch.rand_like(accept_prob) < accept_prob).to(torch.int64)
+        accept_prefix_mask = accept_mask.cumprod(dim=1)
+        accepted_draft_tokens = int(accept_prefix_mask.sum(dim=1)[0].item())
+    else:
+        accepted_draft_tokens = 0
+
+    effective_proposal_length = draft_token_count
+    terminated_by_stop_token = False
+    if stop_token_ids and accepted_draft_tokens > 0:
+        accepted_slice = proposal.verify_input_ids[0, 1 : accepted_draft_tokens + 1]
+        stop_tensor = torch.tensor(
+            stop_token_ids,
+            device=accepted_slice.device,
+            dtype=accepted_slice.dtype,
+        )
+        eos_hits = torch.isin(accepted_slice, stop_tensor).nonzero(as_tuple=True)[0]
+        if eos_hits.numel() > 0:
+            accepted_draft_tokens = int(eos_hits[0].item()) + 1
+            effective_proposal_length = accepted_draft_tokens
+            terminated_by_stop_token = True
+
+    if 0 < draft_token_count and accepted_draft_tokens < draft_token_count:
+        assert proposal.draft_probs is not None
+        next_token = sample_residual(
+            target_probs[:, accepted_draft_tokens, :],
+            proposal.draft_probs[:, accepted_draft_tokens, :],
+        )
+    else:
+        next_token = sample_from_probs(target_probs[:, -1:, :]).squeeze(1)
+
+    committed_tokens = torch.cat(
+        [
+            proposal.verify_input_ids[:, 1 : accepted_draft_tokens + 1],
+            next_token.unsqueeze(1),
+        ],
+        dim=1,
+    )
+    return VerificationResult(
+        target_output=target_output,
+        target_probs=target_probs,
+        accept_prefix_mask=accept_prefix_mask,
+        accepted_draft_tokens=accepted_draft_tokens,
+        next_token=next_token,
+        effective_proposal_length=effective_proposal_length,
+        terminated_by_stop_token=terminated_by_stop_token,
+        committed_tokens=committed_tokens,
+    )
+
+
+def generate_decoding_sample(
+    *,
+    target_model,
+    input_ids,
+    max_new_tokens: int,
+    max_proposal_tokens: int,
+    temperature: float,
+    stop_token_ids: list[int] | None,
+    init_context: Callable[..., Any],
+    propose: Callable[..., DraftProposal],
+    update: Callable[[Any, VerificationResult], None],
+) -> SimpleNamespace:
+    assert max_proposal_tokens >= 1
+    assert input_ids.size(0) == 1, "only bsz=1 is supported"
+
+    device = input_ids.device
+    num_input_tokens = input_ids.shape[1]
+    max_length = num_input_tokens + int(max_new_tokens)
+    output_ids = torch.empty(
+        (1, max_length + max_proposal_tokens + 1),
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
+    past_key_values_target = DynamicCache()
+
+    output = target_model(
+        input_ids=input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values_target,
+        use_cache=True,
+        output_hidden_states=True,
+    )
+    output_ids[:, :num_input_tokens] = input_ids
+    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample_from_probs(
+        logits_to_probs(output.logits[:, -1:, :], float(temperature))
+    )
+
+    start = num_input_tokens
+    acceptance_lengths: list[int] = []
+    proposal_lengths: list[int] = []
+    accepted_draft_lengths: list[int] = []
+    initial_token = output_ids[:, num_input_tokens : num_input_tokens + 1]
+    if has_stop_token(initial_token, stop_token_ids):
+        output_ids = output_ids[:, : num_input_tokens + 1]
+        output_ids = trim_output_ids(output_ids, num_input_tokens, stop_token_ids)
+        return SimpleNamespace(
+            output_ids=output_ids,
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=output_ids.shape[1] - num_input_tokens,
+            acceptance_lengths=acceptance_lengths,
+            proposal_lengths=proposal_lengths,
+            accepted_draft_lengths=accepted_draft_lengths,
+            verify_count=0,
+        )
+
+    context = init_context(
+        initial_output=output,
+        output_ids=output_ids,
+        position_ids=position_ids,
+        num_input_tokens=num_input_tokens,
+    )
+
+    while start < max_length:
+        proposal = propose(
+            context=context,
+            output_ids=output_ids,
+            position_ids=position_ids,
+            start=start,
+            stop_token_ids=stop_token_ids,
+        )
+        verification = verify_draft_tokens(
+            target_model=target_model,
+            proposal=proposal,
+            position_ids=position_ids,
+            start=start,
+            past_key_values_target=past_key_values_target,
+            temperature=temperature,
+            max_proposal_tokens=max_proposal_tokens,
+            current_token_ids=output_ids[:, start : start + 1],
+            stop_token_ids=stop_token_ids,
+        )
+
+        proposal_lengths.append(int(verification.effective_proposal_length))
+        accepted = int(verification.accepted_draft_tokens)
+        accepted_draft_lengths.append(accepted)
+        output_ids[:, start : start + accepted + 1] = (
+            proposal.verify_input_ids[:, : accepted + 1]
+        )
+
+        if verification.terminated_by_stop_token:
+            acceptance_lengths.append(accepted)
+            start += accepted
+            past_key_values_target.crop(start)
+            break
+
+        output_ids[:, start + accepted + 1] = verification.next_token
+        new_token_ids = output_ids[:, start + 1 : start + accepted + 2]
+        acceptance_lengths.append(accepted + 1)
+        start += accepted + 1
+        past_key_values_target.crop(start)
+        update(context, verification)
+
+        if has_stop_token(new_token_ids, stop_token_ids):
+            break
+
+    output_ids = output_ids[:, : min(start + 1, max_length)]
+    output_ids = trim_output_ids(output_ids, num_input_tokens, stop_token_ids)
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=output_ids.shape[1] - num_input_tokens,
+        acceptance_lengths=acceptance_lengths,
+        proposal_lengths=proposal_lengths,
+        accepted_draft_lengths=accepted_draft_lengths,
+        verify_count=len(proposal_lengths),
+    )
+
+
+class DSparkOfflineRunner:
+    def __init__(self, target_model, draft_model, tokenizer, args) -> None:
+        self.target_model = target_model
+        self.draft_model = draft_model
+        self.tokenizer = tokenizer
+        self.args = args
+        self.device = next(target_model.parameters()).device
+        self.max_proposal_tokens = max(1, int(draft_model.block_size) - 1)
+
+    def _extract_context_feature(self, hidden_states):
+        return torch.cat(
+            [hidden_states[i] for i in self.draft_model.target_layer_ids],
+            dim=-1,
+        )
+
+    def _init_context(self, *, initial_output, **kwargs) -> SimpleNamespace:
+        return SimpleNamespace(
+            target_hidden_states=self._extract_context_feature(
+                initial_output.hidden_states,
+            ),
+        )
+
+    def _single_anchor_backbone(self, hidden_states, input_ids, start: int):
+        draft = self.draft_model
+        block = draft.block_size
+        if hidden_states.shape[1] != start:
+            raise ValueError(
+                "DSpark context hidden states must contain exactly the prefix before "
+                f"the current anchor; got {hidden_states.shape[1]} and start={start}."
+            )
+        # The synthetic block carries the current anchor token. DFlash masks base
+        # tokens with position >= anchor, so this dummy anchor hidden state is
+        # present only to preserve the training-time base-sequence layout.
+        hidden_states = torch.cat(
+            [hidden_states, hidden_states.new_zeros(hidden_states[:, :1, :].shape)],
+            dim=1,
+        )
+        total_seq_len = hidden_states.shape[1]
+        current_ids = input_ids[:, :total_seq_len]
+        anchor_positions = torch.tensor([start], dtype=torch.long, device=self.device)
+        document_ids = torch.zeros_like(current_ids)
+
+        full_attn_mask = None
+        if draft.uses_full_attn:
+            full_attn_mask = draft._create_attention_masks_for_layers(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                device=self.device,
+                sliding_window=None,
+            )
+
+        sliding_window_attn_mask = None
+        if draft.uses_sliding_window_attn:
+            sliding_window_attn_mask = draft._create_attention_masks_for_layers(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                device=self.device,
+                sliding_window=draft.sliding_window,
+                sliding_window_non_causal=draft.sliding_window_non_causal,
+            )
+
+        mask_token_ids = torch.full(
+            (1, block),
+            draft.mask_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        mask_token_ids[:, 0] = input_ids[:, start]
+        noise_embedding = draft.embed_tokens(mask_token_ids)
+        fc_output = draft.hidden_norm(draft.fc(hidden_states))
+        base_position_ids = torch.arange(
+            total_seq_len,
+            dtype=torch.long,
+            device=self.device,
+        )
+        block_offsets = torch.arange(block, dtype=torch.long, device=self.device)
+        position_ids = torch.cat(
+            [base_position_ids, base_position_ids[start] + block_offsets],
+            dim=0,
+        ).unsqueeze(0)
+        position_embeddings = draft.rotary_emb(hidden_states, position_ids)
+
+        for layer_idx, layer in enumerate(draft.layers):
+            if layer_idx in draft.sliding_window_indices:
+                attention_mask = sliding_window_attn_mask[layer_idx]
+            else:
+                attention_mask = full_attn_mask[layer_idx]
+            noise_embedding = layer(
+                hidden_states=noise_embedding,
+                target_hidden=fc_output,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+            )
+
+        hidden = draft.norm(noise_embedding)
+        return hidden, draft.lm_head(hidden)
+
+    def _sample_dspark_tokens(self, base_logits, hidden_states, first_prev_token_id):
+        draft = self.draft_model
+        max_tokens = self.max_proposal_tokens
+        proposed_target_ids: list[int] = []
+        draft_probs = []
+        prev_token = first_prev_token_id.reshape(1, 1).long()
+
+        for token_idx in range(max_tokens):
+            slot = token_idx + 1
+            logits = base_logits[:, slot : slot + 1, :]
+            if draft.markov_head is not None:
+                logits = logits + draft.markov_head.block_bias(
+                    prev_token_ids=prev_token,
+                    hidden_states=hidden_states[:, slot : slot + 1, :],
+                )
+            probs = logits_to_probs(logits, float(self.args.temperature))
+            draft_id = int(sample_from_probs(probs)[0, 0].item())
+            target_id = _draft_ids_to_target_ids(draft, [draft_id])[0]
+            proposed_target_ids.append(target_id)
+            draft_probs.append(probs)
+            prev_token = torch.tensor([[target_id]], dtype=torch.long, device=self.device)
+
+        return proposed_target_ids, torch.cat(draft_probs, dim=1)
+
+    def _expand_draft_probs_to_target_vocab(self, draft_probs):
+        draft = self.draft_model
+        if not draft.use_draft_vocab or draft.t2d is None:
+            return draft_probs
+        target_vocab_size = int(draft.t2d.shape[0])
+        expanded = draft_probs.new_zeros(*draft_probs.shape[:-1], target_vocab_size)
+        target_ids = torch.nonzero(draft.t2d, as_tuple=False).flatten().to(
+            device=draft_probs.device,
+        )
+        expanded.index_copy_(-1, target_ids, draft_probs)
+        return expanded
+
+    def _propose(
+        self,
+        *,
+        context: SimpleNamespace,
+        output_ids,
+        position_ids,
+        start: int,
+        stop_token_ids: list[int] | None = None,
+    ) -> DraftProposal:
+        hidden, base_logits = self._single_anchor_backbone(
+            context.target_hidden_states,
+            output_ids,
+            start,
+        )
+        proposed_target_ids, draft_probs = self._sample_dspark_tokens(
+            base_logits,
+            hidden,
+            output_ids[:, start],
+        )
+        verify_input_ids = torch.cat(
+            [
+                output_ids[:, start : start + 1],
+                torch.tensor(
+                    [proposed_target_ids],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+            ],
+            dim=1,
+        )
+        return DraftProposal(
+            draft_token_count=len(proposed_target_ids),
+            verify_input_ids=verify_input_ids,
+            draft_probs=self._expand_draft_probs_to_target_vocab(draft_probs),
+        )
+
+    def _update(self, context: SimpleNamespace, verification: VerificationResult) -> None:
+        hidden = self._extract_context_feature(verification.target_output.hidden_states)
+        committed_hidden = hidden[:, : verification.accepted_draft_tokens + 1, :]
+        context.target_hidden_states = torch.cat(
+            [context.target_hidden_states, committed_hidden],
+            dim=1,
+        )
+
+    def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
+        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        return generate_decoding_sample(
+            target_model=self.target_model,
+            input_ids=input_ids,
+            max_new_tokens=int(self.args.max_new_tokens),
+            max_proposal_tokens=self.max_proposal_tokens,
+            temperature=float(self.args.temperature),
+            stop_token_ids=stop_token_ids,
+            init_context=self._init_context,
+            propose=self._propose,
+            update=self._update,
+        )
+
+
+def _evaluate_dataset(
+    *,
+    path: Path,
+    runner: DSparkOfflineRunner,
+    args: argparse.Namespace,
+    stop_token_ids: list[int] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    records = _load_jsonl(path)
+    if args.max_samples is not None:
+        records = records[: args.max_samples]
+
+    stats = EvalStats()
+    artifacts: list[dict[str, Any]] = []
+    start_time = time.perf_counter()
+    iterator = enumerate(records, start=1)
+    if tqdm is not None and not args.no_progress:
+        iterator = tqdm(iterator, total=len(records), desc=path.stem, unit="sample")
+
+    for idx, record in iterator:
+        prompt = _prompt_from_record(
+            record,
+            runner.tokenizer,
+            source=f"{path}:{idx}",
+        )
+        response = runner.generate_one(prompt, stop_token_ids)
+        stats.add_response(response)
+        if not args.skip_artifacts:
+            artifacts.append(
+                {
+                    "prompt": prompt,
+                    "output_token_ids": response.output_ids[0].tolist(),
+                    "num_input_tokens": int(response.num_input_tokens),
+                }
+            )
+
+        if idx == 1 or idx % args.log_every == 0 or idx == len(records):
+            elapsed = time.perf_counter() - start_time
+            out_tps = stats.total_output_tokens / elapsed if elapsed else 0.0
+            logger.info(
+                "[%s] %d/%d samples | out_tok=%d | out_tps=%.2f | acc_len=%.3f",
+                path.stem,
+                idx,
+                len(records),
+                stats.total_output_tokens,
+                out_tps,
+                stats.acceptance_length,
+            )
+
+    stats.elapsed_s = time.perf_counter() - start_time
+    row = {
+        "dataset": path.stem,
+        "num_requests": len(records),
+        "elapsed_s": stats.elapsed_s,
+        "requests_per_second": len(records) / stats.elapsed_s if stats.elapsed_s else 0,
+        "output_tokens_per_second": (
+            stats.total_output_tokens / stats.elapsed_s if stats.elapsed_s else 0
+        ),
+        "total_output_tokens": stats.total_output_tokens,
+        "num_proposals": stats.num_proposals,
+        "num_proposed_draft_tokens": stats.num_proposed_draft_tokens,
+        "num_accepted_draft_tokens": stats.num_accepted_draft_tokens,
+        "acceptance_length": stats.acceptance_length,
+        "accepted_draft_length": stats.accepted_draft_length,
+    }
+    return row, artifacts
+
+
+def _write_outputs(
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+    artifacts_by_dataset: dict[str, list[dict[str, Any]]],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+
+    if not artifacts_by_dataset:
+        return
+    artifacts_dir = output_dir / "artifacts"
+    artifacts_dir.mkdir(exist_ok=True)
+    for dataset, artifacts in artifacts_by_dataset.items():
+        with (artifacts_dir / f"{dataset}.jsonl").open("w", encoding="utf-8") as f:
+            for artifact in artifacts:
+                f.write(json.dumps(artifact) + "\n")
+
+
+def _resolve_draft_attn_impl(device: str, draft_attn_impl: str) -> str | None:
+    if draft_attn_impl != "auto":
+        return draft_attn_impl
+    if str(device).startswith("npu"):
+        return "sdpa"
+    return None
+
+
+def run(args: argparse.Namespace) -> None:
+    global torch, DynamicCache
+
+    import torch as torch_module  # noqa: PLC0415
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
+    from transformers import DynamicCache as DynamicCacheClass  # noqa: PLC0415
+
+    from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
+
+    torch = torch_module
+    DynamicCache = DynamicCacheClass
+    device = torch.device(args.device)
+    dtype = getattr(torch, args.dtype) if args.dtype != "auto" else "auto"
+
+    logger.info("Loading tokenizer: %s", args.verifier_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.verifier_model,
+        trust_remote_code=args.trust_remote_code,
+    )
+    logger.info("Loading verifier: %s", args.verifier_model)
+    target_model = AutoModelForCausalLM.from_pretrained(
+        args.verifier_model,
+        torch_dtype=dtype,
+        trust_remote_code=args.trust_remote_code,
+    ).to(device).eval()
+
+    logger.info("Loading DSpark draft: %s", args.draft_model)
+    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    draft_attn_impl = _resolve_draft_attn_impl(args.device, args.draft_attn_impl)
+    if draft_attn_impl is not None:
+        logger.info("Using draft attention backend: %s", draft_attn_impl)
+        draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
+    draft_model = DSparkDraftModel.from_pretrained(
+        args.draft_model,
+        config=draft_config,
+    ).to(device).eval()
+
+    runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
+    stop_token_ids = resolve_stop_token_ids(target_model, tokenizer)
+    dataset_names = args.datasets.split(",") if args.datasets else None
+    dataset_paths = _discover_datasets(args.datasets_root, dataset_names)
+    rows: list[dict[str, Any]] = []
+    artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
+
+    for path in dataset_paths:
+        row, artifacts = _evaluate_dataset(
+            path=path,
+            runner=runner,
+            args=args,
+            stop_token_ids=stop_token_ids,
+        )
+        rows.append(row)
+        if not args.skip_artifacts:
+            artifacts_by_dataset[path.stem] = artifacts
+        logger.info(
+            "[%s] output_tps=%.2f acceptance_length=%.4f",
+            path.stem,
+            row["output_tokens_per_second"],
+            row["acceptance_length"],
+        )
+
+    _write_outputs(args.output_dir, rows, artifacts_by_dataset)
+    logger.info("Wrote results to %s", args.output_dir)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Offline DSpark/speculators evaluation on JSONL data.",
+    )
+    parser.add_argument("--verifier-model", required=True)
+    parser.add_argument("--draft-model", required=True)
+    parser.add_argument("--datasets-root", type=Path, required=True)
+    parser.add_argument("--datasets", default=None)
+    parser.add_argument("--output-dir", type=Path, default=Path("dspark_offline_eval"))
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument(
+        "--draft-attn-impl",
+        choices=["auto", "simple_flex_attention", "sdpa", "eager"],
+        default="auto",
+    )
+    parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--skip-artifacts", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    run(parse_args())
+
+
+if __name__ == "__main__":
+    main()
