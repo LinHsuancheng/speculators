@@ -92,15 +92,6 @@ class DSparkDraftModel(DFlashDraftModel):
         }
         return dict(shared), dict(shared)
 
-    @staticmethod
-    def _build_markov_prev_token_ids(
-        block_tokens: torch.Tensor,
-        sample_from_anchor: bool,
-    ) -> torch.Tensor:
-        if sample_from_anchor:
-            return block_tokens
-        return torch.cat([block_tokens[:, :1], block_tokens[:, :-1]], dim=1)
-
     @conditional_torch_compile
     def forward(
         self,
@@ -134,10 +125,10 @@ class DSparkDraftModel(DFlashDraftModel):
         mask_tokens_size = num_blocks * block
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
-        prev_token_ids = self._build_markov_prev_token_ids(
-            block_tokens,
-            getattr(self.config, "sample_from_anchor", True),
-        )
+        # prev_token_ids[:, k] is the token preceding draft position k within the block.
+        prev_token_ids = torch.cat(
+            [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
+        )  # [num_blocks, block]
         hidden_blocks = hidden.view(num_blocks, block, -1)
 
         confidence_logits = None
