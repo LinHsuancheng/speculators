@@ -100,6 +100,56 @@ def test_eval_stats_acceptance_length():
     assert stats.accepted_draft_length == 3.0
 
 
+def test_eval_stats_position_accept_rates():
+    module = _load_module()
+    stats = module.EvalStats()
+    stats.add_response(
+        SimpleNamespace(
+            num_output_tokens=0,
+            proposal_lengths=[3, 3, 2],
+            accepted_draft_lengths=[3, 1, 0],
+        ),
+    )
+
+    assert stats.position_proposed_counts == [3, 3, 2]
+    assert stats.position_accepted_counts == [2, 1, 1]
+    assert stats.position_accept_rates == [2 / 3, 1 / 3, 1 / 2]
+
+
+def test_aggregate_rows_merges_position_accept_rates():
+    module = _load_module()
+
+    row = module._aggregate_rows(
+        "sample",
+        [
+            {
+                "num_requests": 1,
+                "elapsed_s": 1.0,
+                "total_output_tokens": 4,
+                "num_proposals": 2,
+                "num_proposed_draft_tokens": 5,
+                "num_accepted_draft_tokens": 3,
+                "position_accepted_counts": "[2, 1, 0]",
+                "position_proposed_counts": "[2, 2, 1]",
+            },
+            {
+                "num_requests": 1,
+                "elapsed_s": 2.0,
+                "total_output_tokens": 5,
+                "num_proposals": 1,
+                "num_proposed_draft_tokens": 2,
+                "num_accepted_draft_tokens": 1,
+                "position_accepted_counts": "[1, 0]",
+                "position_proposed_counts": "[1, 1]",
+            },
+        ],
+    )
+
+    assert json.loads(row["position_accepted_counts"]) == [3, 1, 0]
+    assert json.loads(row["position_proposed_counts"]) == [3, 3, 1]
+    assert json.loads(row["position_accept_rates"]) == [1.0, 1 / 3, 0.0]
+
+
 def test_draft_sample_from_anchor_defaults_to_false():
     module = _load_module()
 

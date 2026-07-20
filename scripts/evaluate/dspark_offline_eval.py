@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -61,6 +61,9 @@ RESULT_COLUMNS = [
     "draft_length",
     "acceptance_length",
     "accepted_draft_length",
+    "position_accept_rates",
+    "position_accepted_counts",
+    "position_proposed_counts",
 ]
 
 
@@ -90,6 +93,8 @@ class EvalStats:
     num_proposals: int = 0
     num_proposed_draft_tokens: int = 0
     num_accepted_draft_tokens: int = 0
+    position_proposed_counts: list[int] = field(default_factory=list)
+    position_accepted_counts: list[int] = field(default_factory=list)
 
     @property
     def acceptance_length(self) -> float:
@@ -109,6 +114,17 @@ class EvalStats:
             return 0.0
         return self.num_accepted_draft_tokens / self.num_proposals
 
+    @property
+    def position_accept_rates(self) -> list[float]:
+        return [
+            accepted / proposed if proposed else 0.0
+            for accepted, proposed in zip(
+                self.position_accepted_counts,
+                self.position_proposed_counts,
+                strict=True,
+            )
+        ]
+
     def add_response(self, response: SimpleNamespace) -> None:
         self.total_output_tokens += int(response.num_output_tokens)
         proposal_lengths = getattr(response, "proposal_lengths", [])
@@ -116,6 +132,53 @@ class EvalStats:
         self.num_proposals += len(proposal_lengths)
         self.num_proposed_draft_tokens += sum(int(x) for x in proposal_lengths)
         self.num_accepted_draft_tokens += sum(int(x) for x in accepted_lengths)
+        for proposal_len, accepted_len in zip(
+            proposal_lengths,
+            accepted_lengths,
+            strict=True,
+        ):
+            self.add_proposal_positions(int(proposal_len), int(accepted_len))
+
+    def add_proposal_positions(self, proposal_len: int, accepted_len: int) -> None:
+        if proposal_len < 0 or accepted_len < 0:
+            raise ValueError("proposal_len and accepted_len must be non-negative")
+        if accepted_len > proposal_len:
+            raise ValueError(
+                f"accepted_len must not exceed proposal_len, got "
+                f"{accepted_len}>{proposal_len}"
+            )
+        missing = proposal_len - len(self.position_proposed_counts)
+        if missing > 0:
+            self.position_proposed_counts.extend([0] * missing)
+            self.position_accepted_counts.extend([0] * missing)
+        for pos in range(proposal_len):
+            self.position_proposed_counts[pos] += 1
+            if pos < accepted_len:
+                self.position_accepted_counts[pos] += 1
+
+
+def _format_position_accept_rates(stats: EvalStats) -> str:
+    rates = stats.position_accept_rates
+    if not rates:
+        return "[]"
+    return "[" + ", ".join(
+        (
+            f"pos{idx}={rate:.4f}"
+            f"({stats.position_accepted_counts[idx]}/"
+            f"{stats.position_proposed_counts[idx]})"
+        )
+        for idx, rate in enumerate(rates)
+    ) + "]"
+
+
+def _parse_count_list(value: Any) -> list[int]:
+    if isinstance(value, str):
+        if not value:
+            return []
+        value = json.loads(value)
+    if not isinstance(value, list):
+        return []
+    return [int(item) for item in value]
 
 
 def logits_to_probs(logits, temperature: float):
@@ -341,6 +404,20 @@ def _format_device_memory() -> str:
 
 
 def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    position_proposed_counts: list[int] = []
+    position_accepted_counts: list[int] = []
+    for row in rows:
+        proposed = _parse_count_list(row.get("position_proposed_counts", []))
+        accepted = _parse_count_list(row.get("position_accepted_counts", []))
+        size = max(len(position_proposed_counts), len(proposed))
+        if len(position_proposed_counts) < size:
+            position_proposed_counts.extend([0] * (size - len(position_proposed_counts)))
+            position_accepted_counts.extend([0] * (size - len(position_accepted_counts)))
+        for idx, count in enumerate(proposed):
+            position_proposed_counts[idx] += count
+        for idx, count in enumerate(accepted):
+            position_accepted_counts[idx] += count
+
     stats = EvalStats(
         elapsed_s=max((float(row["elapsed_s"]) for row in rows), default=0.0),
         total_output_tokens=sum(int(row["total_output_tokens"]) for row in rows),
@@ -351,6 +428,8 @@ def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         num_accepted_draft_tokens=sum(
             int(row["num_accepted_draft_tokens"]) for row in rows
         ),
+        position_proposed_counts=position_proposed_counts,
+        position_accepted_counts=position_accepted_counts,
     )
     num_requests = sum(int(row["num_requests"]) for row in rows)
     return {
@@ -368,6 +447,9 @@ def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "draft_length": stats.draft_length,
         "acceptance_length": stats.acceptance_length,
         "accepted_draft_length": stats.accepted_draft_length,
+        "position_accept_rates": json.dumps(stats.position_accept_rates),
+        "position_accepted_counts": json.dumps(stats.position_accepted_counts),
+        "position_proposed_counts": json.dumps(stats.position_proposed_counts),
     }
 
 
@@ -914,7 +996,8 @@ def _evaluate_dataset(
             logger.info(
                 (
                     "[%s%s] %d/%d samples | out_tok=%d | tok/s=%.2f | "
-                    "acc_len=%.3f | draft_len=%.3f | accepted_draft_len=%.3f | mem=%s"
+                    "acc_len=%.3f | draft_len=%.3f | accepted_draft_len=%.3f | "
+                    "pos_accept=%s | mem=%s"
                 ),
                 path.stem,
                 _shard_label(args),
@@ -925,6 +1008,7 @@ def _evaluate_dataset(
                 stats.acceptance_length,
                 stats.draft_length,
                 stats.accepted_draft_length,
+                _format_position_accept_rates(stats),
                 _format_device_memory(),
             )
         del response
@@ -947,6 +1031,9 @@ def _evaluate_dataset(
         "draft_length": stats.draft_length,
         "acceptance_length": stats.acceptance_length,
         "accepted_draft_length": stats.accepted_draft_length,
+        "position_accept_rates": json.dumps(stats.position_accept_rates),
+        "position_accepted_counts": json.dumps(stats.position_accepted_counts),
+        "position_proposed_counts": json.dumps(stats.position_proposed_counts),
     }
     return row, artifacts
 
@@ -1111,7 +1198,7 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
         logger.info(
             (
                 "[%s] result | requests=%d | tok/s=%.2f | acc_len=%.4f | "
-                "draft_len=%.4f | accepted_draft_len=%.4f"
+                "draft_len=%.4f | accepted_draft_len=%.4f | pos_accept=%s"
             ),
             dataset_path.stem,
             row["num_requests"],
@@ -1119,6 +1206,16 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
             row["acceptance_length"],
             row["draft_length"],
             row["accepted_draft_length"],
+            _format_position_accept_rates(
+                EvalStats(
+                    position_accepted_counts=_parse_count_list(
+                        row.get("position_accepted_counts", []),
+                    ),
+                    position_proposed_counts=_parse_count_list(
+                        row.get("position_proposed_counts", []),
+                    ),
+                ),
+            ),
         )
 
     logger.info("Wrote merged results to %s", args.output_dir)
@@ -1217,7 +1314,8 @@ def run(args: argparse.Namespace) -> None:
         logger.info(
             (
                 "[%s%s] done | requests=%d | tok/s=%.2f | "
-                "acc_len=%.4f | draft_len=%.4f | accepted_draft_len=%.4f | mem=%s"
+                "acc_len=%.4f | draft_len=%.4f | accepted_draft_len=%.4f | "
+                "pos_accept=%s | mem=%s"
             ),
             path.stem,
             _shard_label(args),
@@ -1226,6 +1324,16 @@ def run(args: argparse.Namespace) -> None:
             row["acceptance_length"],
             row["draft_length"],
             row["accepted_draft_length"],
+            _format_position_accept_rates(
+                EvalStats(
+                    position_accepted_counts=_parse_count_list(
+                        row.get("position_accepted_counts", []),
+                    ),
+                    position_proposed_counts=_parse_count_list(
+                        row.get("position_proposed_counts", []),
+                    ),
+                ),
+            ),
             _format_device_memory(),
         )
 
