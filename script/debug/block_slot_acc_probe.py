@@ -87,13 +87,11 @@ def target_only_generate(torch, target, input_ids, max_new_tokens):
         )
 
 
-def first_diff(torch, a, b):
+def first_content_diff(torch, a, b):
     limit = min(a.shape[1], b.shape[1])
     mismatch = torch.nonzero(a[:, :limit] != b[:, :limit], as_tuple=False)
     if mismatch.numel() > 0:
         return int(mismatch[0, 1].item())
-    if a.shape[1] != b.shape[1]:
-        return limit
     return None
 
 
@@ -101,8 +99,17 @@ def compare_target_and_spec(torch, tokenizer, input_ids, target_ids, spec_ids, s
     prompt_len = input_ids.shape[1]
     target_cont = target_ids[:, prompt_len:]
     spec_cont = spec_ids[:, prompt_len:]
-    diff = first_diff(torch, target_cont, spec_cont)
+    diff = first_content_diff(torch, target_cont, spec_cont)
     if diff is None:
+        if target_cont.shape[1] != spec_cont.shape[1]:
+            log.error(
+                "sample=%d target_only_vs_speculative=PREFIX_OK_LENGTH_DIFF "
+                "target_len=%d spec_len=%d",
+                sample_index,
+                target_cont.shape[1],
+                spec_cont.shape[1],
+            )
+            return
         log.info(
             "sample=%d target_only_vs_speculative=OK continuation_tokens=%d",
             sample_index,
@@ -164,7 +171,15 @@ def slot_records(torch, proposal, verification):
     return rows
 
 
-def generate_one(torch, eval_impl, runner, input_ids, max_new_tokens, round_stats):
+def generate_one(
+    torch,
+    eval_impl,
+    runner,
+    input_ids,
+    max_new_tokens,
+    stop_token_ids,
+    round_stats,
+):
     device = input_ids.device
     target = runner.target_model
     past = eval_impl.DynamicCache()
@@ -185,6 +200,16 @@ def generate_one(torch, eval_impl, runner, input_ids, max_new_tokens, round_stat
         )
     output_ids[:, : input_ids.shape[1]] = input_ids
     output_ids[:, input_ids.shape[1]] = torch.argmax(out.logits[:, -1, :], dim=-1)
+    initial_token = output_ids[:, input_ids.shape[1] : input_ids.shape[1] + 1]
+    if eval_impl.has_stop_token(initial_token, stop_token_ids):
+        output_ids = output_ids[:, : input_ids.shape[1] + 1]
+        output_ids = eval_impl.trim_output_ids(
+            output_ids,
+            input_ids.shape[1],
+            stop_token_ids,
+        )
+        return output_ids, 0, 0.0
+
     context = runner._init_context(initial_output=out)
     start = input_ids.shape[1]
     max_length = input_ids.shape[1] + max_new_tokens
@@ -207,6 +232,7 @@ def generate_one(torch, eval_impl, runner, input_ids, max_new_tokens, round_stat
             temperature=0.0,
             max_proposal_tokens=max_proposal,
             current_token_ids=output_ids[:, start : start + 1],
+            stop_token_ids=stop_token_ids,
         )
         for row in slot_records(torch, proposal, verification):
             round_stats.add(row["slot"], row["correct"], row["soft"])
@@ -217,12 +243,21 @@ def generate_one(torch, eval_impl, runner, input_ids, max_new_tokens, round_stat
         output_ids[:, start : start + accepted + 1] = proposal.verify_input_ids[
             :, : accepted + 1
         ]
+        if verification.terminated_by_stop_token:
+            start += accepted
+            past.crop(start)
+            break
+
         output_ids[:, start + accepted + 1] = verification.next_token
+        new_token_ids = output_ids[:, start + 1 : start + accepted + 2]
         start += accepted + 1
         past.crop(start)
         runner._update(context, verification)
+        if eval_impl.has_stop_token(new_token_ids, stop_token_ids):
+            break
 
     output_ids = output_ids[:, : min(start + 1, max_length)]
+    output_ids = eval_impl.trim_output_ids(output_ids, input_ids.shape[1], stop_token_ids)
     return output_ids, rounds, accepted_sum / max(rounds, 1)
 
 
@@ -361,6 +396,8 @@ def run(args):
         tokenizer,
         SimpleNamespace(temperature=0.0),
     )
+    stop_token_ids = eval_impl.resolve_stop_token_ids(target, tokenizer)
+    log.info("stop_token_ids=%s", stop_token_ids)
     round_stats = SlotStats("complete_inference_proposal_rounds", draft.block_size)
     random_stats = SlotStats("random_anchors_in_generated_samples", draft.block_size)
     preparedata_stats = SlotStats("random_anchors_in_preparedata_samples", draft.block_size)
@@ -406,6 +443,7 @@ def run(args):
             runner,
             input_ids,
             args.max_new_tokens,
+            stop_token_ids,
             round_stats,
         )
         if target_only_ids is not None:
