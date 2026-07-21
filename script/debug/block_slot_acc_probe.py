@@ -198,6 +198,59 @@ def random_generated_anchors(torch, output_ids, prompt_len, block_size, count):
     return [anchors[i] for i in perm]
 
 
+def random_preparedata_indices(torch, dataset_len, start, count):
+    available = list(range(start, dataset_len))
+    if len(available) <= count:
+        return available
+    perm = torch.randperm(len(available))[:count].tolist()
+    return [available[i] for i in perm]
+
+
+def random_preparedata_anchors(torch, input_ids, loss_mask, block_size, count):
+    end = input_ids.shape[1] - block_size
+    if end <= 0:
+        return []
+    valid = loss_mask[: end + 1].bool()
+    anchors = torch.nonzero(valid, as_tuple=False).view(-1).tolist()
+    if len(anchors) <= count:
+        return anchors
+    perm = torch.randperm(len(anchors))[:count].tolist()
+    return [anchors[i] for i in perm]
+
+
+def run_preparedata_random(torch, args, eval_impl, runner, dataset_stats):
+    from datasets import load_from_disk
+
+    data = load_from_disk(args.data_path)
+    indices = random_preparedata_indices(
+        torch,
+        len(data),
+        args.preparedata_sample_start,
+        args.preparedata_num_samples,
+    )
+    for sample_index in indices:
+        item = data[int(sample_index)]
+        input_ids = torch.as_tensor(item["input_ids"], dtype=torch.long).to(
+            args.device
+        ).unsqueeze(0)
+        loss_mask = torch.as_tensor(item["loss_mask"], dtype=torch.bool)
+        anchors = random_preparedata_anchors(
+            torch,
+            input_ids,
+            loss_mask,
+            runner.draft_model.block_size,
+            args.preparedata_anchors_per_sample,
+        )
+        for anchor in anchors:
+            replay_anchor(torch, eval_impl, runner, input_ids, anchor, dataset_stats)
+        log.info(
+            "preparedata_sample=%d tokens=%d random_anchors=%d",
+            sample_index,
+            input_ids.shape[1],
+            len(anchors),
+        )
+
+
 def run(args):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -237,6 +290,7 @@ def run(args):
     )
     round_stats = SlotStats("complete_inference_proposal_rounds", draft.block_size)
     random_stats = SlotStats("random_anchors_in_generated_samples", draft.block_size)
+    preparedata_stats = SlotStats("random_anchors_in_preparedata_samples", draft.block_size)
 
     for sample_index in range(args.sample_start, args.sample_start + args.num_samples):
         if args.prompt:
@@ -273,6 +327,9 @@ def run(args):
 
     round_stats.print()
     random_stats.print()
+    if args.preparedata_num_samples > 0:
+        run_preparedata_random(torch, args, eval_impl, runner, preparedata_stats)
+        preparedata_stats.print()
 
 
 def parse_args():
@@ -286,6 +343,9 @@ def parse_args():
     p.add_argument("--num-samples", type=int, default=4)
     p.add_argument("--anchors-per-sample", type=int, default=32)
     p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--preparedata-sample-start", type=int, default=0)
+    p.add_argument("--preparedata-num-samples", type=int, default=0)
+    p.add_argument("--preparedata-anchors-per-sample", type=int, default=32)
     p.add_argument("--device", default="npu:0")
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument(
