@@ -390,7 +390,22 @@ def _messages_from_conversations(value: Any) -> list[dict[str, str]] | None:
     return messages or None
 
 
-def _prompt_from_record(record: dict[str, Any], tokenizer, *, source: str) -> str:
+def _chat_template_kwargs(args: argparse.Namespace | None) -> dict[str, Any]:
+    if args is None:
+        return {}
+    enable_thinking = getattr(args, "enable_thinking", "false")
+    if enable_thinking == "default":
+        return {}
+    return {"enable_thinking": enable_thinking == "true"}
+
+
+def _prompt_from_record(
+    record: dict[str, Any],
+    tokenizer,
+    *,
+    source: str,
+    args: argparse.Namespace | None = None,
+) -> str:
     turns = _string_turns(record.get("turns"))
     if turns is not None:
         # DeepSpec keeps only the first turn for eval. Keep all turns joined here
@@ -403,6 +418,7 @@ def _prompt_from_record(record: dict[str, Any], tokenizer, *, source: str) -> st
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **_chat_template_kwargs(args),
         )
 
     messages = _messages_from_conversations(record.get("conversations"))
@@ -411,6 +427,7 @@ def _prompt_from_record(record: dict[str, Any], tokenizer, *, source: str) -> st
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **_chat_template_kwargs(args),
         )
 
     for field in PROMPT_FIELDS:
@@ -1133,6 +1150,7 @@ def _evaluate_dataset(
             record,
             runner.tokenizer,
             source=f"{path}:{idx}",
+            args=args,
         )
         response = runner.generate_one(prompt, stop_token_ids)
         stats.add_response(response)
@@ -1275,6 +1293,8 @@ def _worker_command(
         str(args.max_new_tokens),
         "--temperature",
         str(args.temperature),
+        "--enable-thinking",
+        args.enable_thinking,
         "--device",
         args.device,
         "--dtype",
@@ -1550,6 +1570,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--enable-thinking",
+        choices=["false", "true", "default"],
+        default="false",
+        help=(
+            "Qwen-style chat-template thinking mode for records with messages or "
+            "conversations. Default false disables thinking; default leaves the "
+            "tokenizer's own default unchanged."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument(

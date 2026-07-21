@@ -59,12 +59,13 @@ class SlotStats:
             )
 
 
-def prompt_from_dataset(eval_impl, tokenizer, path, sample_index):
+def prompt_from_dataset(eval_impl, tokenizer, path, sample_index, args):
     records = eval_impl._load_jsonl(Path(path))
     return eval_impl._prompt_from_record(
         records[sample_index],
         tokenizer,
         source=f"{path}:{sample_index}",
+        args=args,
     )
 
 
@@ -296,7 +297,13 @@ def run(args):
         if args.prompt:
             prompt = args.prompt
         else:
-            prompt = prompt_from_dataset(eval_impl, tokenizer, args.prompt_dataset, sample_index)
+            prompt = prompt_from_dataset(
+                eval_impl,
+                tokenizer,
+                args.prompt_dataset,
+                sample_index,
+                args,
+            )
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(args.device)
         output_ids, rounds, avg_accepted = generate_one(
             torch,
@@ -343,6 +350,11 @@ def parse_args():
     p.add_argument("--num-samples", type=int, default=4)
     p.add_argument("--anchors-per-sample", type=int, default=32)
     p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument(
+        "--enable-thinking",
+        choices=["false", "true", "default"],
+        default="false",
+    )
     p.add_argument("--preparedata-sample-start", type=int, default=0)
     p.add_argument("--preparedata-num-samples", type=int, default=0)
     p.add_argument("--preparedata-anchors-per-sample", type=int, default=32)
