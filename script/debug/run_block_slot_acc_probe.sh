@@ -16,6 +16,11 @@ export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/script/debug:${PYTHONPATH:-}"
 : "${ANCHORS_PER_SAMPLE:=32}"
 : "${MAX_NEW_TOKENS:=128}"
 : "${ENABLE_THINKING:=false}"
+: "${PRINT_PROMPT:=1}"
+: "${COMPARE_TARGET_ONLY:=1}"
+: "${PROMPT_TAIL_TOKENS:=32}"
+: "${PROMPT_TAIL_CHARS:=400}"
+: "${DEBUG_CONTEXT_TOKENS:=32}"
 : "${PREPAREDATA_SAMPLE_START:=0}"
 : "${PREPAREDATA_NUM_SAMPLES:=0}"
 : "${PREPAREDATA_ANCHORS_PER_SAMPLE:=32}"
@@ -34,6 +39,9 @@ cmd=(
     --anchors-per-sample "$ANCHORS_PER_SAMPLE"
     --max-new-tokens "$MAX_NEW_TOKENS"
     --enable-thinking "$ENABLE_THINKING"
+    --prompt-tail-tokens "$PROMPT_TAIL_TOKENS"
+    --prompt-tail-chars "$PROMPT_TAIL_CHARS"
+    --debug-context-tokens "$DEBUG_CONTEXT_TOKENS"
     --preparedata-sample-start "$PREPAREDATA_SAMPLE_START"
     --preparedata-num-samples "$PREPAREDATA_NUM_SAMPLES"
     --preparedata-anchors-per-sample "$PREPAREDATA_ANCHORS_PER_SAMPLE"
@@ -41,6 +49,14 @@ cmd=(
     --dtype "$DTYPE"
     --draft-attn-impl "$DRAFT_ATTN_IMPL"
 )
+
+if [[ "$PRINT_PROMPT" == "0" ]]; then
+    cmd+=(--no-print-prompt)
+fi
+
+if [[ "$COMPARE_TARGET_ONLY" == "0" ]]; then
+    cmd+=(--no-compare-target-only)
+fi
 
 if [[ -n "$PROMPT_DATASET" ]]; then
     cmd+=(--prompt-dataset "$PROMPT_DATASET")

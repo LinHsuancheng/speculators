@@ -69,6 +69,78 @@ def prompt_from_dataset(eval_impl, tokenizer, path, sample_index, args):
     )
 
 
+def log_token_window(tokenizer, label, ids, max_tokens):
+    ids_list = ids[0].detach().cpu().tolist()
+    tail = ids_list[-max_tokens:]
+    log.info("%s_ids=%s", label, tail)
+    log.info("%s_text=%r", label, tokenizer.decode(tail))
+
+
+def target_only_generate(torch, target, input_ids, max_new_tokens):
+    with torch.inference_mode():
+        return target.generate(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            return_dict_in_generate=False,
+        )
+
+
+def first_diff(torch, a, b):
+    limit = min(a.shape[1], b.shape[1])
+    mismatch = torch.nonzero(a[:, :limit] != b[:, :limit], as_tuple=False)
+    if mismatch.numel() > 0:
+        return int(mismatch[0, 1].item())
+    if a.shape[1] != b.shape[1]:
+        return limit
+    return None
+
+
+def compare_target_and_spec(torch, tokenizer, input_ids, target_ids, spec_ids, sample_index, args):
+    prompt_len = input_ids.shape[1]
+    target_cont = target_ids[:, prompt_len:]
+    spec_cont = spec_ids[:, prompt_len:]
+    diff = first_diff(torch, target_cont, spec_cont)
+    if diff is None:
+        log.info(
+            "sample=%d target_only_vs_speculative=OK continuation_tokens=%d",
+            sample_index,
+            target_cont.shape[1],
+        )
+        return
+
+    log.error(
+        "sample=%d target_only_vs_speculative=DIFF first_continuation_diff=%d "
+        "target_len=%d spec_len=%d",
+        sample_index,
+        diff,
+        target_cont.shape[1],
+        spec_cont.shape[1],
+    )
+    start = max(0, diff - args.debug_context_tokens)
+    end = min(
+        min(target_cont.shape[1], spec_cont.shape[1]),
+        diff + args.debug_context_tokens + 1,
+    )
+    log.info(
+        "target_context_ids=%s",
+        target_cont[0, start:end].detach().cpu().tolist(),
+    )
+    log.info(
+        "target_context_text=%r",
+        tokenizer.decode(target_cont[0, start:end].detach().cpu().tolist()),
+    )
+    log.info(
+        "spec_context_ids=%s",
+        spec_cont[0, start:end].detach().cpu().tolist(),
+    )
+    log.info(
+        "spec_context_text=%r",
+        tokenizer.decode(spec_cont[0, start:end].detach().cpu().tolist()),
+    )
+
+
 def slot_records(torch, proposal, verification):
     draft_count = int(proposal.draft_token_count)
     target_logits = verification.target_output.logits[:, :draft_count, :]
@@ -305,6 +377,29 @@ def run(args):
                 args,
             )
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(args.device)
+        if args.print_prompt:
+            log.info(
+                "sample=%d enable_thinking=%s prompt_chars=%d prompt_tokens=%d",
+                sample_index,
+                args.enable_thinking,
+                len(prompt),
+                input_ids.shape[1],
+            )
+            log.info("prompt_tail_raw=%r", prompt[-args.prompt_tail_chars :])
+            log_token_window(
+                tokenizer,
+                "prompt_tail",
+                input_ids,
+                args.prompt_tail_tokens,
+            )
+        target_only_ids = None
+        if args.compare_target_only:
+            target_only_ids = target_only_generate(
+                torch,
+                target,
+                input_ids,
+                args.max_new_tokens,
+            )
         output_ids, rounds, avg_accepted = generate_one(
             torch,
             eval_impl,
@@ -313,6 +408,16 @@ def run(args):
             args.max_new_tokens,
             round_stats,
         )
+        if target_only_ids is not None:
+            compare_target_and_spec(
+                torch,
+                tokenizer,
+                input_ids,
+                target_only_ids,
+                output_ids,
+                sample_index,
+                args,
+            )
         anchors = random_generated_anchors(
             torch,
             output_ids,
@@ -355,6 +460,15 @@ def parse_args():
         choices=["false", "true", "default"],
         default="false",
     )
+    p.add_argument("--print-prompt", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--compare-target-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--prompt-tail-tokens", type=int, default=32)
+    p.add_argument("--prompt-tail-chars", type=int, default=400)
+    p.add_argument("--debug-context-tokens", type=int, default=32)
     p.add_argument("--preparedata-sample-start", type=int, default=0)
     p.add_argument("--preparedata-num-samples", type=int, default=0)
     p.add_argument("--preparedata-anchors-per-sample", type=int, default=32)
