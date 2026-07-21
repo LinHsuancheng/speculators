@@ -47,43 +47,72 @@ def load_vocab_maps(torch, args):
     return None, None
 
 
-def load_cached_sample(torch, args):
-    from speculators.train.data import ArrowDataset, _maybe_load_hs_file
+def load_vllm_sample(torch, args):
+    import openai
+
+    from speculators.data_generation.offline import check_hidden_states
+    from speculators.data_generation.vllm_client import generate_hidden_states
+    from speculators.train.data import ArrowDataset, _maybe_load_hs_file, build_client_item
 
     dataset = ArrowDataset(
         max_len=args.total_seq_len,
         datapath=args.data_path,
-        hidden_states_path=args.hidden_states_path,
+        hidden_states_path=None,
+        vllm_endpoint=args.vllm_endpoint,
         on_missing="raise",
         hidden_states_dtype=dtype_of(torch, args.hidden_states_dtype),
-        model=args.verifier_model,
+        model=args.vllm_model,
+        request_timeout=args.request_timeout,
+        max_retries=args.max_retries,
     )
     if not 0 <= args.sample_index < len(dataset):
         raise ValueError(f"--sample-index out of range [0, {len(dataset) - 1}]")
 
-    file_idx = dataset._map_to_file_idx(args.sample_index)
-    hs_path = dataset.hidden_states_path / f"hs_{file_idx}.safetensors"
+    row = dataset.data[args.sample_index]
+    client = openai.OpenAI(base_url=args.vllm_endpoint, api_key="EMPTY", max_retries=0)
+    vllm_model = args.vllm_model or client.models.list().data[0].id
+    log.info(
+        "requesting vLLM hidden states endpoint=%s model=%s sample_index=%d",
+        args.vllm_endpoint,
+        vllm_model,
+        args.sample_index,
+    )
+    hs_path = Path(
+        generate_hidden_states(
+            client,
+            vllm_model,
+            build_client_item(row),
+            timeout=args.request_timeout,
+            max_retries=args.max_retries,
+        )
+    )
     hs = _maybe_load_hs_file(hs_path)
     if hs is None:
-        raise FileNotFoundError(f"missing cached hidden state: {hs_path}")
+        raise FileNotFoundError(
+            f"vLLM returned hidden state path but file is missing: {hs_path}"
+        )
 
-    row = dataset.data[args.sample_index]
     expected = torch.as_tensor(row["input_ids"], dtype=torch.long)
+    check_hidden_states(hs, expected.tolist())
     if not torch.equal(hs["token_ids"].cpu(), expected.cpu()):
-        raise ValueError(f"cached token_ids do not match dataset row: {hs_path}")
+        raise ValueError(f"vLLM token_ids do not match dataset row: {hs_path}")
 
-    train_view = dataset._get_raw_data(args.sample_index)
-    if train_view is None:
-        raise RuntimeError(f"ArrowDataset returned None for sample {args.sample_index}")
-
-    return SimpleNamespace(
+    sample = SimpleNamespace(
         hs_path=hs_path,
         raw_hidden=hs["hidden_states"],
         token_ids=hs["token_ids"].long(),
         loss_mask=torch.as_tensor(row["loss_mask"]),
-        train_hidden=train_view["hidden_states"],
-        train_last=train_view["verifier_last_hidden_states"],
+        train_hidden=hs["hidden_states"][:, :-1]
+        .flatten(1)
+        .to(dtype_of(torch, args.hidden_states_dtype)),
+        train_last=hs["hidden_states"][:, -1].to(
+            dtype_of(torch, args.hidden_states_dtype)
+        ),
     )
+    if args.delete_vllm_hidden_state:
+        hs_path.unlink(missing_ok=True)
+        log.info("deleted transient vLLM hidden state file: %s", hs_path)
+    return sample
 
 
 def choose_anchor(torch, loss_mask, block_size: int, requested: int | None) -> int:
@@ -138,7 +167,7 @@ def print_hidden_alignment(torch, cached, direct, offset, layer_ids):
         direct_scores.append(d)
         offset_scores.append(o)
         log.info(
-            "layer_id=%s cached_slot=%d | hf[layer_id] cos=%.8f max_abs=%.8f | "
+            "layer_id=%s vllm_slot=%d | hf[layer_id] cos=%.8f max_abs=%.8f | "
             "hf[layer_id+1] cos=%.8f max_abs=%.8f",
             layer_id,
             pos,
@@ -254,7 +283,7 @@ def compare_replay(torch, cached, other, name: str):
     for field in ("base", "bias", "final"):
         cos, max_abs, mean_abs = sim(torch, getattr(cached, field), getattr(other, field))
         log.info(
-            "compare cached_vllm vs %s slot1_%s: cosine=%.8f max_abs=%.8f mean_abs=%.8f",
+            "compare vllm_request vs %s slot1_%s: cosine=%.8f max_abs=%.8f mean_abs=%.8f",
             name,
             field,
             cos,
@@ -271,7 +300,7 @@ def run(args):
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    cached = load_cached_sample(torch, args)
+    cached = load_vllm_sample(torch, args)
     tokenizer = AutoTokenizer.from_pretrained(
         args.verifier_model, trust_remote_code=args.trust_remote_code
     )
@@ -291,8 +320,8 @@ def run(args):
     aux_layers = cached.train_hidden.shape[-1] // hidden_size
     if aux_layers != len(layer_ids):
         raise ValueError(
-            f"cached aux layers after ArrowDataset={aux_layers}, but draft "
-            f"target_layer_ids={layer_ids}. Cached vLLM layer list mismatches config."
+            f"vLLM aux layers after training layout={aux_layers}, but draft "
+            f"target_layer_ids={layer_ids}. vLLM layer list mismatches config."
         )
 
     anchor = choose_anchor(torch, cached.loss_mask, int(draft.block_size), args.anchor_position)
@@ -300,9 +329,9 @@ def run(args):
     input_ids = token_ids.unsqueeze(0)
     position_ids = torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
 
-    log.info("sample_index=%d cached_file=%s", args.sample_index, cached.hs_path)
+    log.info("sample_index=%d vllm_hidden_file=%s", args.sample_index, cached.hs_path)
     log.info(
-        "seq_len=%d raw_cached_hidden_shape=%s train_hidden_shape=%s",
+        "seq_len=%d raw_vllm_hidden_shape=%s train_hidden_shape=%s",
         token_ids.numel(),
         tuple(cached.raw_hidden.shape),
         tuple(cached.train_hidden.shape),
@@ -354,16 +383,16 @@ def run(args):
         )
 
         replays = {
-            "cached_vllm": replay_slot1(torch, draft, cached_aux, cached_last, token_ids, anchor),
+            "vllm_request": replay_slot1(torch, draft, cached_aux, cached_last, token_ids, anchor),
             "hf_layer_id": replay_slot1(torch, draft, hf_direct, cached_last, token_ids, anchor),
             "hf_layer_id_plus_1": replay_slot1(torch, draft, hf_offset, cached_last, token_ids, anchor),
         }
         for name, replay in replays.items():
             print_replay(torch, tokenizer, draft, name, replay)
-        compare_replay(torch, replays["cached_vllm"], replays["hf_layer_id"], "hf_layer_id")
+        compare_replay(torch, replays["vllm_request"], replays["hf_layer_id"], "hf_layer_id")
         compare_replay(
             torch,
-            replays["cached_vllm"],
+            replays["vllm_request"],
             replays["hf_layer_id_plus_1"],
             "hf_layer_id_plus_1",
         )
@@ -374,7 +403,11 @@ def parse_args():
     p.add_argument("--verifier-model", required=True)
     p.add_argument("--draft-model", required=True)
     p.add_argument("--data-path", required=True)
-    p.add_argument("--hidden-states-path", default=None)
+    p.add_argument("--vllm-endpoint", default="http://localhost:8000/v1")
+    p.add_argument("--vllm-model", default=None)
+    p.add_argument("--request-timeout", type=float, default=120)
+    p.add_argument("--max-retries", type=int, default=3)
+    p.add_argument("--delete-vllm-hidden-state", action="store_true")
     p.add_argument("--sample-index", type=int, default=0)
     p.add_argument("--anchor-position", type=int, default=None)
     p.add_argument("--total-seq-len", type=int, default=3072)

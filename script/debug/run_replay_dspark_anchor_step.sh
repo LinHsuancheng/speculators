@@ -9,7 +9,11 @@ export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 : "${VERIFIER_MODEL:=/models/Qwen3-4B}"
 : "${DRAFT_MODEL:=/outputs/dspark_qwen3_4b_real_baseline/checkpoints/checkpoint_best}"
 : "${DATA_PATH:=/data/open_perfectblend_qwen3_4b_100k}"
-: "${HIDDEN_STATES_PATH:=}"
+: "${VLLM_ENDPOINT:=http://localhost:8000/v1}"
+: "${VLLM_MODEL:=}"
+: "${REQUEST_TIMEOUT:=120}"
+: "${MAX_RETRIES:=3}"
+: "${DELETE_VLLM_HIDDEN_STATE:=0}"
 : "${SAMPLE_INDEX:=0}"
 : "${ANCHOR_POSITION:=}"
 : "${TOTAL_SEQ_LEN:=3072}"
@@ -25,6 +29,9 @@ cmd=(
     --verifier-model "$VERIFIER_MODEL"
     --draft-model "$DRAFT_MODEL"
     --data-path "$DATA_PATH"
+    --vllm-endpoint "$VLLM_ENDPOINT"
+    --request-timeout "$REQUEST_TIMEOUT"
+    --max-retries "$MAX_RETRIES"
     --sample-index "$SAMPLE_INDEX"
     --total-seq-len "$TOTAL_SEQ_LEN"
     --device "$DEVICE"
@@ -33,8 +40,12 @@ cmd=(
     --draft-attn-impl "$DRAFT_ATTN_IMPL"
 )
 
-if [[ -n "$HIDDEN_STATES_PATH" ]]; then
-    cmd+=(--hidden-states-path "$HIDDEN_STATES_PATH")
+if [[ -n "$VLLM_MODEL" ]]; then
+    cmd+=(--vllm-model "$VLLM_MODEL")
+fi
+
+if [[ "$DELETE_VLLM_HIDDEN_STATE" == "1" ]]; then
+    cmd+=(--delete-vllm-hidden-state)
 fi
 
 if [[ -n "$ANCHOR_POSITION" ]]; then
