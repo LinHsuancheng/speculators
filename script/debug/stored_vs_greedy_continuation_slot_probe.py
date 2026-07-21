@@ -21,6 +21,7 @@ class AnchorPair:
     offset: int
     anchor_a: int
     anchor_b: int
+    anchor_c: int
 
 
 def load_jsonl_record(path: Path, index: int) -> dict:
@@ -111,6 +112,29 @@ def first_loss_position(torch, loss_mask) -> int:
     return int(positions[0].item())
 
 
+def maybe_check_raw_prompt_prefix(torch, tokenizer, stored_ids, loss_mask, args):
+    prompt_ids = prompt_ids_from_raw(torch, tokenizer, args)
+    if prompt_ids is None:
+        return "no_raw_jsonl"
+    stored_prefix = stored_ids[: prompt_ids.numel()].cpu()
+    if not torch.equal(stored_prefix, prompt_ids.cpu()):
+        diff = first_token_diff(stored_prefix.tolist(), prompt_ids.cpu().tolist())
+        log.error("raw prompt_ids do not match stored prefix; first_diff=%s", diff)
+        print_token_window(
+            tokenizer,
+            "stored_prefix_around_raw_diff",
+            stored_ids,
+            max(0, int(diff or 0) - 8),
+            min(stored_ids.numel(), int(diff or 0) + 16),
+            loss_mask,
+        )
+        if args.strict_prompt_prefix:
+            raise AssertionError("stored_ids prefix != raw reconstructed prompt_ids")
+        return "raw_chat_template_mismatch"
+    log.info("stored prefix matches raw reconstructed prompt_ids")
+    return "raw_chat_template_match"
+
+
 def prompt_ids_for_sample(torch, tokenizer, stored_ids, loss_mask, args):
     prompt_ids = prompt_ids_from_raw(torch, tokenizer, args)
     if prompt_ids is None:
@@ -142,6 +166,79 @@ def prompt_ids_for_sample(torch, tokenizer, stored_ids, loss_mask, args):
     else:
         log.info("stored prompt prefix matches raw reconstructed prompt_ids")
     return prompt_ids, response_start, "raw_chat_template"
+
+
+def tokenizer_think_prefix_ids(torch, tokenizer, text_value: str):
+    return torch.as_tensor(
+        tokenizer.encode(text_value, add_special_tokens=False),
+        dtype=torch.long,
+    )
+
+
+def find_token_subsequence(haystack, needle, start: int = 0):
+    if needle.numel() == 0:
+        return None
+    last = haystack.numel() - needle.numel()
+    for idx in range(start, last + 1):
+        if bool((haystack[idx : idx + needle.numel()] == needle).all().item()):
+            return idx
+    return None
+
+
+def stored_think_prefix_ids(torch, tokenizer, stored_ids, assistant_start: int, args):
+    tokenized = tokenizer_think_prefix_ids(torch, tokenizer, args.think_prefix_text)
+    stored_slice = stored_ids[assistant_start : assistant_start + tokenized.numel()]
+    if torch.equal(stored_slice.cpu(), tokenized.cpu()):
+        log.info(
+            "think_prefix_ids match stored sample at assistant_start; ids=%s",
+            tokenized.tolist(),
+        )
+        return tokenized, "tokenized_matches_stored"
+
+    if args.think_prefix_source == "tokenizer":
+        if args.strict_think_prefix:
+            raise AssertionError(
+                "tokenized think prefix does not match stored sample at assistant_start"
+            )
+        log.warning(
+            "using tokenizer think prefix despite stored mismatch; tokenized=%s stored=%s",
+            tokenized.tolist(),
+            stored_slice.tolist(),
+        )
+        return tokenized, "tokenized_mismatch"
+
+    think_id = tokenizer.encode("<think>", add_special_tokens=False)
+    end_id = tokenizer.encode("</think>", add_special_tokens=False)
+    if len(think_id) != 1 or len(end_id) != 1:
+        raise ValueError(
+            f"expected single-token think tags, got <think>={think_id} "
+            f"</think>={end_id}"
+        )
+    if int(stored_ids[assistant_start].item()) != int(think_id[0]):
+        raise ValueError(
+            "stored assistant_start does not begin with <think>; cannot infer "
+            "stored think prefix"
+        )
+    end_pos = find_token_subsequence(
+        stored_ids,
+        torch.as_tensor(end_id, dtype=torch.long),
+        start=assistant_start + 1,
+    )
+    if end_pos is None:
+        raise ValueError("could not find </think> after assistant_start")
+    prefix_end = end_pos + 1
+    if prefix_end < stored_ids.numel():
+        next_text = tokenizer.decode([int(stored_ids[prefix_end].item())])
+        if next_text and next_text.isspace():
+            prefix_end += 1
+    stored_prefix = stored_ids[assistant_start:prefix_end].clone()
+    log.warning(
+        "tokenized think prefix did not match stored; using stored prefix ids=%s "
+        "tokenized=%s",
+        stored_prefix.tolist(),
+        tokenized.tolist(),
+    )
+    return stored_prefix.cpu(), "stored_inferred"
 
 
 def first_token_diff(a: list[int], b: list[int]) -> int | None:
@@ -269,14 +366,20 @@ def print_anchor_examples(torch, tokenizer, examples):
     for ex in examples:
         offset = ex["offset"]
         log.info(
-            "offset=%d A_anchor=%d %s B_anchor=%d %s",
+            "offset=%d A_anchor=%d %s B_anchor=%d %s C_anchor=%d %s",
             offset,
             ex["anchor_a"],
             text(tokenizer, ex["anchor_token_a"]),
             ex["anchor_b"],
             text(tokenizer, ex["anchor_token_b"]),
+            ex["anchor_c"],
+            text(tokenizer, ex["anchor_token_c"]),
         )
-        for label, rows in (("A", ex["rows_a"]), ("B", ex["rows_b"])):
+        for label, rows in (
+            ("A", ex["rows_a"]),
+            ("B", ex["rows_b"]),
+            ("C", ex["rows_c"]),
+        ):
             parts = []
             for row in rows:
                 parts.append(
@@ -334,45 +437,77 @@ def run(args):
     item = data[int(args.sample_index)]
     stored_ids = torch.as_tensor(item["input_ids"], dtype=torch.long)
     loss_mask = torch.as_tensor(item["loss_mask"], dtype=torch.bool)
-    prompt_ids, response_start_a, prompt_source = prompt_ids_for_sample(
+    raw_prompt_status = maybe_check_raw_prompt_prefix(
+        torch, tokenizer, stored_ids, loss_mask, args
+    )
+    response_start_a = first_loss_position(torch, loss_mask)
+    assistant_prompt_ids = stored_ids[:response_start_a].clone()
+    think_prefix_ids, think_prefix_source = stored_think_prefix_ids(
         torch,
         tokenizer,
         stored_ids,
-        loss_mask,
+        response_start_a,
         args,
     )
     stored_cont = stored_ids[response_start_a:]
     max_new_tokens = args.max_new_tokens or int(stored_cont.numel())
-    free_ids = generate_greedy(
+    free_thinking_ids = generate_greedy(
         torch,
         target,
-        prompt_ids,
+        assistant_prompt_ids,
         max_new_tokens=max_new_tokens,
         device=args.device,
     )
-    response_start_b = int(prompt_ids.numel())
-    free_cont = free_ids[response_start_b:]
-    common_len = min(int(stored_cont.numel()), int(free_cont.numel()))
-    first_diff = first_divergence(stored_cont[:common_len], free_cont[:common_len])
+    forced_prompt_ids = torch.cat([assistant_prompt_ids.cpu(), think_prefix_ids.cpu()])
+    forced_new_tokens = max(1, max_new_tokens - int(think_prefix_ids.numel()))
+    forced_answer_ids = generate_greedy(
+        torch,
+        target,
+        forced_prompt_ids,
+        max_new_tokens=forced_new_tokens,
+        device=args.device,
+    )
+    response_start_b = int(assistant_prompt_ids.numel())
+    response_start_c = int(assistant_prompt_ids.numel())
+    free_thinking_cont = free_thinking_ids[response_start_b:]
+    forced_cont = forced_answer_ids[response_start_c:]
+    common_len = min(
+        int(stored_cont.numel()),
+        int(free_thinking_cont.numel()),
+        int(forced_cont.numel()),
+    )
+    first_diff_ab = first_divergence(
+        stored_cont[:common_len], free_thinking_cont[:common_len]
+    )
+    first_diff_ac = first_divergence(stored_cont[:common_len], forced_cont[:common_len])
     offsets = make_offsets(torch, common_len, draft.block_size, args.num_anchors)
     pairs = [
         AnchorPair(
             offset=int(offset),
             anchor_a=response_start_a + int(offset),
             anchor_b=response_start_b + int(offset),
+            anchor_c=response_start_c + int(offset),
         )
         for offset in offsets
     ]
 
     log.info("")
     log.info("=== sample ===")
-    log.info("sample_id=%d prompt_source=%s", args.sample_index, prompt_source)
-    log.info("prompt_tokens=%d", int(prompt_ids.numel()))
+    log.info("sample_id=%d raw_prompt_status=%s", args.sample_index, raw_prompt_status)
+    log.info("assistant_prompt_tokens=%d", int(assistant_prompt_ids.numel()))
+    log.info(
+        "think_prefix_source=%s think_prefix_tokens=%d ids=%s",
+        think_prefix_source,
+        int(think_prefix_ids.numel()),
+        think_prefix_ids.tolist(),
+    )
     log.info("stored_tokens=%d", int(stored_ids.numel()))
     log.info("stored_continuation_tokens=%d", int(stored_cont.numel()))
-    log.info("free_generated_tokens=%d", int(free_cont.numel()))
+    log.info("free_thinking_continuation_tokens=%d", int(free_thinking_cont.numel()))
+    log.info("forced_nonthinking_continuation_tokens=%d", int(forced_cont.numel()))
     log.info("common_continuation_tokens=%d", common_len)
-    log.info("first_divergence_offset=%s", first_diff)
+    log.info("first_divergence_A_vs_B=%s", first_diff_ab)
+    log.info("first_divergence_A_vs_C=%s", first_diff_ac)
     log.info("anchors=%d block_size=%d", len(pairs), draft.block_size)
 
     print_token_window(
@@ -392,29 +527,44 @@ def run(args):
     )
     print_continuation(
         tokenizer,
-        "free_greedy_continuation",
-        free_ids,
+        "free_thinking_continuation",
+        free_thinking_ids,
         response_start_b,
+        args.decode_tokens,
+    )
+    print_continuation(
+        tokenizer,
+        "forced_nonthinking_continuation",
+        forced_answer_ids,
+        response_start_c,
         args.decode_tokens,
     )
 
     output_a = stored_ids.to(args.device).unsqueeze(0)
-    output_b = free_ids.to(args.device).unsqueeze(0)
+    output_b = free_thinking_ids.to(args.device).unsqueeze(0)
+    output_c = forced_answer_ids.to(args.device).unsqueeze(0)
     stats_a = SlotStats("A_stored", draft.block_size)
-    stats_b = SlotStats("B_free_greedy", draft.block_size)
-    stats_a_before = SlotStats("A_before_divergence", draft.block_size)
+    stats_b = SlotStats("B_free_thinking", draft.block_size)
+    stats_c = SlotStats("C_forced_nonthinking", draft.block_size)
+    stats_a_before_b = SlotStats("A_before_B_divergence", draft.block_size)
     stats_b_before = SlotStats("B_before_divergence", draft.block_size)
-    stats_a_after = SlotStats("A_after_divergence", draft.block_size)
+    stats_a_after_b = SlotStats("A_after_B_divergence", draft.block_size)
     stats_b_after = SlotStats("B_after_divergence", draft.block_size)
+    stats_a_before_c = SlotStats("A_before_C_divergence", draft.block_size)
+    stats_c_before = SlotStats("C_before_divergence", draft.block_size)
+    stats_a_after_c = SlotStats("A_after_C_divergence", draft.block_size)
+    stats_c_after = SlotStats("C_after_divergence", draft.block_size)
     examples = []
 
     for pair in pairs:
         rows_a = replay_anchor_rows(torch, eval_impl, runner, output_a, pair.anchor_a)
         rows_b = replay_anchor_rows(torch, eval_impl, runner, output_b, pair.anchor_b)
+        rows_c = replay_anchor_rows(torch, eval_impl, runner, output_c, pair.anchor_c)
         add_rows(stats_a, rows_a)
         add_rows(stats_b, rows_b)
-        if first_diff is None or pair.offset < first_diff:
-            add_rows(stats_a_before, rows_a)
+        add_rows(stats_c, rows_c)
+        if first_diff_ab is None or pair.offset < first_diff_ab:
+            add_rows(stats_a_before_b, rows_a)
             add_rows(stats_b_before, rows_b)
             for ra, rb in zip(rows_a, rows_b, strict=True):
                 if ra["draft"] != rb["draft"] or ra["target"] != rb["target"]:
@@ -423,37 +573,62 @@ def run(args):
                         f"offset={pair.offset} slot={ra['slot']} A={ra} B={rb}"
                     )
         else:
-            add_rows(stats_a_after, rows_a)
+            add_rows(stats_a_after_b, rows_a)
             add_rows(stats_b_after, rows_b)
+        if first_diff_ac is None or pair.offset < first_diff_ac:
+            add_rows(stats_a_before_c, rows_a)
+            add_rows(stats_c_before, rows_c)
+            for ra, rc in zip(rows_a, rows_c, strict=True):
+                if ra["draft"] != rc["draft"] or ra["target"] != rc["target"]:
+                    raise AssertionError(
+                        "A/C rows differ before first divergence: "
+                        f"offset={pair.offset} slot={ra['slot']} A={ra} C={rc}"
+                    )
+        else:
+            add_rows(stats_a_after_c, rows_a)
+            add_rows(stats_c_after, rows_c)
         if len(examples) < args.show_anchors:
             examples.append(
                 {
                     "offset": pair.offset,
                     "anchor_a": pair.anchor_a,
                     "anchor_b": pair.anchor_b,
+                    "anchor_c": pair.anchor_c,
                     "anchor_token_a": int(output_a[0, pair.anchor_a].item()),
                     "anchor_token_b": int(output_b[0, pair.anchor_b].item()),
+                    "anchor_token_c": int(output_c[0, pair.anchor_c].item()),
                     "rows_a": rows_a,
                     "rows_b": rows_b,
+                    "rows_c": rows_c,
                 }
             )
 
     print_stats_table(
         [
             ("A_stored", stats_a),
-            ("B_free_greedy", stats_b),
-            ("A_before_div", stats_a_before),
+            ("B_free_thinking", stats_b),
+            ("C_forced_non", stats_c),
+            ("A_before_B_div", stats_a_before_b),
             ("B_before_div", stats_b_before),
-            ("A_after_div", stats_a_after),
+            ("A_after_B_div", stats_a_after_b),
             ("B_after_div", stats_b_after),
+            ("A_before_C_div", stats_a_before_c),
+            ("C_before_div", stats_c_before),
+            ("A_after_C_div", stats_a_after_c),
+            ("C_after_div", stats_c_after),
         ]
     )
     stats_a.print()
     stats_b.print()
-    stats_a_before.print()
+    stats_c.print()
+    stats_a_before_b.print()
     stats_b_before.print()
-    stats_a_after.print()
+    stats_a_after_b.print()
     stats_b_after.print()
+    stats_a_before_c.print()
+    stats_c_before.print()
+    stats_a_after_c.print()
+    stats_c_after.print()
     print_anchor_examples(torch, tokenizer, examples)
 
 
@@ -481,6 +656,25 @@ def parse_args():
     p.add_argument("--boundary-tokens", type=int, default=20)
     p.add_argument("--decode-tokens", type=int, default=160)
     p.add_argument("--show-anchors", type=int, default=5)
+    p.add_argument(
+        "--think-prefix-text",
+        default="<think>\n\n</think>\n\n",
+        help="Manual non-thinking prefix to force before generating C.",
+    )
+    p.add_argument(
+        "--think-prefix-source",
+        choices=["auto", "stored", "tokenizer"],
+        default="auto",
+        help=(
+            "auto/stored reuse stored DATA_PATH tokens if tokenizer text does not "
+            "match; tokenizer always uses --think-prefix-text tokenization."
+        ),
+    )
+    p.add_argument(
+        "--strict-think-prefix",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     p.add_argument("--device", default="npu:0")
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument(

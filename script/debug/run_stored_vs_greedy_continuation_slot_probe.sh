@@ -11,6 +11,8 @@ DRAFT_ATTN_IMPL="${DRAFT_ATTN_IMPL:-sdpa}"
 NUM_ANCHORS="${NUM_ANCHORS:-64}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-0}"
 ENABLE_THINKING="${ENABLE_THINKING:-false}"
+THINK_PREFIX_SOURCE="${THINK_PREFIX_SOURCE:-auto}"
+STRICT_THINK_PREFIX="${STRICT_THINK_PREFIX:-0}"
 SHOW_ANCHORS="${SHOW_ANCHORS:-5}"
 SEED="${SEED:-0}"
 
@@ -25,9 +27,14 @@ ARGS=(
   --num-anchors "$NUM_ANCHORS"
   --max-new-tokens "$MAX_NEW_TOKENS"
   --enable-thinking "$ENABLE_THINKING"
+  --think-prefix-source "$THINK_PREFIX_SOURCE"
   --show-anchors "$SHOW_ANCHORS"
   --seed "$SEED"
 )
+
+if [[ "${THINK_PREFIX_TEXT:-}" != "" ]]; then
+  ARGS+=(--think-prefix-text "$THINK_PREFIX_TEXT")
+fi
 
 if [[ "${RAW_JSONL:-}" != "" ]]; then
   ARGS+=(--raw-jsonl "$RAW_JSONL")
@@ -43,6 +50,10 @@ fi
 
 if [[ "${STRICT_PROMPT_PREFIX:-1}" == "0" ]]; then
   ARGS+=(--no-strict-prompt-prefix)
+fi
+
+if [[ "$STRICT_THINK_PREFIX" == "1" ]]; then
+  ARGS+=(--strict-think-prefix)
 fi
 
 if [[ "${TRUST_REMOTE_CODE:-1}" == "1" ]]; then
