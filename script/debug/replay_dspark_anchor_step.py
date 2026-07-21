@@ -193,12 +193,16 @@ def print_hidden_alignment(torch, cached, direct, offset, layer_ids):
     )
 
 
-def replay_slot1(torch, draft, features, verifier_last, token_ids, anchor):
+def replay_slot1(torch, draft, features, verifier_last, token_ids, real_loss_mask, anchor):
     block = int(draft.block_size)
     input_ids = token_ids.unsqueeze(0)
     seq_len = input_ids.shape[1]
-    loss_mask = torch.zeros((1, seq_len), device=input_ids.device)
-    loss_mask[0, anchor] = 1
+    loss_mask = real_loss_mask.to(device=input_ids.device).bool().unsqueeze(0).clone()
+    loss_mask[:, :] = False
+    loss_mask[0, anchor : anchor + block] = real_loss_mask[
+        anchor : anchor + block
+    ].bool()
+    loss_mask[0, anchor] = True
     document_ids = torch.zeros((1, seq_len), dtype=torch.long, device=input_ids.device)
     position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
 
@@ -383,9 +387,15 @@ def run(args):
         )
 
         replays = {
-            "vllm_request": replay_slot1(torch, draft, cached_aux, cached_last, token_ids, anchor),
-            "hf_layer_id": replay_slot1(torch, draft, hf_direct, cached_last, token_ids, anchor),
-            "hf_layer_id_plus_1": replay_slot1(torch, draft, hf_offset, cached_last, token_ids, anchor),
+            "vllm_request": replay_slot1(
+                torch, draft, cached_aux, cached_last, token_ids, cached.loss_mask, anchor
+            ),
+            "hf_layer_id": replay_slot1(
+                torch, draft, hf_direct, cached_last, token_ids, cached.loss_mask, anchor
+            ),
+            "hf_layer_id_plus_1": replay_slot1(
+                torch, draft, hf_offset, cached_last, token_ids, cached.loss_mask, anchor
+            ),
         }
         for name, replay in replays.items():
             print_replay(torch, tokenizer, draft, name, replay)

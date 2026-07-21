@@ -290,7 +290,7 @@ def test_expand_draft_probs_uses_d2t_offsets():
     assert module.torch.allclose(expanded.sum(), module.torch.tensor(1.0))
 
 
-def test_extract_context_feature_uses_hf_hidden_state_layer_offset():
+def test_extract_context_feature_uses_speculators_aux_hidden_state_ids():
     module = _load_module()
     module.torch = __import__("torch")
 
@@ -303,7 +303,7 @@ def test_extract_context_feature_uses_hf_hidden_state_layer_offset():
 
     feature = runner._extract_context_feature(hidden_states)
 
-    assert feature.tolist() == [[[1.0, 3.0], [1.0, 3.0]]]
+    assert feature.tolist() == [[[0.0, 2.0], [0.0, 2.0]]]
 
 
 def test_verify_draft_tokens_support_overlap_uses_uncropped_target_probs():

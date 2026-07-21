@@ -904,10 +904,10 @@ class DSparkOfflineRunner:
 
     def _extract_context_feature(self, hidden_states):
         return torch.cat(
-            [
-                hidden_states[layer_id + 1]
-                for layer_id in self.draft_model.target_layer_ids
-            ],
+            # Speculators checkpoints store vLLM auxiliary hidden-state IDs, which
+            # are already HF hidden_states tuple indices. Converter code adds +1
+            # when importing checkpoints whose config stores decoder layer IDs.
+            [hidden_states[i] for i in self.draft_model.target_layer_ids],
             dim=-1,
         )
 
