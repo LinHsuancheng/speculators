@@ -48,6 +48,13 @@ def pick_even(items, count):
     return [items[round(i * step)] for i in range(count)]
 
 
+def pick_random(torch, items, count):
+    if len(items) <= count:
+        return items
+    perm = torch.randperm(len(items))[:count].tolist()
+    return [items[i] for i in perm]
+
+
 class Acc:
     def __init__(self, name):
         self.name = name
@@ -64,6 +71,27 @@ class Acc:
         acc = self.correct / self.total if self.total else 0.0
         soft = self.soft_sum / self.total if self.total else 0.0
         return f"{self.name}: acc={acc:.6f} ({self.correct}/{self.total}) soft={soft:.6f}"
+
+
+class BucketAcc:
+    def __init__(self, name, buckets):
+        self.name = name
+        self.items = [Acc(f"{name}_bucket_{idx}") for idx in range(buckets)]
+
+    def bucket(self, rel_pos, total_len):
+        if total_len <= 1:
+            return 0
+        idx = int(rel_pos * len(self.items) / total_len)
+        return max(0, min(idx, len(self.items) - 1))
+
+    def add(self, rel_pos, total_len, correct, soft):
+        self.items[self.bucket(rel_pos, total_len)].add(correct, soft)
+
+    def print_lines(self):
+        log.info("%s by position bucket:", self.name)
+        for idx, item in enumerate(self.items):
+            if item.total:
+                log.info("  bucket_%02d %s", idx, item.line())
 
 
 def draft_logits_for_infer(torch, runner, draft, output_ids, anchor):
@@ -115,17 +143,22 @@ def top1_match(torch, draft, draft_logits, target_logits):
 
 def run_training_uniform(torch, args, draft, tokenizer):
     stats = Acc("train_token_uniform")
+    random_stats = Acc("train_random_anchor")
+    buckets = BucketAcc("train_random_anchor", args.position_buckets)
     for sample_index in range(args.train_sample_start, args.train_sample_start + args.train_samples):
         args.sample_index = sample_index
         sample = load_vllm_sample(torch, args)
-        anchors = pick_even(
-            valid_anchors(torch, sample.loss_mask, int(draft.block_size)),
-            args.train_anchors_per_sample,
-        )
+        candidates = valid_anchors(torch, sample.loss_mask, int(draft.block_size))
+        anchors = pick_even(candidates, args.train_anchors_per_sample)
         for anchor in anchors:
             train, _ = train_replay(torch, draft, tokenizer, sample, anchor)
             stats.add(train.greedy_match, train.soft_overlap)
-    return stats
+        random_anchors = pick_random(torch, candidates, args.train_random_anchors_per_sample)
+        for anchor in random_anchors:
+            train, _ = train_replay(torch, draft, tokenizer, sample, anchor)
+            random_stats.add(train.greedy_match, train.soft_overlap)
+            buckets.add(anchor, sample.token_ids.numel(), train.greedy_match, train.soft_overlap)
+    return stats, random_stats, buckets
 
 
 def record_round(torch, draft, proposal, verification):
@@ -219,6 +252,8 @@ def prompt_from_dataset(eval_impl, tokenizer, dataset_path, sample_index):
 def run_inference_metrics(torch, args, eval_impl, runner, draft, tokenizer):
     round_stats = Acc("infer_round_weighted")
     token_stats = Acc("infer_generated_token_uniform")
+    round_buckets = BucketAcc("infer_round_weighted", args.position_buckets)
+    token_buckets = BucketAcc("infer_generated_token_uniform", args.position_buckets)
     for prompt_index in range(args.prompt_start, args.prompt_start + args.num_prompts):
         if args.prompt:
             prompt = args.prompt
@@ -230,6 +265,12 @@ def run_inference_metrics(torch, args, eval_impl, runner, draft, tokenizer):
         )
         for item in rounds:
             round_stats.add(item["correct"], item["soft"])
+            round_buckets.add(
+                item["anchor"] - input_ids.shape[1],
+                args.max_new_tokens,
+                item["correct"],
+                item["soft"],
+            )
         start = input_ids.shape[1]
         anchors = list(range(start, max(output_ids.shape[1] - 1, start)))
         anchors = pick_even(anchors, args.generated_token_anchors)
@@ -238,7 +279,9 @@ def run_inference_metrics(torch, args, eval_impl, runner, draft, tokenizer):
                 torch, runner, draft, output_ids, anchor
             )
             correct, _, _ = top1_match(torch, draft, draft_logits, target_logits)
-            token_stats.add(correct, soft_overlap(torch, draft_logits, target_logits))
+            soft = soft_overlap(torch, draft_logits, target_logits)
+            token_stats.add(correct, soft)
+            token_buckets.add(anchor - start, args.max_new_tokens, correct, soft)
         log.info(
             "prompt=%d rounds=%d generated_token_anchors=%d avg_accepted=%.3f",
             prompt_index,
@@ -246,7 +289,7 @@ def run_inference_metrics(torch, args, eval_impl, runner, draft, tokenizer):
             len(anchors),
             sum(x["accepted"] for x in rounds) / max(len(rounds), 1),
         )
-    return round_stats, token_stats
+    return round_stats, token_stats, round_buckets, token_buckets
 
 
 def run(args):
@@ -280,15 +323,21 @@ def run(args):
         target, draft, tokenizer, SimpleNamespace(temperature=0.0)
     )
 
-    train_stats = run_training_uniform(torch, args, draft, tokenizer)
-    round_stats, token_stats = run_inference_metrics(
+    train_stats, random_train_stats, train_buckets = run_training_uniform(
+        torch, args, draft, tokenizer
+    )
+    round_stats, token_stats, round_buckets, token_buckets = run_inference_metrics(
         torch, args, eval_impl, runner, draft, tokenizer
     )
     log.info("")
     log.info("=== Anchor Distribution Pos1 Metrics ===")
     log.info(train_stats.line())
+    log.info(random_train_stats.line())
     log.info(round_stats.line())
     log.info(token_stats.line())
+    train_buckets.print_lines()
+    round_buckets.print_lines()
+    token_buckets.print_lines()
     if token_stats.total:
         log.info(
             "round_minus_generated_token_acc=%.6f",
@@ -310,12 +359,14 @@ def parse_args():
     p.add_argument("--train-sample-start", type=int, default=0)
     p.add_argument("--train-samples", type=int, default=8)
     p.add_argument("--train-anchors-per-sample", type=int, default=8)
+    p.add_argument("--train-random-anchors-per-sample", type=int, default=8)
     p.add_argument("--prompt-dataset", default=None)
     p.add_argument("--prompt", default=None)
     p.add_argument("--prompt-start", type=int, default=0)
     p.add_argument("--num-prompts", type=int, default=4)
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--generated-token-anchors", type=int, default=64)
+    p.add_argument("--position-buckets", type=int, default=8)
     p.add_argument("--total-seq-len", type=int, default=3072)
     p.add_argument("--device", default="npu:0")
     p.add_argument("--dtype", default="bfloat16")
