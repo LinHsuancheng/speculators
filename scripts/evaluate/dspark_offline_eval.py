@@ -399,6 +399,27 @@ def _chat_template_kwargs(args: argparse.Namespace | None) -> dict[str, Any]:
     return {"enable_thinking": enable_thinking == "true"}
 
 
+def _looks_like_chatml(text: str) -> bool:
+    return "<|im_start|>" in text or "<|im_end|>" in text
+
+
+def _format_raw_prompt(
+    prompt: str,
+    tokenizer,
+    *,
+    args: argparse.Namespace | None,
+) -> str:
+    mode = getattr(args, "raw_prompt_mode", "auto") if args is not None else "auto"
+    if mode == "raw" or (mode == "auto" and _looks_like_chatml(prompt)):
+        return prompt
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+        **_chat_template_kwargs(args),
+    )
+
+
 def _prompt_from_record(
     record: dict[str, Any],
     tokenizer,
@@ -410,7 +431,7 @@ def _prompt_from_record(
     if turns is not None:
         # DeepSpec keeps only the first turn for eval. Keep all turns joined here
         # because existing local data may already be single-response prompts.
-        return "\n\n".join(turns)
+        return _format_raw_prompt("\n\n".join(turns), tokenizer, args=args)
 
     messages = record.get("messages")
     if isinstance(messages, list):
@@ -433,7 +454,7 @@ def _prompt_from_record(
     for field in PROMPT_FIELDS:
         turns = _string_turns(record.get(field))
         if turns is not None:
-            return "\n\n".join(turns)
+            return _format_raw_prompt("\n\n".join(turns), tokenizer, args=args)
 
     keys = ", ".join(sorted(record.keys()))
     supported = ", ".join(["turns", "messages", "conversations", *PROMPT_FIELDS])
@@ -1295,6 +1316,8 @@ def _worker_command(
         str(args.temperature),
         "--enable-thinking",
         args.enable_thinking,
+        "--raw-prompt-mode",
+        args.raw_prompt_mode,
         "--device",
         args.device,
         "--dtype",
@@ -1575,9 +1598,20 @@ def parse_args() -> argparse.Namespace:
         choices=["false", "true", "default"],
         default="false",
         help=(
-            "Qwen-style chat-template thinking mode for records with messages or "
-            "conversations. Default false disables thinking; default leaves the "
-            "tokenizer's own default unchanged."
+            "Qwen-style chat-template thinking mode for records formatted through "
+            "the tokenizer chat template. Default false disables thinking; default "
+            "leaves the tokenizer's own default unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--raw-prompt-mode",
+        choices=["auto", "chat_template", "raw"],
+        default="auto",
+        help=(
+            "How to handle raw DeepSpec-style prompt/turns/question fields. auto "
+            "wraps plain text as a single user message and applies the chat "
+            "template, but leaves strings that already contain ChatML tokens raw; "
+            "chat_template always wraps; raw never wraps."
         ),
     )
     parser.add_argument("--device", default="cuda")

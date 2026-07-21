@@ -498,6 +498,11 @@ def parse_args():
         choices=["false", "true", "default"],
         default="false",
     )
+    p.add_argument(
+        "--raw-prompt-mode",
+        choices=["auto", "chat_template", "raw"],
+        default="auto",
+    )
     p.add_argument("--print-prompt", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--compare-target-only",
