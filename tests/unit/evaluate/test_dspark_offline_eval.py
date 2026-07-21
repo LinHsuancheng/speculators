@@ -290,6 +290,59 @@ def test_expand_draft_probs_uses_d2t_offsets():
     assert module.torch.allclose(expanded.sum(), module.torch.tensor(1.0))
 
 
+def test_extract_context_feature_uses_hf_hidden_state_layer_offset():
+    module = _load_module()
+    module.torch = __import__("torch")
+
+    runner = object.__new__(module.DSparkOfflineRunner)
+    runner.draft_model = SimpleNamespace(target_layer_ids=[0, 2])
+    hidden_states = [
+        module.torch.full((1, 2, 1), float(i))
+        for i in range(4)
+    ]
+
+    feature = runner._extract_context_feature(hidden_states)
+
+    assert feature.tolist() == [[[1.0, 3.0], [1.0, 3.0]]]
+
+
+def test_verify_draft_tokens_support_overlap_uses_uncropped_target_probs():
+    module = _load_module()
+    module.torch = __import__("torch")
+
+    class TargetModel:
+        def __call__(self, **kwargs):
+            del kwargs
+            logits = module.torch.tensor(
+                [
+                    [
+                        [0.0, 1.0, 2.0],
+                        [2.0, 1.0, 0.0],
+                    ]
+                ]
+            )
+            return SimpleNamespace(logits=logits, hidden_states=())
+
+    proposal = module.DraftProposal(
+        draft_token_count=1,
+        verify_input_ids=module.torch.tensor([[9, 1]]),
+        draft_probs=module.torch.tensor([[[0.0, 1.0, 0.0]]]),
+    )
+
+    result = module.verify_draft_tokens(
+        target_model=TargetModel(),
+        proposal=proposal,
+        position_ids=module.torch.arange(2).unsqueeze(0),
+        start=0,
+        past_key_values_target=None,
+        temperature=0.0,
+        max_proposal_tokens=1,
+        current_token_ids=module.torch.tensor([[9]]),
+    )
+
+    assert result.support_accept_rates.tolist() == [[0.0]]
+
+
 def test_ensure_loaded_vocab_mappings_rejects_missing_pruned_mapping(tmp_path: Path):
     module = _load_module()
     module.torch = __import__("torch")

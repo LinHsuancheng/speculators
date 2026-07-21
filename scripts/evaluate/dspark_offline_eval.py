@@ -694,17 +694,9 @@ def verify_draft_tokens(
             max=1.0,
         )
         accept_probs = accept_prob
-        support_target_logits = target_output.logits[:, :-1, :].masked_fill(
-            proposal.draft_probs[:, :draft_token_count, :] <= 0,
-            torch.finfo(target_output.logits.dtype).min,
-        )
-        support_target_probs = logits_to_probs(
-            support_target_logits,
-            float(temperature),
-        )
         support_accept_rates = torch.minimum(
             proposal.draft_probs[:, :draft_token_count, :],
-            support_target_probs,
+            target_probs[:, :draft_token_count, :],
         ).sum(dim=-1)
         accept_mask = (torch.rand_like(accept_prob) < accept_prob).to(torch.int64)
         accept_prefix_mask = accept_mask.cumprod(dim=1)
@@ -912,7 +904,10 @@ class DSparkOfflineRunner:
 
     def _extract_context_feature(self, hidden_states):
         return torch.cat(
-            [hidden_states[i] for i in self.draft_model.target_layer_ids],
+            [
+                hidden_states[layer_id + 1]
+                for layer_id in self.draft_model.target_layer_ids
+            ],
             dim=-1,
         )
 
